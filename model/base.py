@@ -45,6 +45,20 @@ class BaseModel(nn.Module):
         self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)
 
+        motion_cfg = getattr(args, "motion_encoder", None)
+        if motion_cfg is not None and getattr(motion_cfg, "enabled", False):
+            from model.motion_encoder import MotionEncoder
+            self.motion_encoder = MotionEncoder(
+                vae_wrapper=self.vae,
+                dim=getattr(motion_cfg, "dim", 4096),
+                num_layers=getattr(motion_cfg, "num_layers", 4),
+                num_heads=getattr(motion_cfg, "num_heads", 16),
+                tokens_per_frame=getattr(motion_cfg, "tokens_per_frame", 64),
+                max_tokens=getattr(motion_cfg, "max_tokens", 512),
+            )
+        else:
+            self.motion_encoder = None
+
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 

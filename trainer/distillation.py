@@ -6,7 +6,7 @@ import random
 import re
 from pathlib import Path
 
-from utils.dataset import TextDataset, TwoTextDataset, cycle
+from utils.dataset import TextDataset, TwoTextDataset, MotionSwitchDataset, cycle
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -31,13 +31,26 @@ import peft
 from peft import get_peft_model_state_dict
 import safetensors.torch
 
+# peft 0.19.1 calls _maybe_shard_state_dict_for_tp which imports
+# transformers.integrations.tensor_parallel; missing in our transformers
+# version. We never use tensor parallelism (only FSDP), so make it a no-op.
+try:
+    import peft.utils.save_and_load as _peft_sl
+    if hasattr(_peft_sl, "_maybe_shard_state_dict_for_tp"):
+        _peft_sl._maybe_shard_state_dict_for_tp = lambda *a, **kw: None
+except Exception:
+    pass
+
 from utils.memory import gpu, get_cuda_free_memory_gb, log_gpu_memory
 from pipeline import (
     CausalInferencePipeline,
     SwitchCausalInferencePipeline
 )
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
-from one_logger_utils import OneLoggerUtils
+try:
+    from one_logger_utils import OneLoggerUtils
+except ImportError:
+    OneLoggerUtils = None
 import time
 
 class Trainer:
@@ -70,15 +83,17 @@ class Trainer:
 
         self.use_one_logger = getattr(config, "use_one_logger", True)
         if self.is_main_process and not self.disable_wandb:
-            wandb.login(
-                # host=config.wandb_host,
-                key=config.wandb_key)
+            wandb_key = getattr(config, "wandb_key", None)
+            if wandb_key and not wandb_key.startswith("YOUR_"):
+                wandb.login(key=wandb_key)
+            wandb_entity = getattr(config, "wandb_entity", None)
+            wandb_project = getattr(config, "wandb_project", None)
             wandb.init(
                 config=OmegaConf.to_container(config, resolve=True),
                 name=config.config_name,
                 mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
+                entity=wandb_entity if wandb_entity and not wandb_entity.startswith("YOUR_") else None,
+                project=wandb_project if wandb_project and not wandb_project.startswith("YOUR_") else "longlive",
                 dir=config.wandb_save_dir
             )
 
@@ -86,7 +101,7 @@ class Trainer:
         app_start_time = time.time_ns() / 1_000_000 
         
         # ------------------------------------- One Logger Setup ----------------------------------------------
-        if self.use_one_logger and dist.get_rank() == 0 and not self.disable_wandb:
+        if self.use_one_logger and OneLoggerUtils is not None and dist.get_rank() == 0 and not self.disable_wandb:
             app_tag_run_name = f"dmd_{config.real_name[:6]}_local_attn_size_{config.model_kwargs.local_attn_size}_lr_{config.lr}"
             app_tag_run_version = "0.0.0"
             app_tag = f"{app_tag_run_name}_{app_tag_run_version}_{config.batch_size}_{dist.get_world_size()}"
@@ -215,6 +230,22 @@ class Trainer:
             else:
                 if self.is_main_process:
                     print("LoRA applied to generator only")
+
+            # PEFT creates LoRA adapters in float32; FSDP's size-based auto-wrap
+            # groups them with the bfloat16 base params and fails "uniform dtype"
+            # validation. Cast every fp32 param down to bfloat16 to match base.
+            if config.mixed_precision:
+                def _cast_fp32_params_to_bf16(module):
+                    n_cast = 0
+                    for p in module.parameters():
+                        if p.dtype == torch.float32:
+                            p.data = p.data.to(torch.bfloat16)
+                            n_cast += 1
+                    return n_cast
+                n_gen = _cast_fp32_params_to_bf16(self.model.generator)
+                n_crit = _cast_fp32_params_to_bf16(self.model.fake_score)
+                if self.is_main_process:
+                    print(f"Cast {n_gen} generator + {n_crit} critic fp32 params to bfloat16 (post-LoRA)")
             
             # 3. Load LoRA weights before FSDP wrapping (if a checkpoint is available)
             lora_checkpoint_path = None
@@ -283,9 +314,16 @@ class Trainer:
                 if "critic_lora" in lora_checkpoint:
                     if self.is_main_process:
                         print(f"Loading LoRA critic weights: {len(lora_checkpoint['critic_lora'])} keys in checkpoint")
-                    
+
                     # Use PEFT's set_peft_model_state_dict; it automatically aligns key names
                     peft.set_peft_model_state_dict(self.model.fake_score.model, lora_checkpoint["critic_lora"])
+
+                if ("motion_encoder" in lora_checkpoint
+                        and getattr(self.model, "motion_encoder", None) is not None):
+                    if self.is_main_process:
+                        print(f"Loading motion_encoder weights: {len(lora_checkpoint['motion_encoder'])} keys")
+                    self.model.motion_encoder.load_state_dict(
+                        lora_checkpoint["motion_encoder"], strict=True)
 
                 # Load training step
                 if "step" in lora_checkpoint:
@@ -307,7 +345,8 @@ class Trainer:
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy
+            wrap_strategy=config.real_score_fsdp_wrap_strategy,
+            cpu_offload=getattr(config, "real_score_cpu_offload", False)
         )
 
         self.model.fake_score = fsdp_wrap(
@@ -326,6 +365,23 @@ class Trainer:
         )
         self.model.vae = self.model.vae.to(
             device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+
+        if getattr(self.model, "motion_encoder", None) is not None:
+            self.model.motion_encoder = self.model.motion_encoder.to(
+                device=self.device,
+                dtype=torch.bfloat16 if config.mixed_precision else torch.float32,
+            )
+            # NO_SHARD (DDP-like): motion_encoder is only ~270M params so we
+            # replicate rather than shard. HYBRID_SHARD + use_orig_params
+            # returns 1-D shard fragments for small params, breaking nn.Linear.
+            self.model.motion_encoder = fsdp_wrap(
+                self.model.motion_encoder,
+                sharding_strategy="no_shard",
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=getattr(
+                    config, "motion_encoder_fsdp_wrap_strategy", "size"),
+                min_num_params=int(1e7),
+            )
 
         # if not config.no_visualize or config.load_raw_video:
         #     print("Moving vae to device 2, self.device: ", self.device)
@@ -364,9 +420,17 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_optimizer_init_start()
 
+        generator_trainable_params = [
+            param for param in self.model.generator.parameters()
+            if param.requires_grad
+        ]
+        if getattr(self.model, "motion_encoder", None) is not None:
+            generator_trainable_params += [
+                param for param in self.model.motion_encoder.parameters()
+                if param.requires_grad
+            ]
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
+            generator_trainable_params,
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
@@ -381,24 +445,169 @@ class Trainer:
         )
 
         if self.one_logger is not None:
-            self.one_logger.on_optimizer_init_end() 
+            self.one_logger.on_optimizer_init_end()
+
+        # Optional auxiliary motion-consistency loss. Fully self-contained;
+        # toggled off by default so the existing DMD path is untouched.
+        mcfg = getattr(config, "motion_loss", None)
+        if mcfg is not None and getattr(mcfg, "enabled", False):
+            from utils.motion_loss import MotionConsistencyLoss
+            self.motion_loss = MotionConsistencyLoss(
+                loss_type=getattr(mcfg, "type", "scalar_energy"),
+                weight=getattr(mcfg, "weight", 0.05),
+            )
+            if self.is_main_process:
+                print(f"[motion_loss] enabled: type={self.motion_loss.loss_type}, "
+                      f"weight={self.motion_loss.weight}")
+        else:
+            self.motion_loss = None
+
+        # ================= Uni-DAD: dual-domain DMD =================
+        # Optional online-trained target_teacher. Config-gated by
+        # `unidad.enabled` + `unidad.dual_domain_dmd.enabled`. When off,
+        # DMD path is byte-identical to prior behavior.
+        unidad_cfg = getattr(config, "unidad", None)
+        unidad_on = unidad_cfg is not None and getattr(unidad_cfg, "enabled", False)
+        dd_cfg = getattr(unidad_cfg, "dual_domain_dmd", None) if unidad_on else None
+        dual_dmd_on = dd_cfg is not None and getattr(dd_cfg, "enabled", False)
+
+        if dual_dmd_on:
+            from utils.wan_wrapper import WanDiffusionWrapper
+            from model.motion_encoder import MotionEncoder
+
+            if self.is_main_process:
+                print(
+                    "[unidad] dual-domain DMD enabled: "
+                    f"w_real={dd_cfg.real_score_loss_weight}, "
+                    f"w_unidad_motion={dd_cfg.unidad_motion_loss_weight}, "
+                    f"update_ratio={dd_cfg.target_teacher_update_ratio}")
+
+            # 1. Build target_teacher with student architecture (causal 1.3B).
+            target_teacher = WanDiffusionWrapper(
+                model_name=dd_cfg.target_teacher_model_name,
+                is_causal=dd_cfg.target_teacher_is_causal,
+                local_attn_size=dd_cfg.target_teacher_local_attn_size,
+                sink_size=dd_cfg.target_teacher_sink_size,
+            )
+            target_teacher.model.requires_grad_(True)
+            if config.gradient_checkpointing:
+                target_teacher.enable_gradient_checkpointing()
+
+            # 2. Build separate trainable MotionEncoder for target_teacher.
+            me_cfg = config.motion_encoder
+            target_motion_encoder = MotionEncoder(
+                vae_wrapper=self.model.vae,
+                dim=getattr(me_cfg, "dim", 4096),
+                num_layers=getattr(me_cfg, "num_layers", 4),
+                num_heads=getattr(me_cfg, "num_heads", 16),
+                tokens_per_frame=getattr(me_cfg, "tokens_per_frame", 64),
+                max_tokens=getattr(me_cfg, "max_tokens", 512),
+            )
+            target_motion_encoder.requires_grad_(True)
+
+            # 3. Initialize from same base ckpt as student (longlive_init.pt).
+            init_ckpt_path = getattr(dd_cfg, "target_teacher_init_from", None) \
+                or getattr(config, "generator_ckpt", None)
+            if init_ckpt_path:
+                if self.is_main_process:
+                    print(f"[unidad] loading target_teacher weights from {init_ckpt_path}")
+                init_ckpt = torch.load(init_ckpt_path, map_location="cpu")
+                # generator/model weights (strict=False to tolerate missing LoRA keys).
+                gen_key = "generator" if "generator" in init_ckpt else (
+                    "model" if "model" in init_ckpt else None)
+                if gen_key is not None:
+                    target_teacher.load_state_dict(init_ckpt[gen_key], strict=False)
+                if "motion_encoder" in init_ckpt:
+                    target_motion_encoder.load_state_dict(
+                        init_ckpt["motion_encoder"], strict=False)
+
+            # 4. FSDP wrap — with grad (unlike real_score which is frozen).
+            target_teacher = fsdp_wrap(
+                target_teacher,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=dd_cfg.target_teacher_fsdp_wrap_strategy,
+                cpu_offload=getattr(dd_cfg, "target_teacher_cpu_offload", False),
+            )
+            target_motion_encoder = target_motion_encoder.to(
+                device=self.device, dtype=self.dtype)
+            target_motion_encoder = fsdp_wrap(
+                target_motion_encoder,
+                sharding_strategy="no_shard",
+                mixed_precision=config.mixed_precision,
+                wrap_strategy="size",
+                min_num_params=int(1e7),
+            )
+
+            self.model.target_teacher = target_teacher
+            self.model.target_motion_encoder = target_motion_encoder
+            self.model.real_score_loss_weight = float(dd_cfg.real_score_loss_weight)
+            self.model.unidad_motion_loss_weight = float(dd_cfg.unidad_motion_loss_weight)
+            self.target_teacher_update_ratio = int(
+                dd_cfg.target_teacher_update_ratio)
+
+            # 5. Dedicated optimizer for target_teacher + target_motion_encoder.
+            tt_params = [p for p in target_teacher.parameters() if p.requires_grad]
+            tt_params += [p for p in target_motion_encoder.parameters() if p.requires_grad]
+            self.target_teacher_optimizer = torch.optim.AdamW(
+                tt_params,
+                lr=float(getattr(dd_cfg, "target_teacher_lr", config.lr)),
+                betas=(
+                    float(getattr(dd_cfg, "target_teacher_beta1", config.beta1)),
+                    float(getattr(dd_cfg, "target_teacher_beta2", config.beta2)),
+                ),
+                weight_decay=config.weight_decay,
+            )
+        else:
+            self.model.target_teacher = None
+            self.model.target_motion_encoder = None
+            self.model.real_score_loss_weight = 1.0
+            self.model.unidad_motion_loss_weight = 0.0
+            self.target_teacher_update_ratio = 0
+            self.target_teacher_optimizer = None
 
         # Step 5: Initialize the dataloader
         if self.one_logger is not None:
             self.one_logger.on_dataloader_init_start()
+        motion_cfg = getattr(config, "motion_encoder", None)
+        motion_enabled = motion_cfg is not None and getattr(motion_cfg, "enabled", False)
+        # Uni-DAD: when target_teacher is enabled, ask MotionSwitchDataset for
+        # a longer "target_video" clip (self-pair) for teacher_turn MSE.
+        # Latent chunk length T_lat → pixel frames = (T_lat-1)*4+1 under Wan
+        # VAE 4x temporal compression. In streaming mode T_lat = chunk size;
+        # in non-streaming T_lat = image_or_video_shape[1].
+        teacher_target_pixel_len = 0
+        if self.target_teacher_optimizer is not None:
+            lat_T = int(getattr(
+                config, "streaming_chunk_size",
+                getattr(config, "image_or_video_shape", [1, 21])[1]))
+            teacher_target_pixel_len = (lat_T - 1) * 4 + 1
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+        elif motion_enabled:
+            dataset = MotionSwitchDataset(
+                pair_jsonl=config.motion_pair_jsonl,
+                motion_ref_root=config.motion_ref_root,
+                ref_length=getattr(motion_cfg, "ref_length", 16),
+                image_size=getattr(motion_cfg, "image_size", (480, 832)),
+                target_video_length=teacher_target_pixel_len,
+            )
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
+        # num_workers is configurable; default 0 (no fork). With num_workers>0
+        # on a Linux fork, each worker inherits the parent's CPU-offload FSDP
+        # storage via COW. Python ref-count writes dirty those pages quickly,
+        # so 8 workers × 14GB teacher shard × N ranks can blow past CPU RAM.
+        dataloader_num_workers = getattr(config, "dataloader_num_workers", 0)
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=dataloader_num_workers)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -413,6 +622,13 @@ class Trainer:
 
             if self.config.i2v:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
+            elif motion_enabled:
+                val_dataset = MotionSwitchDataset(
+                    pair_jsonl=getattr(config, "val_motion_pair_jsonl", config.motion_pair_jsonl),
+                    motion_ref_root=config.motion_ref_root,
+                    ref_length=getattr(motion_cfg, "ref_length", 16),
+                    image_size=getattr(motion_cfg, "image_size", (480, 832)),
+                )
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
             else:
@@ -428,7 +644,7 @@ class Trainer:
                 val_dataset,
                 batch_size=getattr(config, "val_batch_size", 1),
                 sampler=sampler,
-                num_workers=8,
+                num_workers=dataloader_num_workers,
             )
 
             # Take the first batch as fixed visualization batch
@@ -754,6 +970,13 @@ class Trainer:
                 "critic_lora": crit_lora_sd,
                 "step": self.step,
             }
+            if getattr(self.model, "motion_encoder", None) is not None:
+                with FSDP.state_dict_type(
+                    self.model.motion_encoder,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                ):
+                    state_dict["motion_encoder"] = self.model.motion_encoder.state_dict()
         else:
             with FSDP.state_dict_type(
                 self.model.generator,
@@ -775,6 +998,39 @@ class Trainer:
                 critic_opim_state_dict = FSDP.optim_state_dict(self.model.fake_score,
                                                 self.critic_optimizer)
 
+            motion_sd = None
+            if getattr(self.model, "motion_encoder", None) is not None:
+                with FSDP.state_dict_type(
+                    self.model.motion_encoder,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                ):
+                    motion_sd = self.model.motion_encoder.state_dict()
+
+            # Uni-DAD: save target_teacher + its motion_encoder when enabled.
+            target_teacher_sd = None
+            target_motion_sd = None
+            target_teacher_opt_sd = None
+            if getattr(self.model, "target_teacher", None) is not None:
+                with FSDP.state_dict_type(
+                    self.model.target_teacher,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                    FullOptimStateDictConfig(rank0_only=True),
+                ):
+                    target_teacher_sd = self.model.target_teacher.state_dict()
+                    if self.target_teacher_optimizer is not None:
+                        target_teacher_opt_sd = FSDP.optim_state_dict(
+                            self.model.target_teacher,
+                            self.target_teacher_optimizer)
+                if getattr(self.model, "target_motion_encoder", None) is not None:
+                    with FSDP.state_dict_type(
+                        self.model.target_motion_encoder,
+                        StateDictType.FULL_STATE_DICT,
+                        FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                    ):
+                        target_motion_sd = self.model.target_motion_encoder.state_dict()
+
             if self.config.ema_start_step < self.step and self.generator_ema is not None:
                 state_dict = {
                     "generator": generator_state_dict,
@@ -784,6 +1040,8 @@ class Trainer:
                     "critic_optimizer": critic_opim_state_dict,
                     "step": self.step,
                 }
+                if motion_sd is not None:
+                    state_dict["motion_encoder"] = motion_sd
             else:
                 state_dict = {
                     "generator": generator_state_dict,
@@ -792,12 +1050,25 @@ class Trainer:
                     "critic_optimizer": critic_opim_state_dict,
                     "step": self.step,
                 }
+                if motion_sd is not None:
+                    state_dict["motion_encoder"] = motion_sd
+
+            if target_teacher_sd is not None:
+                state_dict["target_teacher"] = target_teacher_sd
+            if target_motion_sd is not None:
+                state_dict["target_motion_encoder"] = target_motion_sd
+            if target_teacher_opt_sd is not None:
+                state_dict["target_teacher_optimizer"] = target_teacher_opt_sd
 
         if self.is_main_process:
             checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint_file = os.path.join(checkpoint_dir, "model.pt")
-            torch.save(state_dict, checkpoint_file)
+            # Atomic write: readers (e.g. arp eval daemon rsync) can race the
+            # 3-5s torch.save window and pick up a half-written pickle.
+            tmp_file = checkpoint_file + ".tmp"
+            torch.save(state_dict, tmp_file)
+            os.replace(tmp_file, checkpoint_file)
             print("Model saved to", checkpoint_file)
             
             # Cleanup old checkpoints if max_checkpoints is set
@@ -812,6 +1083,125 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_save_checkpoint_success(global_step=self.step)
             self.one_logger.on_save_checkpoint_end(global_step=self.step)
+
+    def _inject_motion(self, conditional_dict, motion_ref, grad=True):
+        """Encode motion_ref and concatenate to conditional_dict['prompt_embeds'].
+
+        Grad flows back to motion_encoder every forward because cross-attention
+        caches only the text K/V (detached) and recomputes the motion K/V each
+        call — see ``WanT2VCrossAttention.forward`` ``motion_len>0`` branch.
+        """
+        motion_ref = motion_ref.to(device=self.device, dtype=self.dtype)
+        if grad:
+            motion_tokens = self.model.motion_encoder(motion_ref)
+        else:
+            with torch.no_grad():
+                motion_tokens = self.model.motion_encoder(motion_ref)
+        conditional_dict["prompt_embeds"] = torch.cat(
+            [conditional_dict["prompt_embeds"], motion_tokens], dim=1)
+        return motion_tokens.shape[1]
+
+    def fwdbwd_one_step_teacher_turn(self, batch):
+        """Uni-DAD teacher_turn: one diffusion-MSE step on the target_teacher
+        using self-pair data (prompt from video X, motion_ref + target_video
+        also from video X). Updates target_teacher + target_motion_encoder.
+
+        Mirrors the critic MSE mechanism but with:
+          - opt  = target_teacher_optimizer
+          - backbone = target_teacher (not fake_score)
+          - grad path goes through target_motion_encoder (grad=True)
+        """
+        assert self.model.target_teacher is not None, (
+            "teacher_turn requires unidad.dual_domain_dmd.enabled=true")
+        assert "motion_ref" in batch, "teacher_turn needs motion_ref in batch"
+        self.model.eval()
+
+        text_prompts = batch["prompts"]
+        batch_size = len(text_prompts)
+
+        with torch.no_grad():
+            cond = self.model.text_encoder(text_prompts=text_prompts)
+            text_embeds_no_motion = cond["prompt_embeds"].detach().clone()
+
+        # Motion tokens from target_motion_encoder WITH grad so it learns.
+        motion_ref_dev = batch["motion_ref"].to(
+            device=self.device, dtype=self.dtype)
+        target_motion_tokens = self.model.target_motion_encoder(motion_ref_dev)
+        cond = {
+            **cond,
+            "prompt_embeds": torch.cat(
+                [text_embeds_no_motion, target_motion_tokens], dim=1),
+        }
+
+        # Self-pair target_video. Falls back to motion_ref when dataset does
+        # not provide a separate key (self-pair default from prepare_openvid).
+        with torch.no_grad():
+            target_key = "target_video" if "target_video" in batch else "motion_ref"
+            target_video = batch[target_key].to(
+                device=self.device, dtype=self.dtype)
+            clean_latent = self.model.motion_encoder._encode_vae(target_video)
+            # In streaming mode, target_teacher sees chunks of latent length
+            # = streaming_chunk_size (e.g. 21). In non-streaming mode, use
+            # image_or_video_shape[1] directly.
+            T_target = int(
+                getattr(self.config, "streaming_chunk_size",
+                        self.config.image_or_video_shape[1]))
+            if clean_latent.shape[1] >= T_target:
+                clean_latent = clean_latent[:, :T_target]
+            else:
+                pad = clean_latent[:, -1:].expand(
+                    -1, T_target - clean_latent.shape[1], -1, -1, -1)
+                clean_latent = torch.cat([clean_latent, pad], dim=1)
+
+        # Sample timestep with the same shift logic as critic_loss.
+        min_step = int(0.02 * self.config.num_train_timestep)
+        max_step = int(0.98 * self.config.num_train_timestep)
+        timestep = torch.randint(
+            min_step, max_step,
+            [batch_size, 1], device=self.device, dtype=torch.long
+        ).repeat(1, clean_latent.shape[1])
+        ts_shift = float(getattr(self.config, "timestep_shift", 1.0))
+        if ts_shift > 1:
+            ts_frac = timestep.float() / 1000.0
+            timestep = (
+                ts_shift * ts_frac / (1 + (ts_shift - 1) * ts_frac) * 1000
+            ).long()
+
+        noise = torch.randn_like(clean_latent)
+        noisy_latent = self.model.scheduler.add_noise(
+            clean_latent.flatten(0, 1),
+            noise.flatten(0, 1),
+            timestep.flatten(0, 1),
+        ).unflatten(0, (batch_size, clean_latent.shape[1])).to(self.dtype)
+
+        # Forward target_teacher with grad.
+        flow_pred, pred_x0 = self.model.target_teacher(
+            noisy_image_or_video=noisy_latent,
+            conditional_dict=cond,
+            timestep=timestep,
+        )
+
+        # Flow MSE target (mirror critic_loss flow path).
+        from utils.wan_wrapper import WanDiffusionWrapper
+        flow_target = WanDiffusionWrapper._convert_x0_to_flow_pred(
+            scheduler=self.model.scheduler,
+            x0_pred=clean_latent.flatten(0, 1),
+            xt=noisy_latent.flatten(0, 1),
+            timestep=timestep.flatten(0, 1),
+        )
+        import torch.nn.functional as F
+        teacher_loss = F.mse_loss(
+            flow_pred.flatten(0, 1).float(),
+            flow_target.float().detach(),
+        )
+
+        scaled_teacher_loss = teacher_loss / self.gradient_accumulation_steps
+        scaled_teacher_loss.backward()
+
+        return {
+            "teacher_loss": teacher_loss.detach(),
+            "teacher_grad_norm": torch.tensor(0.0, device=self.device),
+        }
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -839,6 +1229,20 @@ class Trainer:
                 self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
+
+        # Step 2b: motion conditioning (optional)
+        motion_len = 0
+        if getattr(self.model, "motion_encoder", None) is not None and "motion_ref" in batch:
+            motion_len = self._inject_motion(
+                conditional_dict, batch["motion_ref"], grad=True)
+            pad = torch.zeros(
+                batch_size, motion_len, unconditional_dict["prompt_embeds"].shape[-1],
+                device=self.device, dtype=unconditional_dict["prompt_embeds"].dtype)
+            unconditional_dict = {
+                **unconditional_dict,
+                "prompt_embeds": torch.cat(
+                    [unconditional_dict["prompt_embeds"], pad], dim=1),
+            }
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
@@ -986,7 +1390,29 @@ class Trainer:
                     print(f"[SeqTrain-Trainer] Created and cached unconditional_dict")
             else:
                 unconditional_dict = self.unconditional_dict
-        
+
+        # Remember pristine text-only prompt_embeds so we can re-inject
+        # fresh motion_tokens every step (keeps motion_encoder's autograd
+        # graph separate per-step, avoiding backward-through-freed-graph).
+        motion_enabled = (getattr(self.model, "motion_encoder", None) is not None
+                          and "motion_ref" in batch)
+        text_embeds_no_motion = (
+            conditional_dict["prompt_embeds"].detach().clone()
+            if motion_enabled else None)
+
+        motion_len = 0
+        if motion_enabled:
+            motion_len = self._inject_motion(
+                conditional_dict, batch["motion_ref"], grad=True)
+            pad = torch.zeros(
+                batch_size, motion_len, unconditional_dict["prompt_embeds"].shape[-1],
+                device=self.device, dtype=unconditional_dict["prompt_embeds"].dtype)
+            unconditional_dict = {
+                **unconditional_dict,
+                "prompt_embeds": torch.cat(
+                    [unconditional_dict["prompt_embeds"], pad], dim=1),
+            }
+
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"streaming Training: After text encoding", device=self.device, rank=dist.get_rank())
         
@@ -1024,7 +1450,27 @@ class Trainer:
                 switch_conditional_dict = self.model.text_encoder(
                     text_prompts=batch["switch_prompts"]
                 )
-            switch_frame_index = self._get_switch_frame_index(temp_max_length)
+            switch_text_embeds_no_motion = None
+            if (getattr(self.model, "motion_encoder", None) is not None
+                    and "switch_motion_ref" in batch):
+                switch_text_embeds_no_motion = (
+                    switch_conditional_dict["prompt_embeds"].detach().clone())
+                self._inject_motion(
+                    switch_conditional_dict,
+                    batch["switch_motion_ref"],
+                    grad=True,
+                )
+            if "switch_frame_index" in batch:
+                val = batch["switch_frame_index"]
+                if torch.is_tensor(val):
+                    val = int(val.flatten()[0].item())
+                switch_frame_index = int(val)
+            else:
+                switch_frame_index = self._get_switch_frame_index(temp_max_length)
+
+            if switch_frame_index is not None and switch_frame_index < 0:
+                switch_conditional_dict = None
+                switch_frame_index = None
             
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Trainer] switch_frame_index={switch_frame_index}")
@@ -1044,7 +1490,49 @@ class Trainer:
             switch_frame_index=switch_frame_index,
             temp_max_length=temp_max_length,
         )
-        
+
+        if motion_enabled:
+            # Stash raw tensors so fwdbwd_one_step_streaming can re-encode
+            # fresh motion_tokens per step.
+            self.streaming_model.state["motion_ref_cpu"] = (
+                batch["motion_ref"].detach().cpu())
+            self.streaming_model.state["text_embeds_no_motion"] = (
+                text_embeds_no_motion)
+            if (switch_conditional_dict is not None
+                    and "switch_motion_ref" in batch):
+                self.streaming_model.state["switch_motion_ref_cpu"] = (
+                    batch["switch_motion_ref"].detach().cpu())
+                self.streaming_model.state["switch_text_embeds_no_motion"] = (
+                    switch_text_embeds_no_motion)
+
+            # Pre-compute and stash the VAE-encoded motion_ref latent for the
+            # auxiliary motion_loss. Done once per batch; reused by every
+            # generator step inside this sequence.
+            if self.motion_loss is not None:
+                with torch.no_grad():
+                    ref_latent = self.model.motion_encoder._encode_vae(
+                        batch["motion_ref"].to(device=self.device, dtype=self.dtype))
+                self.streaming_model.state["ref_latent_cpu"] = (
+                    ref_latent.detach().cpu())
+
+            # Uni-DAD: build a parallel motion-conditioned conditional_dict
+            # using target_motion_encoder (separate frozen-at-this-step clone
+            # for DMD target-branch forward; target_motion_encoder is updated
+            # only on teacher_turn steps, not on every generator step).
+            if getattr(self.model, "target_motion_encoder", None) is not None:
+                motion_ref_dev = batch["motion_ref"].to(
+                    device=self.device, dtype=self.dtype)
+                with torch.no_grad():
+                    target_motion_tokens = self.model.target_motion_encoder(
+                        motion_ref_dev)
+                conditional_dict_target = {
+                    **conditional_dict,
+                    "prompt_embeds": torch.cat(
+                        [text_embeds_no_motion, target_motion_tokens], dim=1),
+                }
+                self.streaming_model.state["conditional_dict_target"] = (
+                    conditional_dict_target)
+
         self.streaming_active = True
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -1052,6 +1540,55 @@ class Trainer:
             
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"streaming Training: After sequence setup", device=self.device, rank=dist.get_rank())
+
+    def _refresh_motion_in_state(self):
+        """Re-encode motion_tokens with a fresh autograd graph and splice into
+        state's conditional_dict. Called at top of every streaming step so the
+        motion_encoder receives gradients on each backward (generator + critic)
+        instead of only on the step where the sequence was first set up.
+
+        The text portion (``text_embeds_no_motion``) stays pristine and the
+        cross-attention split-cache keeps text K/V detached across steps.
+        """
+        if getattr(self.model, "motion_encoder", None) is None:
+            return
+        state = self.streaming_model.state
+        if state.get("motion_ref_cpu") is None:
+            return
+
+        cond_info = state.get("conditional_info")
+        if cond_info is None:
+            return
+        cond_dict = cond_info["conditional_dict"]
+        text_embeds = state["text_embeds_no_motion"]
+
+        motion_ref = state["motion_ref_cpu"].to(device=self.device, dtype=self.dtype)
+        motion_tokens = self.model.motion_encoder(motion_ref)
+        cond_dict["prompt_embeds"] = torch.cat(
+            [text_embeds, motion_tokens], dim=1)
+
+        switch_info = cond_info.get("switch_info")
+        if (switch_info is not None
+                and state.get("switch_motion_ref_cpu") is not None):
+            switch_motion_ref = state["switch_motion_ref_cpu"].to(
+                device=self.device, dtype=self.dtype)
+            switch_motion_tokens = self.model.motion_encoder(switch_motion_ref)
+            switch_info["switch_conditional_dict"]["prompt_embeds"] = torch.cat(
+                [state["switch_text_embeds_no_motion"], switch_motion_tokens], dim=1)
+
+        # Uni-DAD: refresh target-side motion tokens (no_grad — target_motion_encoder
+        # is updated separately on teacher_turn steps, not via this path).
+        if (getattr(self.model, "target_motion_encoder", None) is not None
+                and state.get("motion_ref_cpu") is not None):
+            motion_ref = state["motion_ref_cpu"].to(
+                device=self.device, dtype=self.dtype)
+            with torch.no_grad():
+                target_motion_tokens = self.model.target_motion_encoder(motion_ref)
+            state["conditional_dict_target"] = {
+                **cond_dict,
+                "prompt_embeds": torch.cat(
+                    [text_embeds, target_motion_tokens], dim=1),
+            }
 
     def fwdbwd_one_step_streaming(self, train_generator):
         """Forward/backward pass using the new StreamingTrainingModel for serialized training"""
@@ -1065,6 +1602,10 @@ class Trainer:
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Trainer] No active sequence, starting new one")
             self.start_new_sequence()
+
+        # Per-step fresh motion_tokens (keeps autograd graph separate between
+        # generator and critic backwards within the same sequence).
+        self._refresh_motion_in_state()
         
         # Check whether we can generate more chunks
         if not self.streaming_model.can_generate_more():
@@ -1100,11 +1641,25 @@ class Trainer:
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                     print(f"[SeqTrain-Trainer] train_first_chunk={train_first_chunk}, current_seq_length={current_seq_length}")
 
-            # Compute generator loss
+            # Compute generator loss. When Uni-DAD dual-domain DMD is enabled,
+            # also pass the target-side conditional_dict so DMD computes both
+            # source (real_score) and target (target_teacher) MSE branches.
             generator_loss, generator_log_dict = self.streaming_model.compute_generator_loss(
                 chunk=generated_chunk,
-                chunk_info=chunk_info
+                chunk_info=chunk_info,
+                conditional_dict_target=self.streaming_model.state.get(
+                    "conditional_dict_target"),
             )
+
+            # Optional: auxiliary motion-consistency loss on the generated chunk.
+            # Fully modular — active only when self.motion_loss was constructed
+            # and the corresponding ref_latent was stashed this sequence.
+            if (self.motion_loss is not None
+                    and "ref_latent_cpu" in self.streaming_model.state):
+                ref_latent = self.streaming_model.state["ref_latent_cpu"]
+                m_loss = self.motion_loss(generated_chunk, ref_latent)
+                generator_loss = generator_loss + self.motion_loss.weight * m_loss
+                generator_log_dict["motion_loss"] = m_loss.detach()
 
             # Scale loss for gradient accumulation and backward
             scaled_generator_loss = generator_loss / self.gradient_accumulation_steps
@@ -1169,6 +1724,28 @@ class Trainer:
             
             return critic_log_dict
 
+    def _run_teacher_turn(self):
+        """Run one accumulated teacher_turn update. Returns the merged log dict
+        (empty when Uni-DAD is disabled)."""
+        if self.target_teacher_optimizer is None:
+            return {}
+        if self.target_teacher_update_ratio <= 0:
+            return {}
+        if self.step % self.target_teacher_update_ratio != 0:
+            return {}
+
+        self.target_teacher_optimizer.zero_grad(set_to_none=True)
+        accumulated = []
+        for _ in range(self.gradient_accumulation_steps):
+            tt_batch = next(self.dataloader)
+            accumulated.append(self.fwdbwd_one_step_teacher_turn(tt_batch))
+        tt_grad_norm = self.model.target_teacher.clip_grad_norm_(
+            self.max_grad_norm_generator)
+        self.target_teacher_optimizer.step()
+        tt_log = merge_dict_list(accumulated)
+        tt_log["teacher_grad_norm"] = tt_grad_norm
+        return tt_log
+
     def train(self):
         start_step = self.step
         try:
@@ -1183,6 +1760,8 @@ class Trainer:
 
                 if self.one_logger is not None:
                     self.one_logger.on_train_batch_start()
+
+                teacher_log_dict = {}
 
                 if self.streaming_training:
                     # Zero-out all optimizer gradients
@@ -1240,10 +1819,13 @@ class Trainer:
                         print(f"[SeqTrain-Trainer] Critic training completed, grad_norm={critic_grad_norm.item()}")
                     
                     self.critic_optimizer.step()
-                    
+
+                    # Uni-DAD teacher_turn (gated inside the helper).
+                    teacher_log_dict = self._run_teacher_turn()
+
                     if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
                         log_gpu_memory(f"streaming Training Step {self.step}: After optimizer steps", device=self.device, rank=dist.get_rank())
-                    
+
                     # Increase step count
                     self.step += 1
                     
@@ -1294,6 +1876,9 @@ class Trainer:
                     
                     self.critic_optimizer.step()
 
+                    # Uni-DAD teacher_turn (gated inside the helper).
+                    teacher_log_dict = self._run_teacher_turn()
+
                     # Increment the step since we finished gradient update
                     self.step += 1
 
@@ -1328,6 +1913,9 @@ class Trainer:
                                 "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                             }
                         )
+                        if "motion_loss" in generator_log_dict:
+                            wandb_loss_dict["motion_loss"] = (
+                                generator_log_dict["motion_loss"].mean().item())
 
 
                     wandb_loss_dict.update(
@@ -1336,6 +1924,21 @@ class Trainer:
                             "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                         }
                     )
+                    if teacher_log_dict:
+                        if "teacher_loss" in teacher_log_dict:
+                            wandb_loss_dict["teacher_loss"] = (
+                                teacher_log_dict["teacher_loss"].mean().item())
+                        if "teacher_grad_norm" in teacher_log_dict:
+                            wandb_loss_dict["teacher_grad_norm"] = (
+                                teacher_log_dict["teacher_grad_norm"].mean().item())
+                    # Surface dual-DMD source/target decomposition when present.
+                    if TRAIN_GENERATOR and generator_log_dict:
+                        if "dmd_loss_source" in generator_log_dict:
+                            wandb_loss_dict["dmd_loss_source"] = (
+                                generator_log_dict["dmd_loss_source"].mean().item())
+                        if "dmd_loss_target" in generator_log_dict:
+                            wandb_loss_dict["dmd_loss_target"] = (
+                                generator_log_dict["dmd_loss_target"].mean().item())
                     if not self.disable_wandb:
                         wandb.log(wandb_loss_dict, step=self.step)
 
@@ -1352,10 +1955,25 @@ class Trainer:
                         wandb.log({"per iteration time": iteration_time}, step=self.step)
                     self.previous_time = current_time
                     # Log training progress
+                    mloss_str = ""
+                    if (TRAIN_GENERATOR and generator_log_dict
+                            and "motion_loss" in generator_log_dict):
+                        mloss_str = f", motion_loss {generator_log_dict['motion_loss'].mean().item()}"
+                    dmd_decomp_str = ""
                     if TRAIN_GENERATOR and generator_log_dict:
-                        print(f"step {self.step}, per iteration time {iteration_time}, generator_loss {generator_log_dict['generator_loss'].mean().item()}, generator_grad_norm {generator_log_dict['generator_grad_norm'].mean().item()}, dmdtrain_gradient_norm {generator_log_dict['dmdtrain_gradient_norm'].mean().item()}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}")
+                        if "dmd_loss_source" in generator_log_dict:
+                            dmd_decomp_str += (
+                                f", dmd_src {generator_log_dict['dmd_loss_source'].mean().item():.4f}")
+                        if "dmd_loss_target" in generator_log_dict:
+                            dmd_decomp_str += (
+                                f", dmd_trg {generator_log_dict['dmd_loss_target'].mean().item():.4f}")
+                    tloss_str = ""
+                    if teacher_log_dict and "teacher_loss" in teacher_log_dict:
+                        tloss_str = f", teacher_loss {teacher_log_dict['teacher_loss'].mean().item():.4f}"
+                    if TRAIN_GENERATOR and generator_log_dict:
+                        print(f"step {self.step}, per iteration time {iteration_time}, generator_loss {generator_log_dict['generator_loss'].mean().item()}, generator_grad_norm {generator_log_dict['generator_grad_norm'].mean().item()}, dmdtrain_gradient_norm {generator_log_dict['dmdtrain_gradient_norm'].mean().item()}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}{mloss_str}{dmd_decomp_str}{tloss_str}")
                     else:
-                        print(f"step {self.step}, per iteration time {iteration_time}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}")
+                        print(f"step {self.step}, per iteration time {iteration_time}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}{tloss_str}")
 
                 # ---------------------------------------- Visualization ---------------------------------------------------
 
@@ -1500,6 +2118,20 @@ class Trainer:
         step_vis_dir = os.path.join(self.vis_output_dir, f"step_{self.step:07d}")
         os.makedirs(step_vis_dir, exist_ok=True)
         batch = self.fixed_vis_batch
+
+        # Log motion_ref alongside generated videos so wandb shows them together.
+        if (self.is_main_process and not self.disable_wandb
+                and "motion_ref" in batch):
+            try:
+                mref = batch["motion_ref"]
+                if isinstance(mref, (list, tuple)):
+                    mref = mref[0]
+                mref_vis = mref[0].detach().to(torch.float32)           # [T, 3, H, W] in [-1, 1]
+                mref_vis = ((mref_vis.clamp(-1, 1) + 1) * 127.5).to(torch.uint8).cpu().numpy()
+                wandb.log({"vis/motion_ref": wandb.Video(mref_vis, fps=8, format="mp4")},
+                          step=self.step)
+            except Exception as exc:
+                print(f"[Warning] motion_ref wandb upload failed: {exc}")
         if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
             prompts = batch["prompts"]
             switch_prompts = batch["switch_prompts"]
@@ -1537,6 +2169,20 @@ class Trainer:
                 )
                 video_tensor = torch.from_numpy(video_np.astype("uint8"))
                 write_video(out_path, video_tensor, fps=16)
+
+                # Also upload to wandb so videos are visible off-lab.
+                # Use ndarray form (moviepy-encoded) so the dashboard download
+                # button returns a proper mp4; the file-path form was serving
+                # a text reference on download.
+                if self.is_main_process and not self.disable_wandb:
+                    try:
+                        video_tchw = video_np.astype("uint8").transpose(0, 3, 1, 2)
+                        wandb.log(
+                            {f"vis/len{vid_len}_s{idx}": wandb.Video(video_tchw, fps=16, format="mp4")},
+                            step=self.step,
+                        )
+                    except Exception as exc:  # keep training alive on upload hiccups
+                        print(f"[Warning] wandb.Video upload failed: {exc}")
 
             # After saving current length videos, release related tensors to reduce peak memory
             del videos, video_np, video_tensor  # type: ignore

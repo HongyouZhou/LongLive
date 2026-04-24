@@ -62,7 +62,7 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         limit_all_gathers=True,
         use_orig_params=True,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=False  # Load ckpt on rank 0 and sync to other ranks
+        sync_module_states=True  # Load ckpt on rank 0 and sync to other ranks (halves peak CPU RAM)
     )
     return module
 

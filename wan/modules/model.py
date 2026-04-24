@@ -158,13 +158,18 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None):
+    def forward(self, x, context, context_lens, crossattn_cache=None, motion_len=0):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
             crossattn_cache (List[dict], *optional*): Contains the cached key and value tensors for context embedding.
+            motion_len (int, *optional*): Number of trailing tokens in ``context`` that carry
+                motion conditioning. When > 0 we split-cache: text K/V (leading
+                L2-motion_len tokens) is projected once and stored detached; motion
+                K/V is recomputed every forward so gradients can flow back into the
+                motion encoder without triggering double-backward through cached tensors.
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
@@ -172,15 +177,36 @@ class WanT2VCrossAttention(WanSelfAttention):
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
         if crossattn_cache is not None:
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
+            if motion_len > 0:
+                text_ctx = context[:, :-motion_len]
+                motion_ctx = context[:, -motion_len:]
+
+                if not crossattn_cache["is_init"]:
+                    crossattn_cache["is_init"] = True
+                    # Cache text K/V detached so subsequent forwards never
+                    # back-propagate through them (the text path is frozen T5).
+                    crossattn_cache["k"] = self.norm_k(self.k(text_ctx)).view(b, -1, n, d).detach()
+                    crossattn_cache["v"] = self.v(text_ctx).view(b, -1, n, d).detach()
+                text_k = crossattn_cache["k"]
+                text_v = crossattn_cache["v"]
+
+                # Always recompute motion K/V so motion_encoder receives grads
+                # every forward. Cheap: motion_ctx has ~256 tokens.
+                motion_k = self.norm_k(self.k(motion_ctx)).view(b, -1, n, d)
+                motion_v = self.v(motion_ctx).view(b, -1, n, d)
+
+                k = torch.cat([text_k, motion_k], dim=1)
+                v = torch.cat([text_v, motion_v], dim=1)
             else:
-                k = crossattn_cache["k"]
-                v = crossattn_cache["v"]
+                if not crossattn_cache["is_init"]:
+                    crossattn_cache["is_init"] = True
+                    k = self.norm_k(self.k(context)).view(b, -1, n, d)
+                    v = self.v(context).view(b, -1, n, d)
+                    crossattn_cache["k"] = k
+                    crossattn_cache["v"] = v
+                else:
+                    k = crossattn_cache["k"]
+                    v = crossattn_cache["v"]
         else:
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
@@ -321,6 +347,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        motion_len=0,
     ):
         r"""
         Args:
@@ -343,14 +370,15 @@ class WanAttentionBlock(nn.Module):
         x = x + y * e[2]
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        def cross_attn_ffn(x, context, context_lens, e, motion_len):
+            x = x + self.cross_attn(self.norm3(x), context, context_lens,
+                                    motion_len=motion_len)
             y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             # with amp.autocast(dtype=torch.float32):
             x = x + y * e[5]
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, context, context_lens, e, motion_len)
         return x
 
 
@@ -701,10 +729,13 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # context
         context_lens = None
+        _max_in = max(uu.size(0) for uu in context)
+        _pad_len = max(self.text_len, _max_in)
+        motion_len = max(0, _max_in - self.text_len)
         context = self.text_embedding(
             torch.stack([
                 torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    [u, u.new_zeros(_pad_len - u.size(0), u.size(1))])
                 for u in context
             ]))
 
@@ -719,7 +750,8 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            motion_len=motion_len)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -834,10 +866,13 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # context
         context_lens = None
+        _max_in = max(uu.size(0) for uu in context)
+        _pad_len = max(self.text_len, _max_in)
+        motion_len = max(0, _max_in - self.text_len)
         context = self.text_embedding(
             torch.stack([
                 torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    [u, u.new_zeros(_pad_len - u.size(0), u.size(1))])
                 for u in context
             ]))
 
@@ -852,7 +887,8 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            motion_len=motion_len)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):

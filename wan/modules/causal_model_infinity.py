@@ -468,6 +468,7 @@ class CausalWanAttentionBlock(nn.Module):
         current_start=0,
         cache_start=None,
         sink_recache_after_switch=False,
+        motion_len=0,
     ):
         r"""
         Args:
@@ -499,9 +500,11 @@ class CausalWanAttentionBlock(nn.Module):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None,
+                           motion_len=0):
             x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache)
+                                    context_lens, crossattn_cache=crossattn_cache,
+                                    motion_len=motion_len)
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -511,7 +514,8 @@ class CausalWanAttentionBlock(nn.Module):
                      frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache,
+                           motion_len=motion_len)
         
         if cache_update_info is not None:
             # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
@@ -1025,10 +1029,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # print("time embedding done")
         # context
         context_lens = None
+        _max_in = max(u.size(0) for u in context)
+        _pad_len = max(self.text_len, _max_in)
+        motion_len = max(0, _max_in - self.text_len)
         context = self.text_embedding(
             torch.stack([
                 torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    [u, u.new_zeros(_pad_len - u.size(0), u.size(1))])
                 for u in context
             ]))
         # print("text embedding done")
@@ -1045,7 +1052,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             block_mask=self.block_mask,
-            sink_recache_after_switch=sink_recache_after_switch
+            sink_recache_after_switch=sink_recache_after_switch,
+            motion_len=motion_len,
         )
         # print("kwargs done")
         def create_custom_forward(module):
@@ -1205,10 +1213,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # context
         context_lens = None
+        _max_in = max(u.size(0) for u in context)
+        _pad_len = max(self.text_len, _max_in)
+        motion_len = max(0, _max_in - self.text_len)
         context = self.text_embedding(
             torch.stack([
                 torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    [u, u.new_zeros(_pad_len - u.size(0), u.size(1))])
                 for u in context
             ]))
 
@@ -1243,7 +1254,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask)
+            block_mask=self.block_mask,
+            motion_len=motion_len,
+        )
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):

@@ -60,6 +60,7 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
+        motion_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -68,6 +69,12 @@ class CausalInferencePipeline(torch.nn.Module):
                 (batch_size, num_output_frames, num_channels, height, width).
             text_prompts (List[str]): The list of text prompts.
             return_latents (bool): Whether to return the latents.
+            motion_tokens (Optional[Tensor]): Pre-computed motion tokens of
+                shape (B, L_mot, dim) produced by ``MotionEncoder``. When
+                provided they are concatenated to ``conditional_dict["prompt_embeds"]``
+                and the generator's cross-attention split-cache logic
+                (``WanT2VCrossAttention.forward`` with ``motion_len>0``) kicks
+                in automatically.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -80,6 +87,16 @@ class CausalInferencePipeline(torch.nn.Module):
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
+        if motion_tokens is not None:
+            tokens = motion_tokens
+            if tokens.shape[0] == 1 and batch_size > 1:
+                tokens = tokens.expand(batch_size, -1, -1)
+            tokens = tokens.to(
+                device=conditional_dict["prompt_embeds"].device,
+                dtype=conditional_dict["prompt_embeds"].dtype,
+            )
+            conditional_dict["prompt_embeds"] = torch.cat(
+                [conditional_dict["prompt_embeds"], tokens], dim=1)
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5

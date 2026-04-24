@@ -73,19 +73,19 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
             local_attn_size=self.local_attn_size
         )
 
-        context_timestep = torch.ones([batch_size, recompute_frames], 
+        context_timestep = torch.ones([batch_size, num_recache_frames],
                                     device=device, dtype=torch.int64) * self.args.context_noise
-        
+
         self.generator.model.block_mask = block_mask
-            
+
         with torch.no_grad():
             self.generator(
-                noisy_image_or_video=frames_to_recompute,
+                noisy_image_or_video=frames_to_recache,
                 conditional_dict=new_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
-                current_start=recompute_start_frame * self.frame_seq_length,
+                current_start=recache_start_frame * self.frame_seq_length,
             )
 
         # reset cross-attention cache
@@ -104,6 +104,8 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
         low_memory: bool = False,
+        motion_tokens_first: Optional[torch.Tensor] = None,
+        motion_tokens_second: Optional[torch.Tensor] = None,
     ):
         """Generate video with prompt switch.
 
@@ -111,6 +113,10 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
             text_prompts_first: prompt list used before switching (aligned with batch)
             text_prompts_second: prompt list used after switching
             switch_frame_index: 0-based frame index; frames >= this value use the second prompt
+            motion_tokens_first / motion_tokens_second: optional (B, L_mot, dim)
+                tensors from ``MotionEncoder``. When provided they are
+                concatenated to the corresponding segment's prompt_embeds;
+                the generator splits text / motion K/V automatically.
         """
         batch_size, num_output_frames, num_channels, height, width = noise.shape
         assert num_output_frames % self.num_frame_per_block == 0
@@ -119,6 +125,19 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
         # Encode both prompts upfront
         cond_first = self.text_encoder(text_prompts=text_prompts_first)
         cond_second = self.text_encoder(text_prompts=text_prompts_second)
+
+        def _inject(cond, tokens):
+            if tokens is None:
+                return
+            t = tokens
+            if t.shape[0] == 1 and batch_size > 1:
+                t = t.expand(batch_size, -1, -1)
+            t = t.to(device=cond["prompt_embeds"].device,
+                     dtype=cond["prompt_embeds"].dtype)
+            cond["prompt_embeds"] = torch.cat([cond["prompt_embeds"], t], dim=1)
+
+        _inject(cond_first, motion_tokens_first)
+        _inject(cond_second, motion_tokens_second)
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5

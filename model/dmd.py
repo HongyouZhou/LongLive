@@ -131,6 +131,49 @@ class DMD(SelfForcingModel):
             "timestep": timestep.detach()
         }
 
+    def _compute_kl_grad_target(
+        self,
+        noisy_image_or_video: torch.Tensor,
+        estimated_clean_image_or_video: torch.Tensor,
+        timestep: torch.Tensor,
+        conditional_dict_target: dict,
+        normalization: bool = True,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Uni-DAD target-branch KL gradient: (fake_score - target_teacher).
+
+        Called only when `self.target_teacher` is attached (dual-domain DMD
+        enabled). fake_score and target_teacher both see the motion-conditioned
+        prompt embeddings; student's motion_encoder and target_motion_encoder
+        produce those embeddings upstream.
+        """
+        # Fake score on motion-conditioned prompt (no_grad context is the
+        # caller's responsibility, matching _compute_kl_grad).
+        _, pred_fake_image = self.fake_score(
+            noisy_image_or_video=noisy_image_or_video,
+            conditional_dict=conditional_dict_target,
+            timestep=timestep,
+        )
+
+        # Target teacher on same conditioning.
+        _, pred_target_image = self.target_teacher(
+            noisy_image_or_video=noisy_image_or_video,
+            conditional_dict=conditional_dict_target,
+            timestep=timestep,
+        )
+
+        grad = (pred_fake_image - pred_target_image)
+
+        if normalization:
+            p_target = (estimated_clean_image_or_video - pred_target_image)
+            normalizer = torch.abs(p_target).mean(
+                dim=[1, 2, 3, 4], keepdim=True)
+            grad = grad / normalizer
+        grad = torch.nan_to_num(grad)
+
+        return grad, {
+            "dmdtrain_target_gradient_norm": torch.mean(torch.abs(grad)).detach(),
+        }
+
     def compute_distribution_matching_loss(
         self,
         image_or_video: torch.Tensor,
@@ -138,7 +181,8 @@ class DMD(SelfForcingModel):
         unconditional_dict: dict,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
-        denoised_timestep_to: int = 0
+        denoised_timestep_to: int = 0,
+        conditional_dict_target: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -182,8 +226,8 @@ class DMD(SelfForcingModel):
                 timestep.flatten(0, 1)
             ).detach().unflatten(0, (batch_size, num_frame))
 
-            # Step 2: Compute the KL grad
-            grad, dmd_log_dict = self._compute_kl_grad(
+            # Step 2a: Source-branch KL grad (fake_score - real_score).
+            grad_src, dmd_log_dict = self._compute_kl_grad(
                 noisy_image_or_video=noisy_latent,
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
@@ -191,12 +235,55 @@ class DMD(SelfForcingModel):
                 unconditional_dict=unconditional_dict
             )
 
+            # Step 2b: Target-branch KL grad (fake_score - target_teacher),
+            # Uni-DAD dual-domain addition. Only runs when target_teacher
+            # is attached AND caller supplied a motion-conditioned dict.
+            grad_trg = None
+            use_target = (
+                getattr(self, "target_teacher", None) is not None
+                and conditional_dict_target is not None
+            )
+            if use_target:
+                grad_trg, trg_log = self._compute_kl_grad_target(
+                    noisy_image_or_video=noisy_latent,
+                    estimated_clean_image_or_video=original_latent,
+                    timestep=timestep,
+                    conditional_dict_target=conditional_dict_target,
+                )
+                dmd_log_dict.update(trg_log)
+
+        # Source loss (existing behavior, byte-identical when no target).
         if gradient_mask is not None:
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
+            loss_src = 0.5 * F.mse_loss(
+                original_latent.double()[gradient_mask],
+                (original_latent.double() - grad_src.double()).detach()[gradient_mask],
+                reduction="mean")
         else:
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            ), (original_latent.double() - grad.double()).detach(), reduction="mean")
+            loss_src = 0.5 * F.mse_loss(
+                original_latent.double(),
+                (original_latent.double() - grad_src.double()).detach(),
+                reduction="mean")
+
+        dmd_log_dict["dmd_loss_source"] = loss_src.detach()
+
+        # Target loss (new — independent MSE, summed with source).
+        loss_trg = loss_src.new_zeros(())
+        if use_target:
+            if gradient_mask is not None:
+                loss_trg = 0.5 * F.mse_loss(
+                    original_latent.double()[gradient_mask],
+                    (original_latent.double() - grad_trg.double()).detach()[gradient_mask],
+                    reduction="mean")
+            else:
+                loss_trg = 0.5 * F.mse_loss(
+                    original_latent.double(),
+                    (original_latent.double() - grad_trg.double()).detach(),
+                    reduction="mean")
+            dmd_log_dict["dmd_loss_target"] = loss_trg.detach()
+
+        w_real = float(getattr(self, "real_score_loss_weight", 1.0))
+        w_unidad = float(getattr(self, "unidad_motion_loss_weight", 0.0))
+        dmd_loss = w_real * loss_src + w_unidad * loss_trg
         return dmd_loss, dmd_log_dict
 
     def generator_loss(

@@ -1,9 +1,13 @@
+# Cross-paired data + auxiliary motion-consistency loss.
+# Trained from longlive_init.pt — independent run, no warm start from
+# the cross-pair-only ckpt, so cross-pair + motion_loss contributions
+# can be isolated from warm-start inheritance effects.
 generator_ckpt: checkpoints/longlive_init.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
-# real_name: Wan2.1-T2V-1.3B
-real_name: Wan2.1-T2V-14B  # rank-1 uses meta-init; FSDP broadcasts from rank 0
+motion_encoder_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
 fake_name: Wan2.1-T2V-1.3B
 text_encoder_fsdp_wrap_strategy: size
 denoising_step_list:
@@ -11,7 +15,7 @@ denoising_step_list:
 - 750
 - 500
 - 250
-warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+warp_denoising_step: true
 ts_schedule: false
 num_train_timestep: 1000
 timestep_shift: 5.0
@@ -29,8 +33,14 @@ beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
+
+# --- data: cross-paired ---
 data_path: prompts/vidprom_filtered_extended.txt
 switch_prompt_path: prompts/vidprom_filtered_extended_switch.txt
+motion_pair_jsonl: /home/hongyou/dev/data/wm/prompts/motion_pairs_cross_train.jsonl
+val_motion_pair_jsonl: /home/hongyou/dev/data/wm/prompts/motion_pairs_cross_val.jsonl
+motion_ref_root: /home/hongyou/dev/data/wm/motion_refs
+
 batch_size: 1
 gradient_accumulation_steps: 1
 ema_weight: 0.99
@@ -44,7 +54,7 @@ negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕�
 dfake_gen_update_ratio: 5
 image_or_video_shape:
 - 1
-- 240 # unused in streaming training
+- 240
 - 16
 - 60
 - 104
@@ -58,6 +68,26 @@ model_kwargs:
   timestep_shift: 5.0
   local_attn_size: 12
   sink_size: 3
+
+# --- motion encoder ---
+motion_encoder:
+  enabled: true
+  dim: 4096
+  num_layers: 4
+  num_heads: 16
+  tokens_per_frame: 64
+  max_tokens: 512
+  ref_length: 16
+  image_size: [480, 832]
+
+# --- auxiliary motion-consistency loss ---
+# Modular addition: VAE-latent temporal-delta energy matching between the
+# generated chunk and motion_ref. Fully self-contained in utils/motion_loss.py.
+# Toggle off by setting enabled=false to fall back to cross-pair-only DMD.
+motion_loss:
+  enabled: true
+  type: scalar_energy     # or per_channel_energy
+  weight: 0.05            # scaled into generator_loss; keep DMD dominant
 
 # Visualization
 vis_interval: 500
@@ -87,9 +117,6 @@ switch_choices:
 streaming_training: true
 streaming_chunk_size: 21
 streaming_max_length: 240
-# real_score_cpu_offload: disabled — 2x96GB Blackwell has enough GPU room
-# and cpu_offload was double-buffering the 14B teacher on CPU → OOM.
-
 streaming_min_new_frame: 18
 train_first_chunk: true
 
@@ -98,9 +125,9 @@ last_step_only: false
 ## LoRA Configuration
 adapter:
   type: "lora"
-  rank: 256                    # LoRA rank (typical values: 8, 16, 32, 64)
-  alpha: 256                   # LoRA alpha (typically same as rank, but can be different)
-  dropout: 0.0                # LoRA dropout rate
-  dtype: "bfloat16"          # Data type for LoRA parameters: "bfloat16", "float16", "float32"
-  apply_to_critic: true       # Whether to apply LoRA to critic/fake_score model
-  verbose: true              # Whether to print all target module names
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  apply_to_critic: true
+  verbose: true

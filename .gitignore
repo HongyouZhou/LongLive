@@ -2,5 +2,9 @@ __pycache__
 
 longlive_models
 wan_models
+checkpoints
 
 videos
+
+wandb
+logs

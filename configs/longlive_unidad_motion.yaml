@@ -1,0 +1,167 @@
+# Uni-DAD integration on top of motion transfer (single-stage).
+#
+# Differences vs configs/longlive_finetune_motion_cross.yaml:
+#   - Adds `unidad.dual_domain_dmd` block: online-trained target_teacher
+#     (Wan 1.3B + its own motion_encoder) providing a second DMD target.
+#   - `motion_loss` kept dormant (scalar_energy legacy regularizer, disabled).
+#   - Student path unchanged: cross-pair JSONL, LoRA rank 256, streaming 240.
+#
+# When `unidad.enabled=false` this config becomes byte-identical to the
+# crossloss baseline (see plan risks table).
+generator_ckpt: checkpoints/longlive_init.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+motion_encoder_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+fake_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_key: YOUR_WANDB_KEY
+wandb_entity: hongyou
+wandb_project: longlive
+sharding_strategy: hybrid_full
+lr: 1.0e-05
+lr_critic: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+
+# --- data: cross-paired (student) ---
+data_path: prompts/vidprom_filtered_extended.txt
+switch_prompt_path: prompts/vidprom_filtered_extended_switch.txt
+motion_pair_jsonl: /home/hongyou/dev/data/wm/prompts/motion_pairs_cross_train.jsonl
+val_motion_pair_jsonl: /home/hongyou/dev/data/wm/prompts/motion_pairs_cross_val.jsonl
+motion_ref_root: /home/hongyou/dev/data/wm/motion_refs
+
+batch_size: 1
+gradient_accumulation_steps: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 50
+max_checkpoints: 3
+max_iters: 3000
+
+negative_prompt: '色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,杂乱的背景,三条腿,背景人很多,倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 240
+- 16
+- 60
+- 104
+distribution_loss: dmd_switch
+global_sink: false
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+
+# --- student motion encoder (unchanged) ---
+motion_encoder:
+  enabled: true
+  dim: 4096
+  num_layers: 4
+  num_heads: 16
+  tokens_per_frame: 64
+  max_tokens: 512
+  ref_length: 16
+  image_size: [480, 832]
+
+# --- Uni-DAD: dual-domain DMD (online target_teacher) ---
+unidad:
+  enabled: true
+
+  dual_domain_dmd:
+    enabled: true
+    # target_teacher init from the same base as student (longlive_init.pt).
+    target_teacher_init_from: checkpoints/longlive_init.pt
+    target_teacher_model_name: Wan2.1-T2V-1.3B
+    target_teacher_is_causal: true
+    target_teacher_local_attn_size: 12
+    target_teacher_sink_size: 3
+    target_teacher_fsdp_wrap_strategy: size
+    target_teacher_cpu_offload: false
+
+    # Two independent DMD loss weights (Uni-DAD source API):
+    #   real_score_loss_weight  - LongLive's existing DMD term (14B teacher)
+    #   unidad_motion_loss_weight - Uni-DAD's added DMD term (motion-aware teacher)
+    real_score_loss_weight: 1.0
+    unidad_motion_loss_weight: 0.33
+
+    # Online teacher_turn: target_teacher is trained every N training steps
+    # on self-pair data via pure diffusion MSE.
+    target_teacher_update_ratio: 5
+    target_teacher_lr: 1.0e-05
+    target_teacher_beta1: 0.0
+    target_teacher_beta2: 0.999
+
+  # Future: unidad.multi_head_gan (GAN heads). NOT implemented here —
+  # would need its own backbone to avoid coupling into the critic.
+
+# Scalar-energy motion_loss kept wired but disabled.
+motion_loss:
+  enabled: false
+  type: scalar_energy
+  weight: 0.05
+
+# Visualization
+vis_interval: 500
+vis_ema: false
+vis_video_lengths:
+- 240
+val_batch_size: 1
+val_data_path: prompts/vidprom_filtered_extended.txt
+val_switch_prompt_path: prompts/vidprom_filtered_extended_switch.txt
+
+slice_last_frames: 21
+
+switch_mode: random_choice
+switch_choices:
+- 21
+- 39
+- 57
+- 75
+- 93
+- 111
+- 129
+- 147
+- 165
+- 183
+- 201
+
+streaming_training: true
+streaming_chunk_size: 21
+streaming_max_length: 240
+streaming_min_new_frame: 18
+train_first_chunk: true
+
+last_step_only: false
+
+## LoRA Configuration
+adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  apply_to_critic: true
+  verbose: true

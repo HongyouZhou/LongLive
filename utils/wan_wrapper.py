@@ -1,9 +1,12 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
+import json
+import os
 import types
 from typing import List, Optional
 import torch
 from torch import nn
+import torch.distributed as dist
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
@@ -12,6 +15,60 @@ from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.causal_model_infinity import CausalWanModel as CausalWanModelInfinity
+
+
+def _load_wan_with_meta(model_cls, path, **extra_kwargs):
+    """Load a Wan diffusion model, using meta init on non-rank-0 ranks.
+
+    When loading a large teacher (e.g. 14B) across multiple ranks, the default
+    from_pretrained materialises the full fp32 weights on every rank's CPU —
+    on 2 ranks this peaks at ~2× model_size × 4 bytes. For a 14B model on a
+    125GB-RAM box that OOMs before FSDP ever gets to shard.
+
+    Fix: only rank 0 loads the weights. Other ranks build an architecture-only
+    copy on meta device (0 bytes), then materialise empty CUDA tensors for
+    FSDP to broadcast into via `sync_module_states=True`.
+    """
+    rank = int(os.environ.get("RANK", "0"))
+    is_distributed = dist.is_available() and dist.is_initialized()
+
+    if not is_distributed or rank == 0:
+        # Load weights directly in bf16 to halve both CPU and GPU footprint
+        # during FSDP wrap. Cast any stray fp32 buffers (RoPE freqs etc.) so
+        # FSDP's size-based auto-wrap sees uniform dtype.
+        model = model_cls.from_pretrained(
+            path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, **extra_kwargs
+        )
+        for buf_name, buf in model.named_buffers():
+            if buf.dtype == torch.float32:
+                buf.data = buf.data.to(torch.bfloat16)
+        return model
+
+    # Non-rank-0: construct empty model (no weight loading), then move to CUDA.
+    from accelerate import init_empty_weights
+
+    with open(os.path.join(path, "config.json")) as f:
+        cfg = json.load(f)
+    cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    cfg.update(extra_kwargs)
+
+    # Build on bf16 default so `to_empty()` halves GPU allocation vs fp32
+    # (14B × 4 bytes = 56GB → 14B × 2 bytes = 28GB). FSDP's mixed_precision
+    # already runs compute in bf16 so this matches runtime.
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with init_empty_weights():
+            model = model_cls(**cfg)
+    finally:
+        torch.set_default_dtype(original_dtype)
+    if hasattr(model, "register_to_config"):
+        model.register_to_config(**cfg)
+    # Convert meta tensors to empty CUDA tensors; FSDP will broadcast real
+    # values from rank 0 during wrap (sync_module_states=True).
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = model.to_empty(device=device)
+    return model
 
 class WanTextEncoder(torch.nn.Module):
     def __init__(self) -> None:
@@ -180,15 +237,19 @@ class WanDiffusionWrapper(torch.nn.Module):
     ):
         super().__init__()
 
+        # Non-rank-0 ranks use meta-device init to avoid duplicate 14B-in-CPU
+        # materialisation (see _load_wan_with_meta). FSDP's sync_module_states
+        # broadcasts real weights from rank 0 during wrap. NOTE: intentionally
+        # don't pass torch_dtype=bf16 — Wan keeps RoPE/sincos buffers in fp32
+        # and FSDP's size-based auto-wrap refuses to flatten mixed-dtype
+        # groups; FSDP's MixedPrecision handles runtime bf16 casting.
+        path = f"wan_models/{model_name}/"
         if is_causal:
-            if use_infinite_attention:
-                self.model = CausalWanModelInfinity.from_pretrained(
-                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
-            else:
-                self.model = CausalWanModel.from_pretrained(
-                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+            model_cls = CausalWanModelInfinity if use_infinite_attention else CausalWanModel
+            self.model = _load_wan_with_meta(
+                model_cls, path, local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = _load_wan_with_meta(WanModel, path)
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep
