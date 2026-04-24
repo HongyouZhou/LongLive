@@ -1525,13 +1525,13 @@ class Trainer:
                 with torch.no_grad():
                     target_motion_tokens = self.model.target_motion_encoder(
                         motion_ref_dev)
-                conditional_dict_target = {
+                conditional_dict_motion = {
                     **conditional_dict,
                     "prompt_embeds": torch.cat(
                         [text_embeds_no_motion, target_motion_tokens], dim=1),
                 }
-                self.streaming_model.state["conditional_dict_target"] = (
-                    conditional_dict_target)
+                self.streaming_model.state["conditional_dict_motion"] = (
+                    conditional_dict_motion)
 
         self.streaming_active = True
         
@@ -1584,7 +1584,7 @@ class Trainer:
                 device=self.device, dtype=self.dtype)
             with torch.no_grad():
                 target_motion_tokens = self.model.target_motion_encoder(motion_ref)
-            state["conditional_dict_target"] = {
+            state["conditional_dict_motion"] = {
                 **cond_dict,
                 "prompt_embeds": torch.cat(
                     [text_embeds, target_motion_tokens], dim=1),
@@ -1647,8 +1647,8 @@ class Trainer:
             generator_loss, generator_log_dict = self.streaming_model.compute_generator_loss(
                 chunk=generated_chunk,
                 chunk_info=chunk_info,
-                conditional_dict_target=self.streaming_model.state.get(
-                    "conditional_dict_target"),
+                conditional_dict_motion=self.streaming_model.state.get(
+                    "conditional_dict_motion"),
             )
 
             # Optional: auxiliary motion-consistency loss on the generated chunk.
@@ -1936,9 +1936,9 @@ class Trainer:
                         if "dmd_loss_source" in generator_log_dict:
                             wandb_loss_dict["dmd_loss_source"] = (
                                 generator_log_dict["dmd_loss_source"].mean().item())
-                        if "dmd_loss_target" in generator_log_dict:
-                            wandb_loss_dict["dmd_loss_target"] = (
-                                generator_log_dict["dmd_loss_target"].mean().item())
+                        if "dmd_loss_motion" in generator_log_dict:
+                            wandb_loss_dict["dmd_loss_motion"] = (
+                                generator_log_dict["dmd_loss_motion"].mean().item())
                     if not self.disable_wandb:
                         wandb.log(wandb_loss_dict, step=self.step)
 
@@ -1964,9 +1964,9 @@ class Trainer:
                         if "dmd_loss_source" in generator_log_dict:
                             dmd_decomp_str += (
                                 f", dmd_src {generator_log_dict['dmd_loss_source'].mean().item():.4f}")
-                        if "dmd_loss_target" in generator_log_dict:
+                        if "dmd_loss_motion" in generator_log_dict:
                             dmd_decomp_str += (
-                                f", dmd_trg {generator_log_dict['dmd_loss_target'].mean().item():.4f}")
+                                f", dmd_motion {generator_log_dict['dmd_loss_motion'].mean().item():.4f}")
                     tloss_str = ""
                     if teacher_log_dict and "teacher_loss" in teacher_log_dict:
                         tloss_str = f", teacher_loss {teacher_log_dict['teacher_loss'].mean().item():.4f}"

@@ -131,12 +131,12 @@ class DMD(SelfForcingModel):
             "timestep": timestep.detach()
         }
 
-    def _compute_kl_grad_target(
+    def _compute_kl_grad_motion(
         self,
         noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
-        conditional_dict_target: dict,
+        conditional_dict_motion: dict,
         normalization: bool = True,
     ) -> Tuple[torch.Tensor, dict]:
         """Uni-DAD target-branch KL gradient: (fake_score - target_teacher).
@@ -150,14 +150,14 @@ class DMD(SelfForcingModel):
         # caller's responsibility, matching _compute_kl_grad).
         _, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict_target,
+            conditional_dict=conditional_dict_motion,
             timestep=timestep,
         )
 
         # Target teacher on same conditioning.
         _, pred_target_image = self.target_teacher(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict_target,
+            conditional_dict=conditional_dict_motion,
             timestep=timestep,
         )
 
@@ -171,7 +171,7 @@ class DMD(SelfForcingModel):
         grad = torch.nan_to_num(grad)
 
         return grad, {
-            "dmdtrain_target_gradient_norm": torch.mean(torch.abs(grad)).detach(),
+            "dmdtrain_motion_gradient_norm": torch.mean(torch.abs(grad)).detach(),
         }
 
     def compute_distribution_matching_loss(
@@ -182,7 +182,7 @@ class DMD(SelfForcingModel):
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
         denoised_timestep_to: int = 0,
-        conditional_dict_target: Optional[dict] = None,
+        conditional_dict_motion: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -241,14 +241,14 @@ class DMD(SelfForcingModel):
             grad_trg = None
             use_target = (
                 getattr(self, "target_teacher", None) is not None
-                and conditional_dict_target is not None
+                and conditional_dict_motion is not None
             )
             if use_target:
-                grad_trg, trg_log = self._compute_kl_grad_target(
+                grad_trg, trg_log = self._compute_kl_grad_motion(
                     noisy_image_or_video=noisy_latent,
                     estimated_clean_image_or_video=original_latent,
                     timestep=timestep,
-                    conditional_dict_target=conditional_dict_target,
+                    conditional_dict_motion=conditional_dict_motion,
                 )
                 dmd_log_dict.update(trg_log)
 
@@ -279,7 +279,7 @@ class DMD(SelfForcingModel):
                     original_latent.double(),
                     (original_latent.double() - grad_trg.double()).detach(),
                     reduction="mean")
-            dmd_log_dict["dmd_loss_target"] = loss_trg.detach()
+            dmd_log_dict["dmd_loss_motion"] = loss_trg.detach()
 
         w_real = float(getattr(self, "real_score_loss_weight", 1.0))
         w_unidad = float(getattr(self, "unidad_motion_loss_weight", 0.0))

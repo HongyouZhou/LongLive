@@ -550,7 +550,7 @@ class StreamingTrainingModel:
     def compute_generator_loss(self,
         chunk: torch.Tensor,
         chunk_info: Dict[str, Any],
-        conditional_dict_target: Optional[Dict[str, Any]] = None,
+        conditional_dict_motion: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Compute the generator loss.
@@ -558,7 +558,7 @@ class StreamingTrainingModel:
         Args:
             chunk: generated chunk
             chunk_info: chunk metadata
-            conditional_dict_target: optional motion-conditioned prompt dict
+            conditional_dict_motion: optional motion-conditioned prompt dict
                 built with target_motion_encoder tokens (Uni-DAD dual-domain
                 DMD). When None, falls back to single-teacher DMD.
 
@@ -589,7 +589,7 @@ class StreamingTrainingModel:
             gradient_mask=gradient_mask,  # Pass gradient_mask
             denoised_timestep_from=chunk_info["denoised_timestep_from"],
             denoised_timestep_to=chunk_info["denoised_timestep_to"],
-            conditional_dict_target=conditional_dict_target,
+            conditional_dict_motion=conditional_dict_motion,
         )
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
