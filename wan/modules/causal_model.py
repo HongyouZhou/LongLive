@@ -1067,7 +1067,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        sink_recache_after_switch=False,
     ):
+        # `sink_recache_after_switch` only meaningful in streaming inference
+        # (kv_cache path). In training forward it's a no-op but the shared
+        # WanDiffusionWrapper passes it unconditionally — accept and ignore.
+        _ = sink_recache_after_switch
         r"""
         Forward pass through the diffusion model
 

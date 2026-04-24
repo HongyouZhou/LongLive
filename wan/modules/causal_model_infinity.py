@@ -1127,7 +1127,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        sink_recache_after_switch=False,
     ):
+        # Same rationale as CausalWanModel._forward_train — accept and ignore.
+        _ = sink_recache_after_switch
         r"""
         Forward pass through the diffusion model
 
