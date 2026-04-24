@@ -9,6 +9,8 @@
 # When `unidad.enabled=false` this config becomes byte-identical to the
 # crossloss baseline (see plan risks table).
 generator_ckpt: checkpoints/longlive_init.pt
+# Fresh start: do NOT auto-resume from any stale logdir checkpoint.
+auto_resume: false
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size

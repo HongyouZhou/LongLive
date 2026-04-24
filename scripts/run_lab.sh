@@ -18,6 +18,7 @@
 set -euo pipefail
 
 CONFIG="${1:-configs/longlive_train_long.yaml}"
+LOGDIR="${LOGDIR:-logs}"           # per-run checkpoint/vis dir (override for isolated experiments)
 GPUS="${GPUS:-0,1}"
 NPROC="${NPROC:-2}"
 MASTER_PORT="${MASTER_PORT:-29501}"
@@ -55,7 +56,7 @@ CUDA_VISIBLE_DEVICES=${GPUS} ${REMOTE_ENV} \
 python -m torch.distributed.run --nproc_per_node=${NPROC} --master_port=${MASTER_PORT} \
   train.py \
   --config_path ${CONFIG} \
-  --logdir logs \
+  --logdir ${LOGDIR} \
   --wandb-save-dir wandb"
 
 echo "[run_lab] Launching on lab with GPUs=${GPUS} nproc=${NPROC}"
