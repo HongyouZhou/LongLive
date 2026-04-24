@@ -95,9 +95,12 @@ unidad:
     # target_teacher init from the same base as student (longlive_init.pt).
     target_teacher_init_from: checkpoints/longlive_init.pt
     target_teacher_model_name: Wan2.1-T2V-1.3B
-    target_teacher_is_causal: true
-    target_teacher_local_attn_size: 12
-    target_teacher_sink_size: 3
+    # Non-causal: CausalWanModel._forward_train is a stub; non-causal Wan's
+    # full-chunk forward gives richer gradient context anyway (matches
+    # real_score and Uni-DAD paper's standard-UNet teacher).
+    target_teacher_is_causal: false
+    target_teacher_local_attn_size: -1
+    target_teacher_sink_size: 0
     target_teacher_fsdp_wrap_strategy: size
     target_teacher_cpu_offload: false
 
