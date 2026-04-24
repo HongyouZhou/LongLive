@@ -1199,8 +1199,8 @@ class Trainer:
         scaled_teacher_loss.backward()
 
         return {
-            "teacher_loss": teacher_loss.detach(),
-            "teacher_grad_norm": torch.tensor(0.0, device=self.device),
+            "motion_teacher_loss": teacher_loss.detach(),
+            "motion_teacher_grad_norm": torch.tensor(0.0, device=self.device),
         }
 
     def fwdbwd_one_step(self, batch, train_generator):
@@ -1743,7 +1743,7 @@ class Trainer:
             self.max_grad_norm_generator)
         self.target_teacher_optimizer.step()
         tt_log = merge_dict_list(accumulated)
-        tt_log["teacher_grad_norm"] = tt_grad_norm
+        tt_log["motion_teacher_grad_norm"] = tt_grad_norm
         return tt_log
 
     def train(self):
@@ -1925,12 +1925,12 @@ class Trainer:
                         }
                     )
                     if teacher_log_dict:
-                        if "teacher_loss" in teacher_log_dict:
-                            wandb_loss_dict["teacher_loss"] = (
-                                teacher_log_dict["teacher_loss"].mean().item())
-                        if "teacher_grad_norm" in teacher_log_dict:
-                            wandb_loss_dict["teacher_grad_norm"] = (
-                                teacher_log_dict["teacher_grad_norm"].mean().item())
+                        if "motion_teacher_loss" in teacher_log_dict:
+                            wandb_loss_dict["motion_teacher_loss"] = (
+                                teacher_log_dict["motion_teacher_loss"].mean().item())
+                        if "motion_teacher_grad_norm" in teacher_log_dict:
+                            wandb_loss_dict["motion_teacher_grad_norm"] = (
+                                teacher_log_dict["motion_teacher_grad_norm"].mean().item())
                     # Surface dual-DMD source/target decomposition when present.
                     if TRAIN_GENERATOR and generator_log_dict:
                         if "dmd_loss_source" in generator_log_dict:
@@ -1968,8 +1968,8 @@ class Trainer:
                             dmd_decomp_str += (
                                 f", dmd_motion {generator_log_dict['dmd_loss_motion'].mean().item():.4f}")
                     tloss_str = ""
-                    if teacher_log_dict and "teacher_loss" in teacher_log_dict:
-                        tloss_str = f", teacher_loss {teacher_log_dict['teacher_loss'].mean().item():.4f}"
+                    if teacher_log_dict and "motion_teacher_loss" in teacher_log_dict:
+                        tloss_str = f", motion_teacher_loss {teacher_log_dict['motion_teacher_loss'].mean().item():.4f}"
                     if TRAIN_GENERATOR and generator_log_dict:
                         print(f"step {self.step}, per iteration time {iteration_time}, generator_loss {generator_log_dict['generator_loss'].mean().item()}, generator_grad_norm {generator_log_dict['generator_grad_norm'].mean().item()}, dmdtrain_gradient_norm {generator_log_dict['dmdtrain_gradient_norm'].mean().item()}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}{mloss_str}{dmd_decomp_str}{tloss_str}")
                     else:
