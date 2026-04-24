@@ -139,11 +139,11 @@ class DMD(SelfForcingModel):
         conditional_dict_motion: dict,
         normalization: bool = True,
     ) -> Tuple[torch.Tensor, dict]:
-        """Uni-DAD target-branch KL gradient: (fake_score - target_teacher).
+        """Uni-DAD target-branch KL gradient: (fake_score - motion_teacher).
 
-        Called only when `self.target_teacher` is attached (dual-domain DMD
-        enabled). fake_score and target_teacher both see the motion-conditioned
-        prompt embeddings; student's motion_encoder and target_motion_encoder
+        Called only when `self.motion_teacher` is attached (dual-domain DMD
+        enabled). fake_score and motion_teacher both see the motion-conditioned
+        prompt embeddings; student's motion_encoder and motion_teacher_motion_encoder
         produce those embeddings upstream.
         """
         # Fake score on motion-conditioned prompt (no_grad context is the
@@ -155,7 +155,7 @@ class DMD(SelfForcingModel):
         )
 
         # Target teacher on same conditioning.
-        _, pred_target_image = self.target_teacher(
+        _, pred_target_image = self.motion_teacher(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict_motion,
             timestep=timestep,
@@ -235,12 +235,12 @@ class DMD(SelfForcingModel):
                 unconditional_dict=unconditional_dict
             )
 
-            # Step 2b: Target-branch KL grad (fake_score - target_teacher),
-            # Uni-DAD dual-domain addition. Only runs when target_teacher
+            # Step 2b: Target-branch KL grad (fake_score - motion_teacher),
+            # Uni-DAD dual-domain addition. Only runs when motion_teacher
             # is attached AND caller supplied a motion-conditioned dict.
             grad_trg = None
             use_target = (
-                getattr(self, "target_teacher", None) is not None
+                getattr(self, "motion_teacher", None) is not None
                 and conditional_dict_motion is not None
             )
             if use_target:

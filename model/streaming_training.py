@@ -559,7 +559,7 @@ class StreamingTrainingModel:
             chunk: generated chunk
             chunk_info: chunk metadata
             conditional_dict_motion: optional motion-conditioned prompt dict
-                built with target_motion_encoder tokens (Uni-DAD dual-domain
+                built with motion_teacher_motion_encoder tokens (Uni-DAD dual-domain
                 DMD). When None, falls back to single-teacher DMD.
 
         Returns:
