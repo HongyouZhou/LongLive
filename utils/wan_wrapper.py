@@ -9,6 +9,7 @@ from torch import nn
 import torch.distributed as dist
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
+from utils.nfs_serial import nfs_serial
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
@@ -50,9 +51,10 @@ def _load_wan_with_meta(model_cls, path, **extra_kwargs):
         # Load weights directly in bf16 to halve both CPU and GPU footprint
         # during FSDP wrap. Cast any stray fp32 buffers (RoPE freqs etc.) so
         # FSDP's size-based auto-wrap sees uniform dtype.
-        model = model_cls.from_pretrained(
-            path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, **extra_kwargs
-        )
+        with nfs_serial():
+            model = model_cls.from_pretrained(
+                path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, **extra_kwargs
+            )
         for buf_name, buf in model.named_buffers():
             if buf.dtype == torch.float32:
                 buf.data = buf.data.to(torch.bfloat16)
@@ -94,10 +96,11 @@ class WanTextEncoder(torch.nn.Module):
             dtype=torch.float32,
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
-        self.text_encoder.load_state_dict(
-            torch.load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-                       map_location='cpu', weights_only=False)
-        )
+        with nfs_serial():
+            self.text_encoder.load_state_dict(
+                torch.load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+                           map_location='cpu', weights_only=False)
+            )
         
         # Move text encoder to GPU if available
         if torch.cuda.is_available():
@@ -143,10 +146,11 @@ class WanVAEWrapper(torch.nn.Module):
         self.std = torch.tensor(std, dtype=torch.float32)
 
         # init model
-        self.model = _video_vae(
-            pretrained_path=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
-            z_dim=16,
-        ).eval().requires_grad_(False)
+        with nfs_serial():
+            self.model = _video_vae(
+                pretrained_path=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+                z_dim=16,
+            ).eval().requires_grad_(False)
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]

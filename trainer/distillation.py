@@ -12,6 +12,7 @@ from utils.misc import (
     set_seed,
     merge_dict_list
 )
+from utils.nfs_serial import nfs_serial
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import DMD, DMDSwitch
@@ -175,7 +176,8 @@ class Trainer:
             if base_checkpoint_path:
                 if self.is_main_process:
                     print(f"Loading base model from {base_checkpoint_path} (before applying LoRA)")
-                base_checkpoint = torch.load(base_checkpoint_path, map_location="cpu")
+                with nfs_serial():
+                    base_checkpoint = torch.load(base_checkpoint_path, map_location="cpu")
                 
                 # Load generator (directly; no key alignment needed since LoRA not applied yet)
                 if "generator" in base_checkpoint:
@@ -254,7 +256,8 @@ class Trainer:
                 latest_checkpoint = self.find_latest_checkpoint(self.output_path)
                 if latest_checkpoint:
                     try:
-                        checkpoint = torch.load(latest_checkpoint, map_location="cpu")
+                        with nfs_serial():
+                            checkpoint = torch.load(latest_checkpoint, map_location="cpu")
                         if "generator_lora" in checkpoint and "critic_lora" in checkpoint:
                             lora_checkpoint_path = latest_checkpoint
                             if self.is_main_process:
@@ -281,7 +284,8 @@ class Trainer:
                 lora_ckpt_path = getattr(config, "lora_ckpt", None)
                 if lora_ckpt_path:
                     try:
-                        checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
+                        with nfs_serial():
+                            checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
                         if "generator_lora" in checkpoint and "critic_lora" in checkpoint:
                             lora_checkpoint_path = lora_ckpt_path
                             if self.is_main_process:
@@ -301,7 +305,8 @@ class Trainer:
             if lora_checkpoint_path:
                 if self.is_main_process:
                     print(f"Loading LoRA checkpoint from {lora_checkpoint_path} (before FSDP wrapping)")
-                lora_checkpoint = torch.load(lora_checkpoint_path, map_location="cpu")
+                with nfs_serial():
+                    lora_checkpoint = torch.load(lora_checkpoint_path, map_location="cpu")
                 
                 # Load LoRA weights using PEFT's standard method
                 if "generator_lora" in lora_checkpoint:
@@ -511,7 +516,8 @@ class Trainer:
             if init_ckpt_path:
                 if self.is_main_process:
                     print(f"[unidad] loading unidad_score weights from {init_ckpt_path}")
-                init_ckpt = torch.load(init_ckpt_path, map_location="cpu")
+                with nfs_serial():
+                    init_ckpt = torch.load(init_ckpt_path, map_location="cpu")
                 # generator/model weights (strict=False to tolerate missing LoRA keys).
                 gen_key = "generator" if "generator" in init_ckpt else (
                     "model" if "model" in init_ckpt else None)
@@ -697,7 +703,8 @@ class Trainer:
             if checkpoint_path:
                 if self.is_main_process:
                     print(f"Loading checkpoint from {checkpoint_path}")
-                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                with nfs_serial():
+                    checkpoint = torch.load(checkpoint_path, map_location="cpu")
                 
                 # Load generator
                 if "generator" in checkpoint:
