@@ -46,11 +46,17 @@ echo "[data] LL_DATA   = $LL_DATA"
 echo "[data] LL_CONFIG = $LL_CONFIG"
 [ -n "${LL_REMOTE_HOST:-}" ] && echo "[data] LL_REMOTE_HOST = $LL_REMOTE_HOST (arp rsync mode)"
 
-# All real data lives under $LL_DATA. The repo doesn't need symlinks anymore:
-#   - utils/wan_wrapper.py reads WAN_MODELS_ROOT (set by sbatch_train.sh)
-#   - generator_ckpt / score_init_from / motion_* paths get rewritten to
-#     absolute paths inside the rendered *_hpc.yaml below
-mkdir -p "$LL_DATA"/{wan_models,longlive_models/models,wm/motion_refs,wm/prompts,wm/meta,hf_cache}
+# All real data lives flat under $LL_DATA (single namespace, no subdirs):
+#   wan_models/        Wan2.1-T2V-{14B,1.3B}/
+#   longlive_models/   models/longlive_base.pt
+#   motion_refs/       *.mp4 from OpenVid
+#   meta/              data/train/OpenVid-1M.csv
+#   prompts/           motion_pairs_{,cross_}{train,val}.jsonl
+#   hf_cache/          HF download cache
+# - utils/wan_wrapper.py reads WAN_MODELS_ROOT (set by sbatch_train.sh)
+# - generator_ckpt / motion_* paths get rewritten to absolute paths in the
+#   rendered *_hpc.yaml below
+mkdir -p "$LL_DATA"/{wan_models,longlive_models/models,motion_refs,prompts,meta,hf_cache}
 
 # logs/wandb stay local to the repo (small writes, per-job artifacts).
 mkdir -p logs wandb
@@ -122,20 +128,24 @@ fi
 #   data/wm/motion_refs/*.mp4            (CelebV reference clips)
 #   data/wm/prompts/motion_pairs_*.jsonl (train/val pair prompts)
 need_motion=0
-[ -z "$(ls -A "$LL_DATA/wm/motion_refs" 2>/dev/null)" ] && need_motion=1
-[ ! -f "$LL_DATA/wm/prompts/motion_pairs_train.jsonl" ] && need_motion=1
+[ -z "$(ls -A "$LL_DATA/motion_refs" 2>/dev/null)" ] && need_motion=1
+[ ! -f "$LL_DATA/prompts/motion_pairs_train.jsonl" ] && need_motion=1
 
 if [ "$need_motion" -eq 1 ]; then
   if arp_mode; then
-    sync_arp "/home/hongyou/dev/data/wm" "$LL_DATA/wm"
+    # arp's data lives at /home/hongyou/dev/data/wm/{motion_refs,meta,prompts}
+    # — sync each subdir individually into our flat layout.
+    sync_arp "/home/hongyou/dev/data/wm/motion_refs" "$LL_DATA/motion_refs"
+    sync_arp "/home/hongyou/dev/data/wm/meta"        "$LL_DATA/meta"
+    sync_arp "/home/hongyou/dev/data/wm/prompts"     "$LL_DATA/prompts"
   else
     # Default path: build motion data from OpenVid-1M via prepare_openvid.py.
     # Step 1: caption CSV (~400 MB, lives in the same HF dataset repo).
-    if [ ! -f "$LL_DATA/wm/meta/data/train/OpenVid-1M.csv" ]; then
+    if [ ! -f "$LL_DATA/meta/data/train/OpenVid-1M.csv" ]; then
       echo "[data] downloading OpenVid-1M caption CSV ..."
       hf download nkp37/OpenVid-1M --repo-type dataset \
           --include "data/train/OpenVid-1M.csv" \
-          --local-dir "$LL_DATA/wm/meta"
+          --local-dir "$LL_DATA/meta"
     fi
     # Step 2: prepare_openvid.py — downloads part zip (~25 GB), filters & extracts.
     echo "[data] preparing motion data from OpenVid-1M part=$LL_OPENVID_PART, num_keep=$LL_OPENVID_NUM_KEEP"
@@ -143,12 +153,12 @@ if [ "$need_motion" -eq 1 ]; then
     python scripts/prepare_openvid.py \
         --part "$LL_OPENVID_PART" \
         --num_keep "$LL_OPENVID_NUM_KEEP" \
-        --data_root "$LL_DATA/wm"
+        --data_root "$LL_DATA"
     # Step 3: cross-pair JSONL (reuses the refs extracted above; no re-download).
     python scripts/prepare_openvid.py \
         --part "$LL_OPENVID_PART" \
         --num_keep "$LL_OPENVID_NUM_KEEP" \
-        --data_root "$LL_DATA/wm" \
+        --data_root "$LL_DATA" \
         --cross_pair --output_suffix _cross \
         --skip_download --skip_extract
   fi
@@ -172,14 +182,14 @@ data = "$LL_DATA"
 cfg  = OmegaConf.load(src)
 
 def remap_jsonl(p):
-    return f"{data}/wm/prompts/" + os.path.basename(p)
+    return f"{data}/prompts/" + os.path.basename(p)
 
 if "motion_pair_jsonl" in cfg:
     cfg.motion_pair_jsonl     = remap_jsonl(cfg.motion_pair_jsonl)
 if "val_motion_pair_jsonl" in cfg:
     cfg.val_motion_pair_jsonl = remap_jsonl(cfg.val_motion_pair_jsonl)
 if "motion_ref_root" in cfg:
-    cfg.motion_ref_root       = f"{data}/wm/motion_refs"
+    cfg.motion_ref_root       = f"{data}/motion_refs"
 
 # generator_ckpt + score_init_from were repo-relative ("checkpoints/longlive_init.pt").
 # Rewrite to absolute path under \$LL_DATA so no symlink shim is needed.
@@ -200,10 +210,12 @@ print(f"[data] wrote {dst}")
 EOF
 
 echo
-echo "[data] DONE. All data under \$LL_DATA, no symlinks in repo:"
+echo "[data] DONE. All data flat under \$LL_DATA, no symlinks in repo:"
 echo "  $LL_DATA/wan_models/                  — Wan2.1-T2V-{14B,1.3B}"
 echo "  $LL_DATA/longlive_models/models/      — longlive_base.pt"
-echo "  $LL_DATA/wm/                          — motion refs + prompts"
+echo "  $LL_DATA/motion_refs/                 — OpenVid motion clips"
+echo "  $LL_DATA/meta/data/train/             — OpenVid-1M.csv"
+echo "  $LL_DATA/prompts/                     — motion_pairs_*.jsonl"
 echo "  $LL_DATA/hf_cache/                    — HF download cache"
 echo "  $LL_REPO/${LL_CONFIG%.yaml}_hpc.yaml  — config with absolute paths to data"
 echo
