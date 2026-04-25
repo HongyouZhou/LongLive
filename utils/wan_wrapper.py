@@ -9,7 +9,7 @@ from torch import nn
 import torch.distributed as dist
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
-from utils.nfs_serial import nfs_serial, rank0_load
+from utils.nfs_serial import rank0_load
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae, WanVAE_
@@ -51,10 +51,9 @@ def _load_wan_with_meta(model_cls, path, **extra_kwargs):
         # Load weights directly in bf16 to halve both CPU and GPU footprint
         # during FSDP wrap. Cast any stray fp32 buffers (RoPE freqs etc.) so
         # FSDP's size-based auto-wrap sees uniform dtype.
-        with nfs_serial():
-            model = model_cls.from_pretrained(
-                path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, **extra_kwargs
-            )
+        model = model_cls.from_pretrained(
+            path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, **extra_kwargs
+        )
         for buf_name, buf in model.named_buffers():
             if buf.dtype == torch.float32:
                 buf.data = buf.data.to(torch.bfloat16)

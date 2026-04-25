@@ -12,7 +12,7 @@ from utils.misc import (
     set_seed,
     merge_dict_list
 )
-from utils.nfs_serial import nfs_serial, rank0_load
+from utils.nfs_serial import rank0_load
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import DMD, DMDSwitch
