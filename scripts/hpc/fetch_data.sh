@@ -28,6 +28,9 @@ set -euo pipefail
 : "${LL_ENV_NAME:=longlive}"
 : "${LL_REPO:=$PWD}"
 : "${LL_CONFIG:=configs/longlive_finetune_motion_cross.yaml}"
+# Motion data lives in a private HF dataset repo. Override with the actual repo id:
+#   LL_MOTION_HF_REPO=<owner>/<repo> bash scripts/hpc/fetch_data.sh
+: "${LL_MOTION_HF_REPO:=}"
 
 if [ ! -f "$LL_REPO/$LL_CONFIG" ]; then
   echo "[data][error] LL_REPO=$LL_REPO doesn't look like the LongLive repo (missing $LL_CONFIG)." >&2
@@ -121,6 +124,9 @@ need_motion=0
 if [ "$need_motion" -eq 1 ]; then
   if arp_mode; then
     sync_arp "/home/hongyou/dev/data/wm" "data/wm"
+  elif [ -n "$LL_MOTION_HF_REPO" ]; then
+    echo "[data] downloading motion data from HF dataset $LL_MOTION_HF_REPO ..."
+    hf download "$LL_MOTION_HF_REPO" --repo-type dataset --local-dir data/wm
   else
     cat >&2 <<EOF
 [data][error] Motion data missing at $LL_REPO/data/wm.
@@ -129,16 +135,13 @@ if [ "$need_motion" -eq 1 ]; then
                 data/wm/prompts/motion_pairs_{train,val}.jsonl
                 data/wm/prompts/motion_pairs_cross_{train,val}.jsonl
 
-              No public mirror exists — upload it yourself:
-                # from a machine that has the data:
-                rsync -aP /home/hongyou/dev/data/wm/  \\
-                      hozh10@<HPC>:$LL_REPO/data/wm/
-
-              Or, if you already have a copy on HPC, symlink it:
-                ln -sfn /path/to/existing/wm  $LL_REPO/data/wm
-
-              Or, opt into arp rsync (only if reachable):
-                LL_REMOTE_HOST=hongyou@arp bash scripts/hpc/fetch_data.sh
+              Pick one source:
+              (1) HF dataset (preferred):
+                  LL_MOTION_HF_REPO=<owner>/<repo> bash scripts/hpc/fetch_data.sh
+              (2) symlink an existing copy on HPC:
+                  ln -sfn /path/to/existing/wm  $LL_REPO/data/wm
+              (3) opt into arp rsync (only if reachable):
+                  LL_REMOTE_HOST=hongyou@arp bash scripts/hpc/fetch_data.sh
 EOF
     exit 1
   fi
