@@ -29,12 +29,19 @@ mamba activate "$LL_ENV_PREFIX"
 ##############################
 : "${LL_WORK:=$PROJECT_HOME/longlive}"
 
-if [ -d "$LL_WORK/repo" ]; then
-    PROJECT_DIR="$LL_WORK/repo"
-elif [ -n "$SLURM_SUBMIT_DIR" ] && [ -d "$SLURM_SUBMIT_DIR" ]; then
+# Locate the repo. Three options, in order:
+#   1. $LL_REPO if exported
+#   2. $SLURM_SUBMIT_DIR (where you ran `sbatch` from)
+#   3. The grandparent of this script ($script_dir/../.. = repo root)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${LL_REPO:-}" ] && [ -d "$LL_REPO" ]; then
+    PROJECT_DIR="$LL_REPO"
+elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "$SLURM_SUBMIT_DIR/train.py" ]; then
     PROJECT_DIR="$SLURM_SUBMIT_DIR"
+elif [ -f "$SCRIPT_DIR/../../train.py" ]; then
+    PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 else
-    echo "[SLURM] Error: cannot locate LongLive repo (LL_WORK=$LL_WORK)"
+    echo "[SLURM] Error: cannot locate LongLive repo. Set LL_REPO or sbatch from repo root."
     exit 1
 fi
 
