@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class MotionEncoder(nn.Module):
@@ -35,11 +34,14 @@ class MotionEncoder(nn.Module):
 
         self.dim = dim
         self.tokens_per_frame = tokens_per_frame
-        self.pool_size = int(tokens_per_frame ** 0.5)
-        assert self.pool_size * self.pool_size == tokens_per_frame, \
-            "tokens_per_frame must be a square number"
 
         self.patch_proj = nn.Linear(latent_channels, dim)
+        self.pool_queries = nn.Parameter(torch.randn(1, tokens_per_frame, dim) * 0.02)
+        self.attention_pool = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
         self.type_embed = nn.Parameter(torch.zeros(1, 1, dim))
         self.pos_embed = nn.Parameter(torch.randn(1, max_tokens, dim) * 0.02)
 
@@ -67,13 +69,14 @@ class MotionEncoder(nn.Module):
         latent = self._encode_vae(motion_video)
         B, T_lat, C, h, w = latent.shape
 
-        flat = latent.reshape(B * T_lat, C, h, w)
-        pooled = F.adaptive_avg_pool2d(flat, (self.pool_size, self.pool_size))
-        tokens = pooled.reshape(B, T_lat, C, -1).permute(0, 1, 3, 2)
-        tokens = tokens.reshape(B, T_lat * self.tokens_per_frame, C)
-        tokens = tokens.to(self.patch_proj.weight.dtype)
+        flat = latent.reshape(B * T_lat, C, h * w).permute(0, 2, 1)
+        flat = flat.to(self.patch_proj.weight.dtype)
+        proj = self.patch_proj(flat)
 
-        tokens = self.patch_proj(tokens)
+        queries = self.pool_queries.expand(B * T_lat, -1, -1)
+        pooled, _ = self.attention_pool(query=queries, key=proj, value=proj, need_weights=False)
+        tokens = pooled.reshape(B, T_lat * self.tokens_per_frame, self.dim)
+
         L_mot = tokens.shape[1]
         assert L_mot <= self.pos_embed.shape[1], \
             f"L_mot={L_mot} exceeds max_tokens={self.pos_embed.shape[1]}"

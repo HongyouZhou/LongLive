@@ -75,8 +75,8 @@ motion_encoder:
   dim: 4096
   num_layers: 4
   num_heads: 16
-  tokens_per_frame: 64
-  max_tokens: 512
+  tokens_per_frame: 256
+  max_tokens: 2048
   ref_length: 16
   image_size: [480, 832]
 
