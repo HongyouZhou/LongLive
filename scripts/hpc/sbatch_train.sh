@@ -5,7 +5,10 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=200G
+# 14B teacher load needs ~30 GB CPU per rank × 8 ranks = ~240 GB peak.
+# 200G triggers cgroup memory pressure → kernel evicts page cache → NFS
+# reads stall to ~0 MB/s. Give plenty of headroom.
+#SBATCH --mem=900G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%x-%j.out
 # Avoid the 40GB DGX A100s — Wan2.1-T2V-14B teacher OOMs there even with FSDP.
@@ -23,6 +26,10 @@ set -e
 echo "[SLURM] Job ID: $SLURM_JOB_ID"
 echo "[SLURM] Node:   $(hostname)"
 echo "[SLURM] GPUs:   ${SLURM_GPUS_ON_NODE:-8}"
+# Print cgroup memory limit (helps diagnose memory-pressure-induced IO stalls)
+if [ -r /sys/fs/cgroup/memory.max ]; then
+    echo "[SLURM] cgroup memory.max: $(cat /sys/fs/cgroup/memory.max)"
+fi
 
 ##############################
 # Activate mamba environment
