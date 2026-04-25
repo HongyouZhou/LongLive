@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-: "${LL_ENV_PREFIX:=$PROJECT_HOME/envs/longlive}"
+: "${LL_ENV_NAME:=longlive}"
 : "${LL_REPO:=$PWD}"
 : "${LL_REMOTE_REPO:=/home/hongyou/dev/LongLive}"
 : "${LL_REMOTE_DATA:=/home/hongyou/dev/data/wm}"
@@ -43,8 +43,11 @@ mkdir -p logs wandb hf_cache \
          data/wm
 
 # Need huggingface-cli + omegaconf from the env we built.
-source /opt/miniforge/etc/profile.d/conda.sh
-conda activate "$LL_ENV_PREFIX"
+if ! mamba activate "$LL_ENV_NAME" 2>/dev/null; then
+  # shellcheck disable=SC1091
+  source /opt/miniforge/etc/profile.d/conda.sh
+  conda activate "$LL_ENV_NAME"
+fi
 
 # Cache HF downloads inside the repo's hf_cache/ (in .gitignore).
 export HF_HOME="$LL_REPO/hf_cache"

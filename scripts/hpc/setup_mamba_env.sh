@@ -4,9 +4,8 @@
 #
 # Designed against the .bashrc you shared:
 #   - mamba shell hook is already loaded
-#   - /opt/miniforge is the system base (read-only for us)
-#   - $PROJECT_HOME points at the project FS (NOT $HOME) — we put the env there
-#     so the 7+ GB env doesn't eat your /home quota
+#   - your user miniforge lives at $PROJECT_HOME/miniforge3 (envs go in
+#     $PROJECT_HOME/miniforge3/envs/, alongside `repair`, `ada_samp` etc.)
 #   - HF_TOKEN / WANDB_API_KEY already exported (we don't touch them)
 #
 # Idempotent: re-running only redoes the missing pieces.
@@ -14,13 +13,12 @@
 # Usage:
 #   bash scripts/hpc/setup_mamba_env.sh
 #
-# Override the env location:
-#   LL_ENV_PREFIX=/some/other/path/envs/longlive bash scripts/hpc/setup_mamba_env.sh
+# Override the env name:
+#   LL_ENV_NAME=longlive2 bash scripts/hpc/setup_mamba_env.sh
 
 set -euo pipefail
 
-: "${PROJECT_HOME:?PROJECT_HOME not set — source ~/.bashrc first}"
-: "${LL_ENV_PREFIX:=$PROJECT_HOME/envs/longlive}"
+: "${LL_ENV_NAME:=longlive}"
 REQ_FILE="${REQ_FILE:-$(dirname "$0")/../../requirements.txt}"
 
 if ! command -v mamba >/dev/null; then
@@ -28,23 +26,24 @@ if ! command -v mamba >/dev/null; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$LL_ENV_PREFIX")"
+echo "[env] LL_ENV_NAME = $LL_ENV_NAME"
+echo "[env] REQ_FILE    = $REQ_FILE"
 
-echo "[env] LL_ENV_PREFIX = $LL_ENV_PREFIX"
-echo "[env] REQ_FILE      = $REQ_FILE"
-
-# -------- 1. Create env (prefix-style, lives on project FS) --------
-if [ ! -f "$LL_ENV_PREFIX/bin/python" ]; then
-  echo "[env] creating mamba env at $LL_ENV_PREFIX (python 3.10) ..."
-  mamba create -y -p "$LL_ENV_PREFIX" python=3.10
+# -------- 1. Create env (named, resolves under your mamba's default envs_dirs) --------
+if ! mamba env list | awk '{print $1}' | grep -qx "$LL_ENV_NAME"; then
+  echo "[env] creating mamba env '$LL_ENV_NAME' (python 3.10) ..."
+  mamba create -y -n "$LL_ENV_NAME" python=3.10
 else
-  echo "[env] env exists, skipping create."
+  echo "[env] env '$LL_ENV_NAME' exists, skipping create."
 fi
 
-# Activate via conda (mamba activate is noisy in non-interactive shells).
-# shellcheck disable=SC1091
-source /opt/miniforge/etc/profile.d/conda.sh
-conda activate "$LL_ENV_PREFIX"
+# Activate. mamba activate works in scripts because your .bashrc already ran
+# the shell hook; fall back to conda if that's somehow missing.
+if ! mamba activate "$LL_ENV_NAME" 2>/dev/null; then
+  # shellcheck disable=SC1091
+  source /opt/miniforge/etc/profile.d/conda.sh
+  conda activate "$LL_ENV_NAME"
+fi
 
 # -------- 2. PyTorch (matches arp: 2.8.0 + cu128) --------
 if ! python -c "import torch; assert torch.__version__.startswith('2.8.0')" 2>/dev/null; then
@@ -93,5 +92,5 @@ EOF
 
 echo
 echo "[env] DONE. To verify GPU on a compute node:"
-echo "  srun -p gpu --gpus=1 --pty bash -c \\"
-echo "    'source /opt/miniforge/etc/profile.d/conda.sh && conda activate $LL_ENV_PREFIX && python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))\"'"
+echo "  srun -p pgpu --gres=gpu:1 --pty bash -c \\"
+echo "    'source ~/.bashrc && mamba activate $LL_ENV_NAME && python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))\"'"

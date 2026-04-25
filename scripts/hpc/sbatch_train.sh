@@ -19,10 +19,8 @@ echo "[SLURM] GPUs:   ${SLURM_GPUS_ON_NODE:-8}"
 # Activate mamba environment
 ##############################
 source ~/.bashrc
-# Prefix env on project FS (created by setup_mamba_env.sh)
-: "${PROJECT_HOME:?PROJECT_HOME not set}"
-: "${LL_ENV_PREFIX:=$PROJECT_HOME/envs/longlive}"
-mamba activate "$LL_ENV_PREFIX"
+: "${LL_ENV_NAME:=longlive}"
+mamba activate "$LL_ENV_NAME"
 
 ##############################
 # Working directory (= the repo; data lives inside it)
