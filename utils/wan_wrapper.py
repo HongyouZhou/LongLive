@@ -9,10 +9,9 @@ from torch import nn
 import torch.distributed as dist
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
-from utils.nfs_serial import rank0_load
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
-from wan.modules.vae import _video_vae, WanVAE_
+from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.causal_model_infinity import CausalWanModel as CausalWanModelInfinity
@@ -95,15 +94,15 @@ class WanTextEncoder(torch.nn.Module):
             dtype=torch.float32,
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
-        # rank 0 reads NFS once, NCCL-broadcasts state_dict to all ranks.
-        sd = rank0_load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth")
-        self.text_encoder.load_state_dict(sd)
-        del sd
+        self.text_encoder.load_state_dict(
+            torch.load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+                       map_location='cpu', weights_only=False)
+        )
         # Stay on CPU here. The trainer FSDP-wraps this module (after wrapping
-        # the 14B real_score teacher) — wrap_with_meta + sync_module_states will
-        # move + shard it onto GPU at that point. If we eagerly .cuda() here,
-        # 11 GB stays unsharded on every GPU during real_score wrap and triggers
-        # OOM when FSDP allocates its broadcast buffer for the 14B model.
+        # the 14B real_score teacher) — wrap + sync_module_states will move and
+        # shard it onto GPU at that point. Eagerly .cuda() here would leave
+        # 11 GB unsharded on every GPU while real_score is being wrapped and
+        # blow up the FSDP broadcast buffer allocation on 80 GB H100s.
 
         self.tokenizer = HuggingfaceTokenizer(
             name=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
@@ -144,23 +143,11 @@ class WanVAEWrapper(torch.nn.Module):
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.std = torch.tensor(std, dtype=torch.float32)
 
-        # init model. We replicate _video_vae() here but split disk-read from
-        # state_dict load so rank 0 reads NFS once and broadcasts via NCCL.
-        vae_cfg = dict(
-            dim=96,
+        # init model
+        self.model = _video_vae(
+            pretrained_path=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
-            dim_mult=[1, 2, 4, 4],
-            num_res_blocks=2,
-            attn_scales=[],
-            temperal_downsample=[False, True, True],
-            dropout=0.0,
-        )
-        with torch.device('meta'):
-            self.model = WanVAE_(**vae_cfg)
-        sd = rank0_load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth")
-        self.model.load_state_dict(sd, assign=True)
-        del sd
-        self.model = self.model.eval().requires_grad_(False)
+        ).eval().requires_grad_(False)
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
