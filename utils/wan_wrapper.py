@@ -37,10 +37,16 @@ def _load_wan_with_meta(model_cls, path, **extra_kwargs):
     copy on meta device (0 bytes), then materialise empty CUDA tensors for
     FSDP to broadcast into via `sync_module_states=True`.
     """
+    # Use torchrun's RANK/WORLD_SIZE env vars — these are set by the launcher
+    # before any Python code runs, so this works correctly even when called
+    # before dist.init_process_group(). Relying on dist.is_initialized() here
+    # was a bug: if model construction happens before init_process_group, every
+    # rank fell through to "full load" and 8-way concurrent NFS reads of the
+    # 14B safetensors thrashed the shared FS into a hang.
     rank = int(os.environ.get("RANK", "0"))
-    is_distributed = dist.is_available() and dist.is_initialized()
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    if not is_distributed or rank == 0:
+    if world_size <= 1 or rank == 0:
         # Load weights directly in bf16 to halve both CPU and GPU footprint
         # during FSDP wrap. Cast any stray fp32 buffers (RoPE freqs etc.) so
         # FSDP's size-based auto-wrap sees uniform dtype.
