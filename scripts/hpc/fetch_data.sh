@@ -51,11 +51,27 @@ mkdir -p "$LL_DATA"/{wan_models,longlive_models/models,wm/motion_refs,wm/prompts
 
 # Repo-internal symlinks pointing into $LL_DATA. yaml/code keeps repo-relative
 # paths; the symlinks transparently resolve to the persistent data dirs.
+# `ln -sfn target name` quietly nests *inside* `name` if `name` is an existing
+# directory — wipe stale shells (and any nested-wrong link inside them) first.
+make_link() {  # make_link <target> <name>
+  local target="$1" name="$2"
+  if [ -L "$name" ]; then
+    rm -f "$name"
+  elif [ -d "$name" ]; then
+    rm -f "$name/$(basename "$name")"           # remove a possible nested wrong link
+    rmdir "$name" 2>/dev/null || {
+      echo "[data][warn] $name is a non-empty dir, not overwriting" >&2
+      return 0
+    }
+  fi
+  ln -sfn "$target" "$name"
+}
+
 mkdir -p data
-ln -sfn "$LL_DATA/wan_models"        wan_models
-ln -sfn "$LL_DATA/longlive_models"   longlive_models
-ln -sfn "$LL_DATA/wm"                data/wm
-ln -sfn "$LL_DATA/hf_cache"          hf_cache
+make_link "$LL_DATA/wan_models"      wan_models
+make_link "$LL_DATA/longlive_models" longlive_models
+make_link "$LL_DATA/wm"              data/wm
+make_link "$LL_DATA/hf_cache"        hf_cache
 
 # logs/wandb stay local to the repo (small writes, per-job artifacts).
 mkdir -p logs wandb checkpoints
