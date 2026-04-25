@@ -9,16 +9,14 @@
 #                                → MUST already exist at $LL_REPO/data/wm
 #                                  (no public mirror; you have to upload it)
 #
-# Motion data sources you can use (pick one, do this BEFORE running the script):
-#
-#   (a) scp from a machine that has it:
-#       rsync -aP /home/hongyou/dev/data/wm/  hozh10@<HPC>:$PWD_ON_HPC/data/wm/
-#
-#   (b) symlink a copy you already have on HPC:
-#       ln -sfn /sc-projects/sc-proj-.../path/to/wm  $LL_REPO/data/wm
-#
-#   (c) opt-in to rsync from arp via this script (legacy, only if reachable):
-#       LL_REMOTE_HOST=hongyou@arp.example bash scripts/hpc/fetch_data.sh
+# Motion data is built from the OpenVid-1M HF dataset by scripts/prepare_openvid.py:
+#   - downloads `nkp37/OpenVid-1M` part 0 zip (~25 GB) + caption CSV
+#   - filters on motion_score / aesthetic / duration, extracts 1000 clips
+#   - emits self-pair + cross-pair JSONLs
+# Override via:
+#   LL_OPENVID_PART=0          which OpenVid zip part to use
+#   LL_OPENVID_NUM_KEEP=1000   how many clips to keep
+#   LL_REMOTE_HOST=hongyou@arp opt-in to rsync from arp (legacy, faster if reachable)
 #
 # Run on a *login* node (compute nodes typically have no outbound network).
 # Run from the cloned repo root.
@@ -28,9 +26,8 @@ set -euo pipefail
 : "${LL_ENV_NAME:=longlive}"
 : "${LL_REPO:=$PWD}"
 : "${LL_CONFIG:=configs/longlive_finetune_motion_cross.yaml}"
-# Motion data lives in a private HF dataset repo. Override with the actual repo id:
-#   LL_MOTION_HF_REPO=<owner>/<repo> bash scripts/hpc/fetch_data.sh
-: "${LL_MOTION_HF_REPO:=}"
+: "${LL_OPENVID_PART:=0}"
+: "${LL_OPENVID_NUM_KEEP:=1000}"
 
 if [ ! -f "$LL_REPO/$LL_CONFIG" ]; then
   echo "[data][error] LL_REPO=$LL_REPO doesn't look like the LongLive repo (missing $LL_CONFIG)." >&2
@@ -124,26 +121,29 @@ need_motion=0
 if [ "$need_motion" -eq 1 ]; then
   if arp_mode; then
     sync_arp "/home/hongyou/dev/data/wm" "data/wm"
-  elif [ -n "$LL_MOTION_HF_REPO" ]; then
-    echo "[data] downloading motion data from HF dataset $LL_MOTION_HF_REPO ..."
-    hf download "$LL_MOTION_HF_REPO" --repo-type dataset --local-dir data/wm
   else
-    cat >&2 <<EOF
-[data][error] Motion data missing at $LL_REPO/data/wm.
-              Expected:
-                data/wm/motion_refs/*.mp4
-                data/wm/prompts/motion_pairs_{train,val}.jsonl
-                data/wm/prompts/motion_pairs_cross_{train,val}.jsonl
-
-              Pick one source:
-              (1) HF dataset (preferred):
-                  LL_MOTION_HF_REPO=<owner>/<repo> bash scripts/hpc/fetch_data.sh
-              (2) symlink an existing copy on HPC:
-                  ln -sfn /path/to/existing/wm  $LL_REPO/data/wm
-              (3) opt into arp rsync (only if reachable):
-                  LL_REMOTE_HOST=hongyou@arp bash scripts/hpc/fetch_data.sh
-EOF
-    exit 1
+    # Default path: build motion data from OpenVid-1M via prepare_openvid.py.
+    # Step 1: caption CSV (~400 MB, lives in the same HF dataset repo).
+    if [ ! -f "data/wm/meta/data/train/OpenVid-1M.csv" ]; then
+      echo "[data] downloading OpenVid-1M caption CSV ..."
+      hf download nkp37/OpenVid-1M --repo-type dataset \
+          --include "data/train/OpenVid-1M.csv" \
+          --local-dir data/wm/meta
+    fi
+    # Step 2: prepare_openvid.py — downloads part zip (~25 GB), filters & extracts.
+    echo "[data] preparing motion data from OpenVid-1M part=$LL_OPENVID_PART, num_keep=$LL_OPENVID_NUM_KEEP"
+    echo "[data] (downloads ~25 GB zip; takes 10-30 min depending on network)"
+    python scripts/prepare_openvid.py \
+        --part "$LL_OPENVID_PART" \
+        --num_keep "$LL_OPENVID_NUM_KEEP" \
+        --data_root "$LL_REPO/data/wm"
+    # Step 3: cross-pair JSONL (reuses the refs extracted above; no re-download).
+    python scripts/prepare_openvid.py \
+        --part "$LL_OPENVID_PART" \
+        --num_keep "$LL_OPENVID_NUM_KEEP" \
+        --data_root "$LL_REPO/data/wm" \
+        --cross_pair --output_suffix _cross \
+        --skip_download --skip_extract
   fi
 else
   echo "[data] motion data present, skipping."
