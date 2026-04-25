@@ -9,10 +9,10 @@ from torch import nn
 import torch.distributed as dist
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
-from utils.nfs_serial import nfs_serial
+from utils.nfs_serial import nfs_serial, rank0_load
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
-from wan.modules.vae import _video_vae
+from wan.modules.vae import _video_vae, WanVAE_
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.causal_model_infinity import CausalWanModel as CausalWanModelInfinity
@@ -96,11 +96,10 @@ class WanTextEncoder(torch.nn.Module):
             dtype=torch.float32,
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
-        with nfs_serial():
-            self.text_encoder.load_state_dict(
-                torch.load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-                           map_location='cpu', weights_only=False)
-            )
+        # rank 0 reads NFS once, NCCL-broadcasts state_dict to all ranks.
+        sd = rank0_load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth")
+        self.text_encoder.load_state_dict(sd)
+        del sd
         
         # Move text encoder to GPU if available
         if torch.cuda.is_available():
@@ -145,12 +144,23 @@ class WanVAEWrapper(torch.nn.Module):
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.std = torch.tensor(std, dtype=torch.float32)
 
-        # init model
-        with nfs_serial():
-            self.model = _video_vae(
-                pretrained_path=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
-                z_dim=16,
-            ).eval().requires_grad_(False)
+        # init model. We replicate _video_vae() here but split disk-read from
+        # state_dict load so rank 0 reads NFS once and broadcasts via NCCL.
+        vae_cfg = dict(
+            dim=96,
+            z_dim=16,
+            dim_mult=[1, 2, 4, 4],
+            num_res_blocks=2,
+            attn_scales=[],
+            temperal_downsample=[False, True, True],
+            dropout=0.0,
+        )
+        with torch.device('meta'):
+            self.model = WanVAE_(**vae_cfg)
+        sd = rank0_load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth")
+        self.model.load_state_dict(sd, assign=True)
+        del sd
+        self.model = self.model.eval().requires_grad_(False)
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
