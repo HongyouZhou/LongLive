@@ -28,6 +28,11 @@ set -euo pipefail
 : "${LL_CONFIG:=configs/longlive_finetune_motion_cross.yaml}"
 : "${LL_OPENVID_PART:=0}"
 : "${LL_OPENVID_NUM_KEEP:=1000}"
+# Data lives under $PROJECT_DATA (separated from code at $PROJECT_DEV).
+# Per-project subdir defaults to $PROJECT_DATA itself (flat layout); set LL_DATA
+# to $PROJECT_DATA/longlive etc. if you want sub-namespacing later.
+: "${PROJECT_DATA:?PROJECT_DATA not set — add 'export PROJECT_DATA=\$PROJECT_HOME/data' to ~/.bashrc}"
+: "${LL_DATA:=$PROJECT_DATA}"
 
 if [ ! -f "$LL_REPO/$LL_CONFIG" ]; then
   echo "[data][error] LL_REPO=$LL_REPO doesn't look like the LongLive repo (missing $LL_CONFIG)." >&2
@@ -37,12 +42,23 @@ fi
 
 cd "$LL_REPO"
 echo "[data] LL_REPO   = $LL_REPO"
+echo "[data] LL_DATA   = $LL_DATA"
 echo "[data] LL_CONFIG = $LL_CONFIG"
 [ -n "${LL_REMOTE_HOST:-}" ] && echo "[data] LL_REMOTE_HOST = $LL_REMOTE_HOST (arp rsync mode)"
 
-mkdir -p logs wandb hf_cache \
-         wan_models longlive_models/models checkpoints \
-         data/wm
+# Real directories under $LL_DATA (data-only, persistent).
+mkdir -p "$LL_DATA"/{wan_models,longlive_models/models,wm/motion_refs,wm/prompts,wm/meta,hf_cache}
+
+# Repo-internal symlinks pointing into $LL_DATA. yaml/code keeps repo-relative
+# paths; the symlinks transparently resolve to the persistent data dirs.
+mkdir -p data
+ln -sfn "$LL_DATA/wan_models"        wan_models
+ln -sfn "$LL_DATA/longlive_models"   longlive_models
+ln -sfn "$LL_DATA/wm"                data/wm
+ln -sfn "$LL_DATA/hf_cache"          hf_cache
+
+# logs/wandb stay local to the repo (small writes, per-job artifacts).
+mkdir -p logs wandb checkpoints
 
 # Activate env (needs `hf` + omegaconf). mamba shell hook isn't loaded in
 # non-interactive subshells, so eval it explicitly. Skip if env is already
@@ -52,9 +68,9 @@ if [ "${CONDA_DEFAULT_ENV:-}" != "$LL_ENV_NAME" ]; then
   mamba activate "$LL_ENV_NAME"
 fi
 
-# Cache HF downloads inside the repo's hf_cache/ (in .gitignore).
-export HF_HOME="$LL_REPO/hf_cache"
-export TRANSFORMERS_CACHE="$LL_REPO/hf_cache"
+# HF downloads cached in $LL_DATA/hf_cache (shared across runs / branches).
+export HF_HOME="$LL_DATA/hf_cache"
+export TRANSFORMERS_CACHE="$LL_DATA/hf_cache"
 : "${HF_TOKEN:?HF_TOKEN not set — your .bashrc should export it}"
 
 # -------- helpers --------
@@ -68,15 +84,13 @@ sync_arp() {  # rsync remote_path local_path
 }
 
 # -------- 1. LongLive-1.3B base ckpt (5.3 GB) --------
-# HF repo Efficient-Large-Model/LongLive-1.3B contains longlive_base.pt
-# (and assets/prompts that ship in the repo already, harmless to redownload).
-if [ ! -f "longlive_models/models/longlive_base.pt" ]; then
+if [ ! -f "$LL_DATA/longlive_models/models/longlive_base.pt" ]; then
   if arp_mode; then
-    sync_arp "/home/hongyou/dev/LongLive/longlive_models/models" "longlive_models/models"
+    sync_arp "/home/hongyou/dev/LongLive/longlive_models/models" "$LL_DATA/longlive_models/models"
   else
     echo "[data] downloading LongLive-1.3B from HF Hub ..."
     hf download Efficient-Large-Model/LongLive-1.3B \
-        --local-dir longlive_models \
+        --local-dir "$LL_DATA/longlive_models" \
         --include "models/longlive_base.pt"
   fi
 else
@@ -85,25 +99,25 @@ fi
 ln -sfn "../longlive_models/models/longlive_base.pt" "checkpoints/longlive_init.pt"
 
 # -------- 2. Wan2.1 weights (~82 GB total) --------
-if [ ! -f "wan_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth" ]; then
+if [ ! -f "$LL_DATA/wan_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth" ]; then
   if arp_mode; then
-    sync_arp "/home/hongyou/dev/LongLive/wan_models" "wan_models"
+    sync_arp "/home/hongyou/dev/LongLive/wan_models" "$LL_DATA/wan_models"
   else
     echo "[data] downloading Wan2.1-T2V-14B from HF Hub (~65 GB) ..."
     hf download Wan-AI/Wan2.1-T2V-14B \
-        --local-dir wan_models/Wan2.1-T2V-14B
+        --local-dir "$LL_DATA/wan_models/Wan2.1-T2V-14B"
   fi
 else
   echo "[data] Wan2.1-T2V-14B already present, skipping."
 fi
 
-if [ ! -f "wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth" ]; then
+if [ ! -f "$LL_DATA/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth" ]; then
   if arp_mode; then
     : # already covered by the wan_models rsync above
   else
     echo "[data] downloading Wan2.1-T2V-1.3B from HF Hub (~17 GB) ..."
     hf download Wan-AI/Wan2.1-T2V-1.3B \
-        --local-dir wan_models/Wan2.1-T2V-1.3B
+        --local-dir "$LL_DATA/wan_models/Wan2.1-T2V-1.3B"
   fi
 else
   echo "[data] Wan2.1-T2V-1.3B already present, skipping."
@@ -114,21 +128,20 @@ fi
 #   data/wm/motion_refs/*.mp4            (CelebV reference clips)
 #   data/wm/prompts/motion_pairs_*.jsonl (train/val pair prompts)
 need_motion=0
-[ ! -d "data/wm/motion_refs" ] && need_motion=1
-[ -d "data/wm/motion_refs" ] && [ -z "$(ls -A data/wm/motion_refs 2>/dev/null)" ] && need_motion=1
-[ ! -d "data/wm/prompts"    ] && need_motion=1
+[ -z "$(ls -A "$LL_DATA/wm/motion_refs" 2>/dev/null)" ] && need_motion=1
+[ ! -f "$LL_DATA/wm/prompts/motion_pairs_train.jsonl" ] && need_motion=1
 
 if [ "$need_motion" -eq 1 ]; then
   if arp_mode; then
-    sync_arp "/home/hongyou/dev/data/wm" "data/wm"
+    sync_arp "/home/hongyou/dev/data/wm" "$LL_DATA/wm"
   else
     # Default path: build motion data from OpenVid-1M via prepare_openvid.py.
     # Step 1: caption CSV (~400 MB, lives in the same HF dataset repo).
-    if [ ! -f "data/wm/meta/data/train/OpenVid-1M.csv" ]; then
+    if [ ! -f "$LL_DATA/wm/meta/data/train/OpenVid-1M.csv" ]; then
       echo "[data] downloading OpenVid-1M caption CSV ..."
       hf download nkp37/OpenVid-1M --repo-type dataset \
           --include "data/train/OpenVid-1M.csv" \
-          --local-dir data/wm/meta
+          --local-dir "$LL_DATA/wm/meta"
     fi
     # Step 2: prepare_openvid.py — downloads part zip (~25 GB), filters & extracts.
     echo "[data] preparing motion data from OpenVid-1M part=$LL_OPENVID_PART, num_keep=$LL_OPENVID_NUM_KEEP"
@@ -136,12 +149,12 @@ if [ "$need_motion" -eq 1 ]; then
     python scripts/prepare_openvid.py \
         --part "$LL_OPENVID_PART" \
         --num_keep "$LL_OPENVID_NUM_KEEP" \
-        --data_root "$LL_REPO/data/wm"
+        --data_root "$LL_DATA/wm"
     # Step 3: cross-pair JSONL (reuses the refs extracted above; no re-download).
     python scripts/prepare_openvid.py \
         --part "$LL_OPENVID_PART" \
         --num_keep "$LL_OPENVID_NUM_KEEP" \
-        --data_root "$LL_REPO/data/wm" \
+        --data_root "$LL_DATA/wm" \
         --cross_pair --output_suffix _cross \
         --skip_download --skip_extract
   fi
@@ -179,11 +192,13 @@ print(f"[data] wrote {dst}")
 EOF
 
 echo
-echo "[data] DONE. Layout:"
-echo "  $LL_REPO/wan_models/                  — Wan2.1-T2V-{14B,1.3B}"
-echo "  $LL_REPO/longlive_models/models/      — longlive_base.pt"
-echo "  $LL_REPO/checkpoints/longlive_init.pt → ../longlive_models/models/longlive_base.pt"
-echo "  $LL_REPO/data/wm/                     — motion refs + prompts (your upload)"
+echo "[data] DONE. Layout (real data in \$LL_DATA, repo has symlinks):"
+echo "  $LL_DATA/wan_models/                  — Wan2.1-T2V-{14B,1.3B}"
+echo "  $LL_DATA/longlive_models/models/      — longlive_base.pt"
+echo "  $LL_DATA/wm/                          — motion refs + prompts"
+echo "  $LL_DATA/hf_cache/                    — HF download cache"
+echo "  $LL_REPO/wan_models  → \$LL_DATA/wan_models"
+echo "  $LL_REPO/data/wm     → \$LL_DATA/wm"
 echo "  $LL_REPO/${LL_CONFIG%.yaml}_hpc.yaml  — patched config"
 echo
 echo "Next: sbatch scripts/hpc/sbatch_train.sh"

@@ -74,6 +74,7 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 # export NCCL_IB_HCA=mlx5_0
 
 # WANDB_API_KEY + HF_TOKEN come from ~/.bashrc.
+# hf_cache is a symlink to $PROJECT_DATA/hf_cache (created by fetch_data.sh).
 export WANDB_DIR="$PROJECT_DIR/wandb"
 export HF_HOME="$PROJECT_DIR/hf_cache"
 export TRANSFORMERS_CACHE="$PROJECT_DIR/hf_cache"
