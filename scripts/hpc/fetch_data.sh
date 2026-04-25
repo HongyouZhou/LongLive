@@ -44,10 +44,12 @@ mkdir -p logs wandb hf_cache \
          wan_models longlive_models/models checkpoints \
          data/wm
 
-# Activate env (needs huggingface-cli + omegaconf).
-if ! mamba activate "$LL_ENV_NAME" 2>/dev/null; then
-  source /opt/miniforge/etc/profile.d/conda.sh
-  conda activate "$LL_ENV_NAME"
+# Activate env (needs `hf` + omegaconf). mamba shell hook isn't loaded in
+# non-interactive subshells, so eval it explicitly. Skip if env is already
+# active (e.g. user ran `mamba activate longlive` in parent shell).
+if [ "${CONDA_DEFAULT_ENV:-}" != "$LL_ENV_NAME" ]; then
+  eval "$(mamba shell hook --shell bash)"
+  mamba activate "$LL_ENV_NAME"
 fi
 
 # Cache HF downloads inside the repo's hf_cache/ (in .gitignore).
@@ -73,7 +75,7 @@ if [ ! -f "longlive_models/models/longlive_base.pt" ]; then
     sync_arp "/home/hongyou/dev/LongLive/longlive_models/models" "longlive_models/models"
   else
     echo "[data] downloading LongLive-1.3B from HF Hub ..."
-    huggingface-cli download Efficient-Large-Model/LongLive-1.3B \
+    hf download Efficient-Large-Model/LongLive-1.3B \
         --local-dir longlive_models \
         --include "models/longlive_base.pt"
   fi
@@ -88,7 +90,7 @@ if [ ! -f "wan_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth" ]; then
     sync_arp "/home/hongyou/dev/LongLive/wan_models" "wan_models"
   else
     echo "[data] downloading Wan2.1-T2V-14B from HF Hub (~65 GB) ..."
-    huggingface-cli download Wan-AI/Wan2.1-T2V-14B \
+    hf download Wan-AI/Wan2.1-T2V-14B \
         --local-dir wan_models/Wan2.1-T2V-14B
   fi
 else
@@ -100,7 +102,7 @@ if [ ! -f "wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth" ]; then
     : # already covered by the wan_models rsync above
   else
     echo "[data] downloading Wan2.1-T2V-1.3B from HF Hub (~17 GB) ..."
-    huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B \
+    hf download Wan-AI/Wan2.1-T2V-1.3B \
         --local-dir wan_models/Wan2.1-T2V-1.3B
   fi
 else
