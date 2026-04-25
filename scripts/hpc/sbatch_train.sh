@@ -8,6 +8,15 @@
 #SBATCH --mem=200G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%x-%j.out
+# Avoid the 40GB DGX A100s — Wan2.1-T2V-14B teacher OOMs there even with FSDP.
+#SBATCH --exclude=s-sc-dgx[01-02]
+#
+# To pin a specific GPU type, override --gres on the sbatch command line:
+#   sbatch --gres=gpu:nvidia_h200:8        scripts/hpc/sbatch_train.sh   # 141 GB Hopper, fastest
+#   sbatch --gres=gpu:nvidia_h100_80gb:8   scripts/hpc/sbatch_train.sh   # only on s-sc-pgpu08
+#   sbatch --gres=gpu:nvidia_a100-sxm4:8   scripts/hpc/sbatch_train.sh   # 80GB A100 (dgx excluded above)
+# Confirm the exact GRES strings on your cluster:
+#   scontrol show node s-sc-pgpu11 | grep -i gres
 
 set -e
 
