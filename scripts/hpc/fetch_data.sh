@@ -28,11 +28,11 @@ set -euo pipefail
 : "${LL_CONFIG:=configs/longlive_finetune_motion_cross.yaml}"
 : "${LL_OPENVID_PART:=0}"
 : "${LL_OPENVID_NUM_KEEP:=1000}"
-# Data lives under $PROJECT_DATA (separated from code at $PROJECT_DEV).
-# Per-project subdir defaults to $PROJECT_DATA itself (flat layout); set LL_DATA
-# to $PROJECT_DATA/longlive etc. if you want sub-namespacing later.
-: "${PROJECT_DATA:?PROJECT_DATA not set — add 'export PROJECT_DATA=\$PROJECT_HOME/data' to ~/.bashrc}"
-: "${LL_DATA:=$PROJECT_DATA}"
+# Data lives under $PROJECT_DATA (shared data root, common across projects).
+# This script claims the "wm" sub-namespace under it. Override LL_DATA to
+# put it elsewhere.
+: "${PROJECT_DATA:?PROJECT_DATA not set — add 'export PROJECT_DATA=\$PROJECT_DEV/data' to ~/.bashrc}"
+: "${LL_DATA:=$PROJECT_DATA/wm}"
 
 if [ ! -f "$LL_REPO/$LL_CONFIG" ]; then
   echo "[data][error] LL_REPO=$LL_REPO doesn't look like the LongLive repo (missing $LL_CONFIG)." >&2
