@@ -73,13 +73,21 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 # export NCCL_SOCKET_IFNAME=ib0
 # export NCCL_IB_HCA=mlx5_0
 
+##############################
+# Data source — explicit, no symlinks
+##############################
+: "${LL_DATA:=$PROJECT_DATA}"
+export WAN_MODELS_ROOT="$LL_DATA/wan_models"     # utils/wan_wrapper.py reads this
+export HF_HOME="$LL_DATA/hf_cache"
+export TRANSFORMERS_CACHE="$LL_DATA/hf_cache"
 # WANDB_API_KEY + HF_TOKEN come from ~/.bashrc.
-# hf_cache is a symlink to $PROJECT_DATA/hf_cache (created by fetch_data.sh).
 export WANDB_DIR="$PROJECT_DIR/wandb"
-export HF_HOME="$PROJECT_DIR/hf_cache"
-export TRANSFORMERS_CACHE="$PROJECT_DIR/hf_cache"
 
-mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/wandb"
+echo "[SLURM] Data root:       $LL_DATA"
+echo "[SLURM] WAN_MODELS_ROOT:  $WAN_MODELS_ROOT"
+echo "[SLURM] HF_HOME:          $HF_HOME"
+
+mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/wandb" "$LL_DATA/hf_cache"
 
 ##############################
 # Start training

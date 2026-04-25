@@ -17,6 +17,14 @@ from wan.modules.causal_model import CausalWanModel
 from wan.modules.causal_model_infinity import CausalWanModel as CausalWanModelInfinity
 
 
+# Root containing the pretrained Wan2.1 checkpoints
+# (Wan2.1-T2V-{14B,1.3B}/ subdirectories live underneath).
+# Defaults to repo-relative `wan_models` to match the historical layout;
+# override with WAN_MODELS_ROOT for HPC/cluster runs where weights live
+# under a separate $PROJECT_DATA tree.
+WAN_MODELS_ROOT = os.environ.get("WAN_MODELS_ROOT", "wan_models")
+
+
 def _load_wan_with_meta(model_cls, path, **extra_kwargs):
     """Load a Wan diffusion model, using meta init on non-rank-0 ranks.
 
@@ -81,7 +89,7 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
         
@@ -90,7 +98,7 @@ class WanTextEncoder(torch.nn.Module):
             self.text_encoder = self.text_encoder.cuda()
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -130,7 +138,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -243,7 +251,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # don't pass torch_dtype=bf16 — Wan keeps RoPE/sincos buffers in fp32
         # and FSDP's size-based auto-wrap refuses to flatten mixed-dtype
         # groups; FSDP's MixedPrecision handles runtime bf16 casting.
-        path = f"wan_models/{model_name}/"
+        path = f"{WAN_MODELS_ROOT}/{model_name}/"
         if is_causal:
             model_cls = CausalWanModelInfinity if use_infinite_attention else CausalWanModel
             self.model = _load_wan_with_meta(

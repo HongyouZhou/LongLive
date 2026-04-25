@@ -46,35 +46,14 @@ echo "[data] LL_DATA   = $LL_DATA"
 echo "[data] LL_CONFIG = $LL_CONFIG"
 [ -n "${LL_REMOTE_HOST:-}" ] && echo "[data] LL_REMOTE_HOST = $LL_REMOTE_HOST (arp rsync mode)"
 
-# Real directories under $LL_DATA (data-only, persistent).
+# All real data lives under $LL_DATA. The repo doesn't need symlinks anymore:
+#   - utils/wan_wrapper.py reads WAN_MODELS_ROOT (set by sbatch_train.sh)
+#   - generator_ckpt / score_init_from / motion_* paths get rewritten to
+#     absolute paths inside the rendered *_hpc.yaml below
 mkdir -p "$LL_DATA"/{wan_models,longlive_models/models,wm/motion_refs,wm/prompts,wm/meta,hf_cache}
 
-# Repo-internal symlinks pointing into $LL_DATA. yaml/code keeps repo-relative
-# paths; the symlinks transparently resolve to the persistent data dirs.
-# `ln -sfn target name` quietly nests *inside* `name` if `name` is an existing
-# directory — wipe stale shells (and any nested-wrong link inside them) first.
-make_link() {  # make_link <target> <name>
-  local target="$1" name="$2"
-  if [ -L "$name" ]; then
-    rm -f "$name"
-  elif [ -d "$name" ]; then
-    rm -f "$name/$(basename "$name")"           # remove a possible nested wrong link
-    rmdir "$name" 2>/dev/null || {
-      echo "[data][warn] $name is a non-empty dir, not overwriting" >&2
-      return 0
-    }
-  fi
-  ln -sfn "$target" "$name"
-}
-
-mkdir -p data
-make_link "$LL_DATA/wan_models"      wan_models
-make_link "$LL_DATA/longlive_models" longlive_models
-make_link "$LL_DATA/wm"              data/wm
-make_link "$LL_DATA/hf_cache"        hf_cache
-
 # logs/wandb stay local to the repo (small writes, per-job artifacts).
-mkdir -p logs wandb checkpoints
+mkdir -p logs wandb
 
 # Activate env (needs `hf` + omegaconf). mamba shell hook isn't loaded in
 # non-interactive subshells, so eval it explicitly. Skip if env is already
@@ -112,7 +91,6 @@ if [ ! -f "$LL_DATA/longlive_models/models/longlive_base.pt" ]; then
 else
   echo "[data] longlive_base.pt already present, skipping."
 fi
-ln -sfn "../longlive_models/models/longlive_base.pt" "checkpoints/longlive_init.pt"
 
 # -------- 2. Wan2.1 weights (~82 GB total) --------
 if [ ! -f "$LL_DATA/wan_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth" ]; then
@@ -190,31 +168,48 @@ from omegaconf import OmegaConf
 
 src  = "$SRC_YAML"
 dst  = "$DST_YAML"
-repo = "$LL_REPO"
+data = "$LL_DATA"
 cfg  = OmegaConf.load(src)
 
 def remap_jsonl(p):
-    return f"{repo}/data/wm/prompts/" + os.path.basename(p)
+    return f"{data}/wm/prompts/" + os.path.basename(p)
 
 if "motion_pair_jsonl" in cfg:
     cfg.motion_pair_jsonl     = remap_jsonl(cfg.motion_pair_jsonl)
 if "val_motion_pair_jsonl" in cfg:
     cfg.val_motion_pair_jsonl = remap_jsonl(cfg.val_motion_pair_jsonl)
 if "motion_ref_root" in cfg:
-    cfg.motion_ref_root       = f"{repo}/data/wm/motion_refs"
+    cfg.motion_ref_root       = f"{data}/wm/motion_refs"
+
+# generator_ckpt + score_init_from were repo-relative ("checkpoints/longlive_init.pt").
+# Rewrite to absolute path under \$LL_DATA so no symlink shim is needed.
+def remap_ckpt(p):
+    if not p or os.path.isabs(p):
+        return p
+    if "longlive_init" in p or "longlive_base" in p:
+        return f"{data}/longlive_models/models/longlive_base.pt"
+    return os.path.join(data, p)  # generic fallback
+
+if "generator_ckpt" in cfg:
+    cfg.generator_ckpt = remap_ckpt(cfg.generator_ckpt)
+if "unidad" in cfg and "dual_domain_dmd" in cfg.unidad and "score_init_from" in cfg.unidad.dual_domain_dmd:
+    cfg.unidad.dual_domain_dmd.score_init_from = remap_ckpt(cfg.unidad.dual_domain_dmd.score_init_from)
 
 OmegaConf.save(cfg, dst)
 print(f"[data] wrote {dst}")
 EOF
 
 echo
-echo "[data] DONE. Layout (real data in \$LL_DATA, repo has symlinks):"
+echo "[data] DONE. All data under \$LL_DATA, no symlinks in repo:"
 echo "  $LL_DATA/wan_models/                  — Wan2.1-T2V-{14B,1.3B}"
 echo "  $LL_DATA/longlive_models/models/      — longlive_base.pt"
 echo "  $LL_DATA/wm/                          — motion refs + prompts"
 echo "  $LL_DATA/hf_cache/                    — HF download cache"
-echo "  $LL_REPO/wan_models  → \$LL_DATA/wan_models"
-echo "  $LL_REPO/data/wm     → \$LL_DATA/wm"
-echo "  $LL_REPO/${LL_CONFIG%.yaml}_hpc.yaml  — patched config"
+echo "  $LL_REPO/${LL_CONFIG%.yaml}_hpc.yaml  — config with absolute paths to data"
+echo
+echo "Training picks up data via:"
+echo "  * sbatch_train.sh exports  WAN_MODELS_ROOT=\$LL_DATA/wan_models"
+echo "  * sbatch_train.sh exports  HF_HOME=\$LL_DATA/hf_cache"
+echo "  * *_hpc.yaml has absolute  generator_ckpt / motion_ref_root / motion_pair_jsonl"
 echo
 echo "Next: sbatch scripts/hpc/sbatch_train.sh"
