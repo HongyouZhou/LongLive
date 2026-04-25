@@ -9,4 +9,9 @@ videos
 wandb
 logs
 
+# HPC scratch (fetched by scripts/hpc/fetch_data.sh)
+data
+hf_cache
+configs/*_hpc.yaml
+
 .claude

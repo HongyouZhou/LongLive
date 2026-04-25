@@ -25,14 +25,8 @@ source ~/.bashrc
 mamba activate "$LL_ENV_PREFIX"
 
 ##############################
-# Working directory
+# Working directory (= the repo; data lives inside it)
 ##############################
-: "${LL_WORK:=$PROJECT_HOME/longlive}"
-
-# Locate the repo. Three options, in order:
-#   1. $LL_REPO if exported
-#   2. $SLURM_SUBMIT_DIR (where you ran `sbatch` from)
-#   3. The grandparent of this script ($script_dir/../.. = repo root)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${LL_REPO:-}" ] && [ -d "$LL_REPO" ]; then
     PROJECT_DIR="$LL_REPO"
@@ -73,11 +67,11 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 # export NCCL_IB_HCA=mlx5_0
 
 # WANDB_API_KEY + HF_TOKEN come from ~/.bashrc.
-export WANDB_DIR="$LL_WORK/wandb"
-export HF_HOME="$LL_WORK/hf_cache"
-export TRANSFORMERS_CACHE="$LL_WORK/hf_cache"
+export WANDB_DIR="$PROJECT_DIR/wandb"
+export HF_HOME="$PROJECT_DIR/hf_cache"
+export TRANSFORMERS_CACHE="$PROJECT_DIR/hf_cache"
 
-mkdir -p "$LL_WORK/logs" "$LL_WORK/wandb"
+mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/wandb"
 
 ##############################
 # Start training
@@ -97,8 +91,8 @@ if [ "$NNODES" -gt 1 ]; then
             --rdzv_id=$SLURM_JOB_ID \
             train.py \
             --config_path $LL_CONFIG \
-            --logdir $LL_WORK/logs \
-            --wandb-save-dir $LL_WORK/wandb
+            --logdir $PROJECT_DIR/logs \
+            --wandb-save-dir $PROJECT_DIR/wandb
     "
 else
     # Single-node: simpler launch, matches your run_lab.sh / run_slurm_aue.sh style.
@@ -107,8 +101,8 @@ else
         --master_port="$MASTER_PORT" \
         train.py \
         --config_path "$LL_CONFIG" \
-        --logdir "$LL_WORK/logs" \
-        --wandb-save-dir "$LL_WORK/wandb"
+        --logdir "$PROJECT_DIR/logs" \
+        --wandb-save-dir "$PROJECT_DIR/wandb"
 fi
 
 echo "[SLURM] Job finished."
