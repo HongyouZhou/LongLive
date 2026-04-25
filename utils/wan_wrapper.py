@@ -100,10 +100,11 @@ class WanTextEncoder(torch.nn.Module):
         sd = rank0_load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth")
         self.text_encoder.load_state_dict(sd)
         del sd
-        
-        # Move text encoder to GPU if available
-        if torch.cuda.is_available():
-            self.text_encoder = self.text_encoder.cuda()
+        # Stay on CPU here. The trainer FSDP-wraps this module (after wrapping
+        # the 14B real_score teacher) — wrap_with_meta + sync_module_states will
+        # move + shard it onto GPU at that point. If we eagerly .cuda() here,
+        # 11 GB stays unsharded on every GPU during real_score wrap and triggers
+        # OOM when FSDP allocates its broadcast buffer for the 14B model.
 
         self.tokenizer = HuggingfaceTokenizer(
             name=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
