@@ -53,6 +53,13 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         "no_shard": ShardingStrategy.NO_SHARD,
     }[sharding_strategy]
 
+    # sync_module_states=True pairs with utils/wan_wrapper.py's rank-0-only
+    # weight load (LL_LOW_CPU_MEM=1). When LL_LOW_CPU_MEM is unset, every
+    # rank already has a full CPU copy of the weights, so FSDP sharding
+    # doesn't need a broadcast — keep sync_module_states=False (NVlabs
+    # default) to skip that step.
+    sync_module_states = os.environ.get("LL_LOW_CPU_MEM", "0") == "1"
+
     module = FSDP(
         module,
         auto_wrap_policy=auto_wrap_policy,
@@ -62,7 +69,7 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         limit_all_gathers=True,
         use_orig_params=True,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=True  # Load ckpt on rank 0 and sync to other ranks (halves peak CPU RAM)
+        sync_module_states=sync_module_states,
     )
     return module
 

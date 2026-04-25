@@ -24,32 +24,40 @@ from wan.modules.causal_model_infinity import CausalWanModel as CausalWanModelIn
 # under a separate $PROJECT_DATA tree.
 WAN_MODELS_ROOT = os.environ.get("WAN_MODELS_ROOT", "wan_models")
 
+# When LL_LOW_CPU_MEM=1, only rank 0 loads weights from disk; non-rank-0
+# ranks meta-init and rely on FSDP `sync_module_states=True` to broadcast.
+# Needed on the lab box (2× GPU, 125 GB RAM) where 2× full 14B in CPU
+# alone is ~half of total RAM. On HPC nodes with plenty of RAM, leave
+# unset and use the standard NVlabs path (every rank loads its own copy).
+LOW_CPU_MEM_LOAD = os.environ.get("LL_LOW_CPU_MEM", "0") == "1"
+
 
 def _load_wan_with_meta(model_cls, path, **extra_kwargs):
-    """Load a Wan diffusion model, using meta init on non-rank-0 ranks.
+    """Load a Wan diffusion model.
 
-    When loading a large teacher (e.g. 14B) across multiple ranks, the default
-    from_pretrained materialises the full fp32 weights on every rank's CPU —
-    on 2 ranks this peaks at ~2× model_size × 4 bytes. For a 14B model on a
-    125GB-RAM box that OOMs before FSDP ever gets to shard.
-
-    Fix: only rank 0 loads the weights. Other ranks build an architecture-only
-    copy on meta device (0 bytes), then materialise empty CUDA tensors for
-    FSDP to broadcast into via `sync_module_states=True`.
+    Default (NVlabs-standard): every rank loads weights via from_pretrained.
+    With LL_LOW_CPU_MEM=1: only rank 0 loads, other ranks meta-init and
+    receive weights through FSDP `sync_module_states=True` broadcast.
+    Use the latter on RAM-constrained boxes; the former on HPC nodes
+    where N×model_size CPU RAM is fine.
     """
-    # Use torchrun's RANK/WORLD_SIZE env vars — these are set by the launcher
-    # before any Python code runs, so this works correctly even when called
-    # before dist.init_process_group(). Relying on dist.is_initialized() here
-    # was a bug: if model construction happens before init_process_group, every
-    # rank fell through to "full load" and 8-way concurrent NFS reads of the
-    # 14B safetensors thrashed the shared FS into a hang.
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    if world_size <= 1 or rank == 0:
-        # Load weights directly in bf16 to halve both CPU and GPU footprint
-        # during FSDP wrap. Cast any stray fp32 buffers (RoPE freqs etc.) so
-        # FSDP's size-based auto-wrap sees uniform dtype.
+    # Standard path: every rank loads its own copy (or single-process run).
+    if not LOW_CPU_MEM_LOAD or world_size <= 1:
+        model = model_cls.from_pretrained(
+            path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, **extra_kwargs
+        )
+        for buf_name, buf in model.named_buffers():
+            if buf.dtype == torch.float32:
+                buf.data = buf.data.to(torch.bfloat16)
+        return model
+
+    # Low-CPU-mem path: rank 0 loads, non-rank-0 meta-init.
+    if rank == 0:
+        # rank 0 loads in bf16. Cast any stray fp32 buffers (RoPE freqs etc.)
+        # so FSDP's size-based auto-wrap sees uniform dtype.
         model = model_cls.from_pretrained(
             path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, **extra_kwargs
         )

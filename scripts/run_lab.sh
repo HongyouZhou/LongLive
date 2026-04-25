@@ -45,7 +45,10 @@ REMOTE_CONDA='source ~/mnt/arp/miniforge3/etc/profile.d/conda.sh && conda activa
 # PYTHONNOUSERSITE=1 is important — arp's ~/.local/ is NOT visible on lab, but
 # if lab happens to have its own ~/.local/ with stale packages it would shadow
 # the env packages. Force env-only imports.
-REMOTE_ENV='PYTHONNOUSERSITE=1 NCCL_IB_DISABLE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True'
+# LL_LOW_CPU_MEM=1: rank 0 loads weights, broadcast via FSDP to other ranks.
+# Required on lab — the box only has 125 GB RAM and 2× full 14B in CPU is
+# already half of that. HPC nodes leave this unset (NVlabs standard path).
+REMOTE_ENV='PYTHONNOUSERSITE=1 NCCL_IB_DISABLE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True LL_LOW_CPU_MEM=1'
 
 REMOTE_CMD="ulimit -n 65536 && \
 mkdir -p /home/hongyou/dev && \
