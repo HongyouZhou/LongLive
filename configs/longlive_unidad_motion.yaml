@@ -1,7 +1,7 @@
 # Uni-DAD integration on top of motion transfer (single-stage).
 #
 # Differences vs configs/longlive_finetune_motion_cross.yaml:
-#   - Adds `unidad.dual_domain_dmd` block: online-trained motion_teacher
+#   - Adds `unidad.dual_domain_dmd` block: online-trained unidad_score
 #     (Wan 1.3B + its own motion_encoder) providing a second DMD target.
 #   - `motion_loss` kept dormant (scalar_energy legacy regularizer, disabled).
 #   - Student path unchanged: cross-pair JSONL, LoRA rank 256, streaming 240.
@@ -88,36 +88,36 @@ motion_encoder:
   ref_length: 16
   image_size: [480, 832]
 
-# --- Uni-DAD: dual-domain DMD (online motion_teacher) ---
+# --- Uni-DAD: dual-domain DMD (online unidad_score) ---
 unidad:
   enabled: true
 
   dual_domain_dmd:
     enabled: true
-    # motion_teacher init from the same base as student (longlive_init.pt).
-    motion_teacher_init_from: checkpoints/longlive_init.pt
-    motion_teacher_model_name: Wan2.1-T2V-1.3B
+    # unidad_score init from the same base as student (longlive_init.pt).
+    score_init_from: checkpoints/longlive_init.pt
+    score_model_name: Wan2.1-T2V-1.3B
     # Non-causal: CausalWanModel._forward_train is a stub; non-causal Wan's
     # full-chunk forward gives richer gradient context anyway (matches
     # real_score and Uni-DAD paper's standard-UNet teacher).
-    motion_teacher_is_causal: false
-    motion_teacher_local_attn_size: -1
-    motion_teacher_sink_size: 0
-    motion_teacher_fsdp_wrap_strategy: size
-    motion_teacher_cpu_offload: false
+    score_is_causal: false
+    score_local_attn_size: -1
+    score_sink_size: 0
+    score_fsdp_wrap_strategy: size
+    score_cpu_offload: false
 
-    # Two independent DMD loss weights (Uni-DAD source API):
-    #   real_score_loss_weight  - LongLive's existing DMD term (14B teacher)
-    #   unidad_motion_loss_weight - Uni-DAD's added DMD term (motion-aware teacher)
-    real_score_loss_weight: 1.0
-    unidad_motion_loss_weight: 0.33
+    # Two independent DMD loss weights (Uni-DAD `dm_weight_source` / `dm_weight_target`):
+    #   real_score_weight   - multiplies dmd_loss           (LongLive's existing DMD term, uses real_score)
+    #   unidad_score_weight - multiplies unidad_score_dmd_loss (new DMD term, uses unidad_score)
+    real_score_weight: 1.0
+    unidad_score_weight: 0.33
 
-    # Online teacher_turn: motion_teacher is trained every N training steps
+    # Online unidad_score_turn: unidad_score is trained every N training steps
     # on self-pair data via pure diffusion MSE.
-    motion_teacher_update_ratio: 5
-    motion_teacher_lr: 1.0e-05
-    motion_teacher_beta1: 0.0
-    motion_teacher_beta2: 0.999
+    score_update_ratio: 5
+    score_lr: 1.0e-05
+    score_beta1: 0.0
+    score_beta2: 0.999
 
   # Future: unidad.multi_head_gan (GAN heads). NOT implemented here —
   # would need its own backbone to avoid coupling into the critic.

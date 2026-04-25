@@ -131,33 +131,33 @@ class DMD(SelfForcingModel):
             "timestep": timestep.detach()
         }
 
-    def _compute_kl_grad_motion(
+    def _compute_kl_grad_unidad_score(
         self,
         noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
-        conditional_dict_motion: dict,
+        conditional_dict_unidad_score: dict,
         normalization: bool = True,
     ) -> Tuple[torch.Tensor, dict]:
-        """Uni-DAD target-branch KL gradient: (fake_score - motion_teacher).
+        """Uni-DAD target-branch KL gradient: (fake_score - unidad_score).
 
-        Called only when `self.motion_teacher` is attached (dual-domain DMD
-        enabled). fake_score and motion_teacher both see the motion-conditioned
-        prompt embeddings; student's motion_encoder and motion_teacher_motion_encoder
+        Called only when `self.unidad_score` is attached (dual-domain DMD
+        enabled). fake_score and unidad_score both see the motion-conditioned
+        prompt embeddings; student's motion_encoder and unidad_motion_encoder
         produce those embeddings upstream.
         """
         # Fake score on motion-conditioned prompt (no_grad context is the
         # caller's responsibility, matching _compute_kl_grad).
         _, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict_motion,
+            conditional_dict=conditional_dict_unidad_score,
             timestep=timestep,
         )
 
-        # Target teacher on same conditioning.
-        _, pred_target_image = self.motion_teacher(
+        # unidad_score on same conditioning.
+        _, pred_target_image = self.unidad_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict_motion,
+            conditional_dict=conditional_dict_unidad_score,
             timestep=timestep,
         )
 
@@ -171,7 +171,7 @@ class DMD(SelfForcingModel):
         grad = torch.nan_to_num(grad)
 
         return grad, {
-            "dmdtrain_motion_gradient_norm": torch.mean(torch.abs(grad)).detach(),
+            "dmdtrain_unidad_score_gradient_norm": torch.mean(torch.abs(grad)).detach(),
         }
 
     def compute_distribution_matching_loss(
@@ -182,7 +182,7 @@ class DMD(SelfForcingModel):
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
         denoised_timestep_to: int = 0,
-        conditional_dict_motion: Optional[dict] = None,
+        conditional_dict_unidad_score: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -235,24 +235,24 @@ class DMD(SelfForcingModel):
                 unconditional_dict=unconditional_dict
             )
 
-            # Step 2b: Target-branch KL grad (fake_score - motion_teacher),
-            # Uni-DAD dual-domain addition. Only runs when motion_teacher
+            # Step 2b: Target-branch KL grad (fake_score - unidad_score),
+            # Uni-DAD dual-domain addition. Only runs when unidad_score
             # is attached AND caller supplied a motion-conditioned dict.
             grad_trg = None
             use_target = (
-                getattr(self, "motion_teacher", None) is not None
-                and conditional_dict_motion is not None
+                getattr(self, "unidad_score", None) is not None
+                and conditional_dict_unidad_score is not None
             )
             if use_target:
-                grad_trg, trg_log = self._compute_kl_grad_motion(
+                grad_trg, trg_log = self._compute_kl_grad_unidad_score(
                     noisy_image_or_video=noisy_latent,
                     estimated_clean_image_or_video=original_latent,
                     timestep=timestep,
-                    conditional_dict_motion=conditional_dict_motion,
+                    conditional_dict_unidad_score=conditional_dict_unidad_score,
                 )
                 dmd_log_dict.update(trg_log)
 
-        # Source loss (existing behavior, byte-identical when no target).
+        # Source loss (LongLive's original DMD loss, value = loss_src).
         if gradient_mask is not None:
             loss_src = 0.5 * F.mse_loss(
                 original_latent.double()[gradient_mask],
@@ -264,25 +264,28 @@ class DMD(SelfForcingModel):
                 (original_latent.double() - grad_src.double()).detach(),
                 reduction="mean")
 
-        dmd_log_dict["dmd_loss_source"] = loss_src.detach()
+        dmd_log_dict["dmd_loss"] = loss_src.detach()
 
-        # Target loss (new — independent MSE, summed with source).
-        loss_trg = loss_src.new_zeros(())
-        if use_target:
-            if gradient_mask is not None:
-                loss_trg = 0.5 * F.mse_loss(
-                    original_latent.double()[gradient_mask],
-                    (original_latent.double() - grad_trg.double()).detach()[gradient_mask],
-                    reduction="mean")
-            else:
-                loss_trg = 0.5 * F.mse_loss(
-                    original_latent.double(),
-                    (original_latent.double() - grad_trg.double()).detach(),
-                    reduction="mean")
-            dmd_log_dict["dmd_loss_motion"] = loss_trg.detach()
+        # Byte-identical short-circuit: when unidad_score is off, return
+        # loss_src without any weight multiplication. No unidad_* log keys.
+        if not use_target:
+            return loss_src, dmd_log_dict
 
-        w_real = float(getattr(self, "real_score_loss_weight", 1.0))
-        w_unidad = float(getattr(self, "unidad_motion_loss_weight", 0.0))
+        # Target branch (Uni-DAD dual-domain addition).
+        if gradient_mask is not None:
+            loss_trg = 0.5 * F.mse_loss(
+                original_latent.double()[gradient_mask],
+                (original_latent.double() - grad_trg.double()).detach()[gradient_mask],
+                reduction="mean")
+        else:
+            loss_trg = 0.5 * F.mse_loss(
+                original_latent.double(),
+                (original_latent.double() - grad_trg.double()).detach(),
+                reduction="mean")
+        dmd_log_dict["unidad_score_dmd_loss"] = loss_trg.detach()
+
+        w_real = float(getattr(self, "real_score_weight", 1.0))
+        w_unidad = float(getattr(self, "unidad_score_weight", 0.0))
         dmd_loss = w_real * loss_src + w_unidad * loss_trg
         return dmd_loss, dmd_log_dict
 

@@ -463,7 +463,7 @@ class Trainer:
             self.motion_loss = None
 
         # ================= Uni-DAD: dual-domain DMD =================
-        # Optional online-trained motion_teacher. Config-gated by
+        # Optional online-trained unidad_score. Config-gated by
         # `unidad.enabled` + `unidad.dual_domain_dmd.enabled`. When off,
         # DMD path is byte-identical to prior behavior.
         unidad_cfg = getattr(config, "unidad", None)
@@ -478,24 +478,24 @@ class Trainer:
             if self.is_main_process:
                 print(
                     "[unidad] dual-domain DMD enabled: "
-                    f"w_real={dd_cfg.real_score_loss_weight}, "
-                    f"w_unidad_motion={dd_cfg.unidad_motion_loss_weight}, "
-                    f"update_ratio={dd_cfg.motion_teacher_update_ratio}")
+                    f"real_score_weight={dd_cfg.real_score_weight}, "
+                    f"unidad_score_weight={dd_cfg.unidad_score_weight}, "
+                    f"update_ratio={dd_cfg.score_update_ratio}")
 
-            # 1. Build motion_teacher with student architecture (causal 1.3B).
-            motion_teacher = WanDiffusionWrapper(
-                model_name=dd_cfg.motion_teacher_model_name,
-                is_causal=dd_cfg.motion_teacher_is_causal,
-                local_attn_size=dd_cfg.motion_teacher_local_attn_size,
-                sink_size=dd_cfg.motion_teacher_sink_size,
+            # 1. Build unidad_score with student architecture (causal 1.3B).
+            unidad_score = WanDiffusionWrapper(
+                model_name=dd_cfg.score_model_name,
+                is_causal=dd_cfg.score_is_causal,
+                local_attn_size=dd_cfg.score_local_attn_size,
+                sink_size=dd_cfg.score_sink_size,
             )
-            motion_teacher.model.requires_grad_(True)
+            unidad_score.model.requires_grad_(True)
             if config.gradient_checkpointing:
-                motion_teacher.enable_gradient_checkpointing()
+                unidad_score.enable_gradient_checkpointing()
 
-            # 2. Build separate trainable MotionEncoder for motion_teacher.
+            # 2. Build separate trainable MotionEncoder for unidad_score.
             me_cfg = config.motion_encoder
-            motion_teacher_motion_encoder = MotionEncoder(
+            unidad_motion_encoder = MotionEncoder(
                 vae_wrapper=self.model.vae,
                 dim=getattr(me_cfg, "dim", 4096),
                 num_layers=getattr(me_cfg, "num_layers", 4),
@@ -503,81 +503,80 @@ class Trainer:
                 tokens_per_frame=getattr(me_cfg, "tokens_per_frame", 64),
                 max_tokens=getattr(me_cfg, "max_tokens", 512),
             )
-            motion_teacher_motion_encoder.requires_grad_(True)
+            unidad_motion_encoder.requires_grad_(True)
 
             # 3. Initialize from same base ckpt as student (longlive_init.pt).
-            init_ckpt_path = getattr(dd_cfg, "motion_teacher_init_from", None) \
+            init_ckpt_path = getattr(dd_cfg, "score_init_from", None) \
                 or getattr(config, "generator_ckpt", None)
             if init_ckpt_path:
                 if self.is_main_process:
-                    print(f"[unidad] loading motion_teacher weights from {init_ckpt_path}")
+                    print(f"[unidad] loading unidad_score weights from {init_ckpt_path}")
                 init_ckpt = torch.load(init_ckpt_path, map_location="cpu")
                 # generator/model weights (strict=False to tolerate missing LoRA keys).
                 gen_key = "generator" if "generator" in init_ckpt else (
                     "model" if "model" in init_ckpt else None)
                 if gen_key is not None:
-                    motion_teacher.load_state_dict(init_ckpt[gen_key], strict=False)
+                    unidad_score.load_state_dict(init_ckpt[gen_key], strict=False)
                 if "motion_encoder" in init_ckpt:
-                    motion_teacher_motion_encoder.load_state_dict(
+                    unidad_motion_encoder.load_state_dict(
                         init_ckpt["motion_encoder"], strict=False)
 
             # 4. FSDP wrap — with grad (unlike real_score which is frozen).
-            motion_teacher = fsdp_wrap(
-                motion_teacher,
+            unidad_score = fsdp_wrap(
+                unidad_score,
                 sharding_strategy=config.sharding_strategy,
                 mixed_precision=config.mixed_precision,
-                wrap_strategy=dd_cfg.motion_teacher_fsdp_wrap_strategy,
-                cpu_offload=getattr(dd_cfg, "motion_teacher_cpu_offload", False),
+                wrap_strategy=dd_cfg.score_fsdp_wrap_strategy,
+                cpu_offload=getattr(dd_cfg, "score_cpu_offload", False),
             )
-            motion_teacher_motion_encoder = motion_teacher_motion_encoder.to(
+            unidad_motion_encoder = unidad_motion_encoder.to(
                 device=self.device, dtype=self.dtype)
-            motion_teacher_motion_encoder = fsdp_wrap(
-                motion_teacher_motion_encoder,
+            unidad_motion_encoder = fsdp_wrap(
+                unidad_motion_encoder,
                 sharding_strategy="no_shard",
                 mixed_precision=config.mixed_precision,
                 wrap_strategy="size",
                 min_num_params=int(1e7),
             )
 
-            self.model.motion_teacher = motion_teacher
-            self.model.motion_teacher_motion_encoder = motion_teacher_motion_encoder
-            self.model.real_score_loss_weight = float(dd_cfg.real_score_loss_weight)
-            self.model.unidad_motion_loss_weight = float(dd_cfg.unidad_motion_loss_weight)
-            self.motion_teacher_update_ratio = int(
-                dd_cfg.motion_teacher_update_ratio)
+            self.model.unidad_score = unidad_score
+            self.model.unidad_motion_encoder = unidad_motion_encoder
+            self.model.real_score_weight = float(dd_cfg.real_score_weight)
+            self.model.unidad_score_weight = float(dd_cfg.unidad_score_weight)
+            self.unidad_score_update_ratio = int(dd_cfg.score_update_ratio)
 
-            # 5. Dedicated optimizer for motion_teacher + motion_teacher_motion_encoder.
-            tt_params = [p for p in motion_teacher.parameters() if p.requires_grad]
-            tt_params += [p for p in motion_teacher_motion_encoder.parameters() if p.requires_grad]
-            self.motion_teacher_optimizer = torch.optim.AdamW(
-                tt_params,
-                lr=float(getattr(dd_cfg, "motion_teacher_lr", config.lr)),
+            # 5. Dedicated optimizer for unidad_score + unidad_motion_encoder.
+            unidad_params = [p for p in unidad_score.parameters() if p.requires_grad]
+            unidad_params += [p for p in unidad_motion_encoder.parameters() if p.requires_grad]
+            self.unidad_score_optimizer = torch.optim.AdamW(
+                unidad_params,
+                lr=float(getattr(dd_cfg, "score_lr", config.lr)),
                 betas=(
-                    float(getattr(dd_cfg, "motion_teacher_beta1", config.beta1)),
-                    float(getattr(dd_cfg, "motion_teacher_beta2", config.beta2)),
+                    float(getattr(dd_cfg, "score_beta1", config.beta1)),
+                    float(getattr(dd_cfg, "score_beta2", config.beta2)),
                 ),
                 weight_decay=config.weight_decay,
             )
         else:
-            self.model.motion_teacher = None
-            self.model.motion_teacher_motion_encoder = None
-            self.model.real_score_loss_weight = 1.0
-            self.model.unidad_motion_loss_weight = 0.0
-            self.motion_teacher_update_ratio = 0
-            self.motion_teacher_optimizer = None
+            self.model.unidad_score = None
+            self.model.unidad_motion_encoder = None
+            self.model.real_score_weight = 1.0
+            self.model.unidad_score_weight = 0.0
+            self.unidad_score_update_ratio = 0
+            self.unidad_score_optimizer = None
 
         # Step 5: Initialize the dataloader
         if self.one_logger is not None:
             self.one_logger.on_dataloader_init_start()
         motion_cfg = getattr(config, "motion_encoder", None)
         motion_enabled = motion_cfg is not None and getattr(motion_cfg, "enabled", False)
-        # Uni-DAD: when motion_teacher is enabled, ask MotionSwitchDataset for
-        # a longer "target_video" clip (self-pair) for teacher_turn MSE.
+        # Uni-DAD: when unidad_score is enabled, ask MotionSwitchDataset for
+        # a longer "target_video" clip (self-pair) for unidad_score_turn MSE.
         # Latent chunk length T_lat → pixel frames = (T_lat-1)*4+1 under Wan
         # VAE 4x temporal compression. In streaming mode T_lat = chunk size;
         # in non-streaming T_lat = image_or_video_shape[1].
         teacher_target_pixel_len = 0
-        if self.motion_teacher_optimizer is not None:
+        if self.unidad_score_optimizer is not None:
             lat_T = int(getattr(
                 config, "streaming_chunk_size",
                 getattr(config, "image_or_video_shape", [1, 21])[1]))
@@ -1007,29 +1006,29 @@ class Trainer:
                 ):
                     motion_sd = self.model.motion_encoder.state_dict()
 
-            # Uni-DAD: save motion_teacher + its motion_encoder when enabled.
-            motion_teacher_sd = None
-            target_motion_sd = None
-            motion_teacher_opt_sd = None
-            if getattr(self.model, "motion_teacher", None) is not None:
+            # Uni-DAD: save unidad_score + its motion_encoder when enabled.
+            unidad_score_sd = None
+            unidad_motion_encoder_sd = None
+            unidad_score_opt_sd = None
+            if getattr(self.model, "unidad_score", None) is not None:
                 with FSDP.state_dict_type(
-                    self.model.motion_teacher,
+                    self.model.unidad_score,
                     StateDictType.FULL_STATE_DICT,
                     FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
                     FullOptimStateDictConfig(rank0_only=True),
                 ):
-                    motion_teacher_sd = self.model.motion_teacher.state_dict()
-                    if self.motion_teacher_optimizer is not None:
-                        motion_teacher_opt_sd = FSDP.optim_state_dict(
-                            self.model.motion_teacher,
-                            self.motion_teacher_optimizer)
-                if getattr(self.model, "motion_teacher_motion_encoder", None) is not None:
+                    unidad_score_sd = self.model.unidad_score.state_dict()
+                    if self.unidad_score_optimizer is not None:
+                        unidad_score_opt_sd = FSDP.optim_state_dict(
+                            self.model.unidad_score,
+                            self.unidad_score_optimizer)
+                if getattr(self.model, "unidad_motion_encoder", None) is not None:
                     with FSDP.state_dict_type(
-                        self.model.motion_teacher_motion_encoder,
+                        self.model.unidad_motion_encoder,
                         StateDictType.FULL_STATE_DICT,
                         FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
                     ):
-                        target_motion_sd = self.model.motion_teacher_motion_encoder.state_dict()
+                        unidad_motion_encoder_sd = self.model.unidad_motion_encoder.state_dict()
 
             if self.config.ema_start_step < self.step and self.generator_ema is not None:
                 state_dict = {
@@ -1053,12 +1052,12 @@ class Trainer:
                 if motion_sd is not None:
                     state_dict["motion_encoder"] = motion_sd
 
-            if motion_teacher_sd is not None:
-                state_dict["motion_teacher"] = motion_teacher_sd
-            if target_motion_sd is not None:
-                state_dict["motion_teacher_motion_encoder"] = target_motion_sd
-            if motion_teacher_opt_sd is not None:
-                state_dict["motion_teacher_optimizer"] = motion_teacher_opt_sd
+            if unidad_score_sd is not None:
+                state_dict["unidad_score"] = unidad_score_sd
+            if unidad_motion_encoder_sd is not None:
+                state_dict["unidad_motion_encoder"] = unidad_motion_encoder_sd
+            if unidad_score_opt_sd is not None:
+                state_dict["unidad_score_optimizer"] = unidad_score_opt_sd
 
         if self.is_main_process:
             checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
@@ -1101,19 +1100,19 @@ class Trainer:
             [conditional_dict["prompt_embeds"], motion_tokens], dim=1)
         return motion_tokens.shape[1]
 
-    def fwdbwd_one_step_teacher_turn(self, batch):
-        """Uni-DAD teacher_turn: one diffusion-MSE step on the motion_teacher
+    def fwdbwd_one_step_unidad_score_turn(self, batch):
+        """Uni-DAD unidad_score_turn: one diffusion-MSE step on the unidad_score
         using self-pair data (prompt from video X, motion_ref + target_video
-        also from video X). Updates motion_teacher + motion_teacher_motion_encoder.
+        also from video X). Updates unidad_score + unidad_motion_encoder.
 
         Mirrors the critic MSE mechanism but with:
-          - opt  = motion_teacher_optimizer
-          - backbone = motion_teacher (not fake_score)
-          - grad path goes through motion_teacher_motion_encoder (grad=True)
+          - opt  = unidad_score_optimizer
+          - backbone = unidad_score (not fake_score)
+          - grad path goes through unidad_motion_encoder (grad=True)
         """
-        assert self.model.motion_teacher is not None, (
-            "teacher_turn requires unidad.dual_domain_dmd.enabled=true")
-        assert "motion_ref" in batch, "teacher_turn needs motion_ref in batch"
+        assert self.model.unidad_score is not None, (
+            "unidad_score_turn requires unidad.dual_domain_dmd.enabled=true")
+        assert "motion_ref" in batch, "unidad_score_turn needs motion_ref in batch"
         self.model.eval()
 
         text_prompts = batch["prompts"]
@@ -1123,14 +1122,14 @@ class Trainer:
             cond = self.model.text_encoder(text_prompts=text_prompts)
             text_embeds_no_motion = cond["prompt_embeds"].detach().clone()
 
-        # Motion tokens from motion_teacher_motion_encoder WITH grad so it learns.
+        # Motion tokens from unidad_motion_encoder WITH grad so it learns.
         motion_ref_dev = batch["motion_ref"].to(
             device=self.device, dtype=self.dtype)
-        target_motion_tokens = self.model.motion_teacher_motion_encoder(motion_ref_dev)
+        unidad_motion_tokens = self.model.unidad_motion_encoder(motion_ref_dev)
         cond = {
             **cond,
             "prompt_embeds": torch.cat(
-                [text_embeds_no_motion, target_motion_tokens], dim=1),
+                [text_embeds_no_motion, unidad_motion_tokens], dim=1),
         }
 
         # Self-pair target_video. Falls back to motion_ref when dataset does
@@ -1140,7 +1139,7 @@ class Trainer:
             target_video = batch[target_key].to(
                 device=self.device, dtype=self.dtype)
             clean_latent = self.model.motion_encoder._encode_vae(target_video)
-            # In streaming mode, motion_teacher sees chunks of latent length
+            # In streaming mode, unidad_score sees chunks of latent length
             # = streaming_chunk_size (e.g. 21). In non-streaming mode, use
             # image_or_video_shape[1] directly.
             T_target = int(
@@ -1174,8 +1173,8 @@ class Trainer:
             timestep.flatten(0, 1),
         ).unflatten(0, (batch_size, clean_latent.shape[1])).to(self.dtype)
 
-        # Forward motion_teacher with grad.
-        flow_pred, pred_x0 = self.model.motion_teacher(
+        # Forward unidad_score with grad.
+        flow_pred, pred_x0 = self.model.unidad_score(
             noisy_image_or_video=noisy_latent,
             conditional_dict=cond,
             timestep=timestep,
@@ -1190,17 +1189,17 @@ class Trainer:
             timestep=timestep.flatten(0, 1),
         )
         import torch.nn.functional as F
-        teacher_loss = F.mse_loss(
+        turn_loss = F.mse_loss(
             flow_pred.flatten(0, 1).float(),
             flow_target.float().detach(),
         )
 
-        scaled_teacher_loss = teacher_loss / self.gradient_accumulation_steps
-        scaled_teacher_loss.backward()
+        scaled_turn_loss = turn_loss / self.gradient_accumulation_steps
+        scaled_turn_loss.backward()
 
         return {
-            "motion_teacher_loss": teacher_loss.detach(),
-            "motion_teacher_grad_norm": torch.tensor(0.0, device=self.device),
+            "unidad_score_turn_loss": turn_loss.detach(),
+            "unidad_score_turn_grad_norm": torch.tensor(0.0, device=self.device),
         }
 
     def fwdbwd_one_step(self, batch, train_generator):
@@ -1516,22 +1515,22 @@ class Trainer:
                     ref_latent.detach().cpu())
 
             # Uni-DAD: build a parallel motion-conditioned conditional_dict
-            # using motion_teacher_motion_encoder (separate frozen-at-this-step clone
-            # for DMD target-branch forward; motion_teacher_motion_encoder is updated
-            # only on teacher_turn steps, not on every generator step).
-            if getattr(self.model, "motion_teacher_motion_encoder", None) is not None:
+            # using unidad_motion_encoder (separate frozen-at-this-step clone
+            # for DMD target-branch forward; unidad_motion_encoder is updated
+            # only on unidad_score_turn steps, not on every generator step).
+            if getattr(self.model, "unidad_motion_encoder", None) is not None:
                 motion_ref_dev = batch["motion_ref"].to(
                     device=self.device, dtype=self.dtype)
                 with torch.no_grad():
-                    target_motion_tokens = self.model.motion_teacher_motion_encoder(
+                    unidad_motion_tokens = self.model.unidad_motion_encoder(
                         motion_ref_dev)
-                conditional_dict_motion = {
+                conditional_dict_unidad_score = {
                     **conditional_dict,
                     "prompt_embeds": torch.cat(
-                        [text_embeds_no_motion, target_motion_tokens], dim=1),
+                        [text_embeds_no_motion, unidad_motion_tokens], dim=1),
                 }
-                self.streaming_model.state["conditional_dict_motion"] = (
-                    conditional_dict_motion)
+                self.streaming_model.state["conditional_dict_unidad_score"] = (
+                    conditional_dict_unidad_score)
 
         self.streaming_active = True
         
@@ -1576,18 +1575,18 @@ class Trainer:
             switch_info["switch_conditional_dict"]["prompt_embeds"] = torch.cat(
                 [state["switch_text_embeds_no_motion"], switch_motion_tokens], dim=1)
 
-        # Uni-DAD: refresh target-side motion tokens (no_grad — motion_teacher_motion_encoder
-        # is updated separately on teacher_turn steps, not via this path).
-        if (getattr(self.model, "motion_teacher_motion_encoder", None) is not None
+        # Uni-DAD: refresh target-side motion tokens (no_grad — unidad_motion_encoder
+        # is updated separately on unidad_score_turn steps, not via this path).
+        if (getattr(self.model, "unidad_motion_encoder", None) is not None
                 and state.get("motion_ref_cpu") is not None):
             motion_ref = state["motion_ref_cpu"].to(
                 device=self.device, dtype=self.dtype)
             with torch.no_grad():
-                target_motion_tokens = self.model.motion_teacher_motion_encoder(motion_ref)
-            state["conditional_dict_motion"] = {
+                unidad_motion_tokens = self.model.unidad_motion_encoder(motion_ref)
+            state["conditional_dict_unidad_score"] = {
                 **cond_dict,
                 "prompt_embeds": torch.cat(
-                    [text_embeds, target_motion_tokens], dim=1),
+                    [text_embeds, unidad_motion_tokens], dim=1),
             }
 
     def fwdbwd_one_step_streaming(self, train_generator):
@@ -1643,12 +1642,12 @@ class Trainer:
 
             # Compute generator loss. When Uni-DAD dual-domain DMD is enabled,
             # also pass the target-side conditional_dict so DMD computes both
-            # source (real_score) and target (motion_teacher) MSE branches.
+            # source (real_score) and target (unidad_score) MSE branches.
             generator_loss, generator_log_dict = self.streaming_model.compute_generator_loss(
                 chunk=generated_chunk,
                 chunk_info=chunk_info,
-                conditional_dict_motion=self.streaming_model.state.get(
-                    "conditional_dict_motion"),
+                conditional_dict_unidad_score=self.streaming_model.state.get(
+                    "conditional_dict_unidad_score"),
             )
 
             # Optional: auxiliary motion-consistency loss on the generated chunk.
@@ -1724,27 +1723,27 @@ class Trainer:
             
             return critic_log_dict
 
-    def _run_teacher_turn(self):
-        """Run one accumulated teacher_turn update. Returns the merged log dict
+    def _run_unidad_score_turn(self):
+        """Run one accumulated unidad_score_turn update. Returns the merged log dict
         (empty when Uni-DAD is disabled)."""
-        if self.motion_teacher_optimizer is None:
+        if self.unidad_score_optimizer is None:
             return {}
-        if self.motion_teacher_update_ratio <= 0:
+        if self.unidad_score_update_ratio <= 0:
             return {}
-        if self.step % self.motion_teacher_update_ratio != 0:
+        if self.step % self.unidad_score_update_ratio != 0:
             return {}
 
-        self.motion_teacher_optimizer.zero_grad(set_to_none=True)
+        self.unidad_score_optimizer.zero_grad(set_to_none=True)
         accumulated = []
         for _ in range(self.gradient_accumulation_steps):
-            tt_batch = next(self.dataloader)
-            accumulated.append(self.fwdbwd_one_step_teacher_turn(tt_batch))
-        tt_grad_norm = self.model.motion_teacher.clip_grad_norm_(
+            unidad_batch = next(self.dataloader)
+            accumulated.append(self.fwdbwd_one_step_unidad_score_turn(unidad_batch))
+        unidad_grad_norm = self.model.unidad_score.clip_grad_norm_(
             self.max_grad_norm_generator)
-        self.motion_teacher_optimizer.step()
-        tt_log = merge_dict_list(accumulated)
-        tt_log["motion_teacher_grad_norm"] = tt_grad_norm
-        return tt_log
+        self.unidad_score_optimizer.step()
+        unidad_log = merge_dict_list(accumulated)
+        unidad_log["unidad_score_turn_grad_norm"] = unidad_grad_norm
+        return unidad_log
 
     def train(self):
         start_step = self.step
@@ -1761,7 +1760,7 @@ class Trainer:
                 if self.one_logger is not None:
                     self.one_logger.on_train_batch_start()
 
-                teacher_log_dict = {}
+                unidad_log_dict = {}
 
                 if self.streaming_training:
                     # Zero-out all optimizer gradients
@@ -1820,8 +1819,8 @@ class Trainer:
                     
                     self.critic_optimizer.step()
 
-                    # Uni-DAD teacher_turn (gated inside the helper).
-                    teacher_log_dict = self._run_teacher_turn()
+                    # Uni-DAD unidad_score_turn (gated inside the helper).
+                    unidad_log_dict = self._run_unidad_score_turn()
 
                     if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
                         log_gpu_memory(f"streaming Training Step {self.step}: After optimizer steps", device=self.device, rank=dist.get_rank())
@@ -1876,8 +1875,8 @@ class Trainer:
                     
                     self.critic_optimizer.step()
 
-                    # Uni-DAD teacher_turn (gated inside the helper).
-                    teacher_log_dict = self._run_teacher_turn()
+                    # Uni-DAD unidad_score_turn (gated inside the helper).
+                    unidad_log_dict = self._run_unidad_score_turn()
 
                     # Increment the step since we finished gradient update
                     self.step += 1
@@ -1924,21 +1923,21 @@ class Trainer:
                             "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                         }
                     )
-                    if teacher_log_dict:
-                        if "motion_teacher_loss" in teacher_log_dict:
-                            wandb_loss_dict["motion_teacher_loss"] = (
-                                teacher_log_dict["motion_teacher_loss"].mean().item())
-                        if "motion_teacher_grad_norm" in teacher_log_dict:
-                            wandb_loss_dict["motion_teacher_grad_norm"] = (
-                                teacher_log_dict["motion_teacher_grad_norm"].mean().item())
-                    # Surface dual-DMD source/target decomposition when present.
+                    if unidad_log_dict:
+                        if "unidad_score_turn_loss" in unidad_log_dict:
+                            wandb_loss_dict["unidad_score_turn_loss"] = (
+                                unidad_log_dict["unidad_score_turn_loss"].mean().item())
+                        if "unidad_score_turn_grad_norm" in unidad_log_dict:
+                            wandb_loss_dict["unidad_score_turn_grad_norm"] = (
+                                unidad_log_dict["unidad_score_turn_grad_norm"].mean().item())
+                    # Surface dual-DMD extra term when unidad_score is active.
                     if TRAIN_GENERATOR and generator_log_dict:
-                        if "dmd_loss_source" in generator_log_dict:
-                            wandb_loss_dict["dmd_loss_source"] = (
-                                generator_log_dict["dmd_loss_source"].mean().item())
-                        if "dmd_loss_motion" in generator_log_dict:
-                            wandb_loss_dict["dmd_loss_motion"] = (
-                                generator_log_dict["dmd_loss_motion"].mean().item())
+                        if "unidad_score_dmd_loss" in generator_log_dict:
+                            wandb_loss_dict["unidad_score_dmd_loss"] = (
+                                generator_log_dict["unidad_score_dmd_loss"].mean().item())
+                        if "dmdtrain_unidad_score_gradient_norm" in generator_log_dict:
+                            wandb_loss_dict["dmdtrain_unidad_score_gradient_norm"] = (
+                                generator_log_dict["dmdtrain_unidad_score_gradient_norm"].mean().item())
                     if not self.disable_wandb:
                         wandb.log(wandb_loss_dict, step=self.step)
 
@@ -1961,15 +1960,15 @@ class Trainer:
                         mloss_str = f", motion_loss {generator_log_dict['motion_loss'].mean().item()}"
                     dmd_decomp_str = ""
                     if TRAIN_GENERATOR and generator_log_dict:
-                        if "dmd_loss_source" in generator_log_dict:
+                        if "dmd_loss" in generator_log_dict:
                             dmd_decomp_str += (
-                                f", dmd_src {generator_log_dict['dmd_loss_source'].mean().item():.4f}")
-                        if "dmd_loss_motion" in generator_log_dict:
+                                f", dmd {generator_log_dict['dmd_loss'].mean().item():.4f}")
+                        if "unidad_score_dmd_loss" in generator_log_dict:
                             dmd_decomp_str += (
-                                f", dmd_motion {generator_log_dict['dmd_loss_motion'].mean().item():.4f}")
+                                f", unidad_dmd {generator_log_dict['unidad_score_dmd_loss'].mean().item():.4f}")
                     tloss_str = ""
-                    if teacher_log_dict and "motion_teacher_loss" in teacher_log_dict:
-                        tloss_str = f", motion_teacher_loss {teacher_log_dict['motion_teacher_loss'].mean().item():.4f}"
+                    if unidad_log_dict and "unidad_score_turn_loss" in unidad_log_dict:
+                        tloss_str = f", unidad_score_turn_loss {unidad_log_dict['unidad_score_turn_loss'].mean().item():.4f}"
                     if TRAIN_GENERATOR and generator_log_dict:
                         print(f"step {self.step}, per iteration time {iteration_time}, generator_loss {generator_log_dict['generator_loss'].mean().item()}, generator_grad_norm {generator_log_dict['generator_grad_norm'].mean().item()}, dmdtrain_gradient_norm {generator_log_dict['dmdtrain_gradient_norm'].mean().item()}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}{mloss_str}{dmd_decomp_str}{tloss_str}")
                     else:
