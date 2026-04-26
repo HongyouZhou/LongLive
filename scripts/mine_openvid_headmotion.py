@@ -134,7 +134,8 @@ def _screen_video(path: str, max_frames: int = 24) -> dict:
         raise RuntimeError("decode timeout >15s")
 
     signal.signal(signal.SIGALRM, _alarm)
-    signal.alarm(15)
+    # Override via env so retry_errors.py can give flaky clips longer to decode.
+    signal.alarm(int(os.environ.get("MINE_ALARM_SEC", "15")))
 
     cap = cv2.VideoCapture(path)
     series = []
