@@ -1935,6 +1935,9 @@ class Trainer:
                         if "unidad_score_dmd_loss" in generator_log_dict:
                             wandb_loss_dict["unidad_score_dmd_loss"] = (
                                 generator_log_dict["unidad_score_dmd_loss"].mean().item())
+                        if "unidad_dmd_ratio" in generator_log_dict:
+                            wandb_loss_dict["unidad_dmd_ratio"] = (
+                                generator_log_dict["unidad_dmd_ratio"].mean().item())
                         if "dmdtrain_unidad_score_gradient_norm" in generator_log_dict:
                             wandb_loss_dict["dmdtrain_unidad_score_gradient_norm"] = (
                                 generator_log_dict["dmdtrain_unidad_score_gradient_norm"].mean().item())
@@ -1966,6 +1969,9 @@ class Trainer:
                         if "unidad_score_dmd_loss" in generator_log_dict:
                             dmd_decomp_str += (
                                 f", unidad_dmd {generator_log_dict['unidad_score_dmd_loss'].mean().item():.4f}")
+                        if "unidad_dmd_ratio" in generator_log_dict:
+                            dmd_decomp_str += (
+                                f", unidad_ratio {generator_log_dict['unidad_dmd_ratio'].mean().item():.4f}")
                     tloss_str = ""
                     if unidad_log_dict and "unidad_score_turn_loss" in unidad_log_dict:
                         tloss_str = f", unidad_score_turn_loss {unidad_log_dict['unidad_score_turn_loss'].mean().item():.4f}"

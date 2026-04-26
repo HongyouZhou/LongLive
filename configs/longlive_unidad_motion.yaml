@@ -110,7 +110,7 @@ unidad:
     #   real_score_weight   - multiplies dmd_loss           (LongLive's existing DMD term, uses real_score)
     #   unidad_score_weight - multiplies unidad_score_dmd_loss (new DMD term, uses unidad_score)
     real_score_weight: 1.0
-    unidad_score_weight: 1.0
+    unidad_score_weight: 0.33
 
     # Online unidad_score_turn: unidad_score is trained every N training steps
     # on self-pair data via pure diffusion MSE.

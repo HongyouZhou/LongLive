@@ -283,6 +283,11 @@ class DMD(SelfForcingModel):
                 (original_latent.double() - grad_trg.double()).detach(),
                 reduction="mean")
         dmd_log_dict["unidad_score_dmd_loss"] = loss_trg.detach()
+        # Ratio is the diagnostic that matters: absolute loss_trg can be tiny
+        # just because unidad_score is near-init while loss_src is on the same
+        # order as the data noise. A non-trivial ratio means the target teacher
+        # contributes a gradient direction distinct from real_score.
+        dmd_log_dict["unidad_dmd_ratio"] = (loss_trg / (loss_src + 1e-8)).detach()
 
         w_real = float(getattr(self, "real_score_weight", 1.0))
         w_unidad = float(getattr(self, "unidad_score_weight", 0.0))
