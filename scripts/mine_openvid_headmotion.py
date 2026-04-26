@@ -31,7 +31,12 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+# Pre-import network deps in the PARENT before any worker forks/spawns.
+# Lab's conda env lives over sshfs; concurrent imports across 28 workers
+# trigger EPERM, so the parent must import these first while uncontested.
 import requests
+import huggingface_hub
+from huggingface_hub import hf_hub_download
 
 
 DEFAULT_FACE_KEYWORDS = "face person man woman boy girl child people head"
@@ -198,7 +203,6 @@ def load_face_kw_csv(csv_path: Path, face_kws: list[str],
 
 def download_part(part_idx: int, raw_dir: Path, retries: int = 3) -> Path:
     """Download one zip part via huggingface_hub. Returns local path."""
-    from huggingface_hub import hf_hub_download
     name = f"OpenVid_part{part_idx}.zip"
     dst = raw_dir / name
     if dst.exists():
@@ -340,7 +344,11 @@ def main():
     ap.add_argument("--save_threshold", type=float, default=15.0,
                     help="yaw_range (deg) for permanent save to motion_refs/")
     ap.add_argument("--max_per_part", type=int, default=0, help="0 = no cap")
-    ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() - 4))
+    ap.add_argument("--workers", type=int, default=8,
+                    help="Pool size. Default 8 is conservative because lab's "
+                         "conda env is sshfs-mounted: 28 workers triggered "
+                         "EPERM storms on concurrent sshfs imports. Bump only "
+                         "if env is on a real local FS.")
     ap.add_argument("--face_keywords", default=DEFAULT_FACE_KEYWORDS,
                     help="space-separated keyword list")
     ap.add_argument("--start_part", type=int, default=0)
@@ -417,8 +425,10 @@ def main():
         return
     log(f"plan: {len(parts_plan)} parts ({parts_plan[0]}..{parts_plan[-1]})  workers={args.workers}")
 
-    # ---- Spawn-mode pool (TFLite/cv2 not fork-safe with already-imported state).
-    mp.set_start_method("spawn", force=True)
+    # ---- Forkserver-mode pool. Workers re-import only what worker_init needs;
+    # the forkserver process imports the main script once and forks from there,
+    # avoiding the sshfs-EPERM storm we saw with spawn @ 28 workers.
+    mp.set_start_method("forkserver", force=True)
     pool = mp.Pool(processes=args.workers,
                    initializer=_worker_init,
                    initargs=(args.model_path,))
