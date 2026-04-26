@@ -11,7 +11,7 @@ ftfy
 dashscope
 imageio-ffmpeg
 # numpy==1.24.4
-wandb
+wandb[media]
 omegaconf
 einops
 av==13.1.0
