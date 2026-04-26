@@ -92,7 +92,6 @@ def _worker_init(model_path: str) -> None:
     # explodes thread count and triggers internal av_frame_get_buffer OOM
     # on weirdly-encoded clips (observed on parts 42/43).
     cv2.setNumThreads(1)
-    cv2.setLogLevel(0)  # silence stderr noise on bad files
 
     base = mp_python.BaseOptions(model_asset_path=model_path)
     opts = mp_vision.FaceLandmarkerOptions(
