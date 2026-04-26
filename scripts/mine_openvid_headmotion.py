@@ -22,6 +22,7 @@ import multiprocessing as mp
 import os
 import queue
 import shutil
+import socket
 import struct
 import sys
 import tempfile
@@ -30,6 +31,12 @@ import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
+
+# Defense against silent socket hangs (HF CDN sometimes drops connections
+# without sending FIN; observed CLOSE-WAIT state stalling part42 for 4.5h).
+# A blocking socket read past this many seconds raises socket.timeout, the
+# download retry loop catches it, fresh connection succeeds.
+socket.setdefaulttimeout(120)
 
 # Pre-import network deps in the PARENT before any worker forks/spawns.
 # Lab's conda env lives over sshfs; concurrent imports across 28 workers
