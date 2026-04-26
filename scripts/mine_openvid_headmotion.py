@@ -78,9 +78,15 @@ _landmarker = None  # per-process global
 
 def _worker_init(model_path: str) -> None:
     global _landmarker
+    import cv2
     import mediapipe as mp_pkg  # noqa: F401  (loaded into worker)
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
+
+    # Cap libav threads per worker; otherwise N workers x M ffmpeg-threads
+    # explodes thread count and triggers internal av_frame_get_buffer OOM
+    # on weirdly-encoded clips (observed on part 42).
+    cv2.setNumThreads(1)
 
     base = mp_python.BaseOptions(model_asset_path=model_path)
     opts = mp_vision.FaceLandmarkerOptions(
@@ -286,7 +292,7 @@ def process_part(part_idx: int,
                    for n in candidates]
     n_pass = 0
     n_err = 0
-    for i, (name, stats) in enumerate(pool.imap_unordered(_worker_screen, screen_args, chunksize=8)):
+    for i, (name, stats) in enumerate(pool.imap_unordered(_worker_screen, screen_args, chunksize=1)):
         if "error" in stats:
             n_err += 1
             master_data[name] = {"part": part_idx, **stats, "saved": False}
@@ -435,10 +441,13 @@ def main():
     # ---- Forkserver-mode pool. Workers re-import only what worker_init needs;
     # the forkserver process imports the main script once and forks from there,
     # avoiding the sshfs-EPERM storm we saw with spawn @ 28 workers.
+    # maxtasksperchild=50: respawn workers periodically so any libav internal
+    # state buildup gets reset (observed cascading OOM in part 42 without).
     mp.set_start_method("forkserver", force=True)
     pool = mp.Pool(processes=args.workers,
                    initializer=_worker_init,
-                   initargs=(args.model_path,))
+                   initargs=(args.model_path,),
+                   maxtasksperchild=50)
 
     # ---- Download thread (one part ahead).
     download_q: queue.Queue = queue.Queue(maxsize=1)
