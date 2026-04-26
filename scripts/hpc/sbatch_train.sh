@@ -59,7 +59,7 @@ echo "[SLURM] Working dir: $(pwd)"
 ##############################
 # Config (paths already patched by fetch_data.sh)
 ##############################
-: "${LL_CONFIG:=configs/longlive_finetune_motion_cross.yaml}"
+: "${LL_CONFIG:=configs/longlive_unidad_motion.yaml}"
 HPC_CONFIG="${LL_CONFIG%.yaml}_hpc.yaml"
 [ -f "$HPC_CONFIG" ] && LL_CONFIG="$HPC_CONFIG"
 echo "[SLURM] Config: $LL_CONFIG"

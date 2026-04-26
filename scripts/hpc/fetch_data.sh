@@ -25,7 +25,7 @@ set -euo pipefail
 
 : "${LL_ENV_NAME:=longlive}"
 : "${LL_REPO:=$PWD}"
-: "${LL_CONFIG:=configs/longlive_finetune_motion_cross.yaml}"
+: "${LL_CONFIG:=configs/longlive_unidad_motion.yaml}"
 : "${LL_OPENVID_PART:=0}"
 : "${LL_OPENVID_NUM_KEEP:=1000}"
 # Data lives under $PROJECT_DATA (shared data root, common across projects).
