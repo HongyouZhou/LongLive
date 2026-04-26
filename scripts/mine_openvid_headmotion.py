@@ -78,6 +78,11 @@ _landmarker = None  # per-process global
 
 def _worker_init(model_path: str) -> None:
     global _landmarker
+    # Limit ffmpeg open/read to 5s so cv2.VideoCapture can't hang on bad
+    # mp4s. Must be set BEFORE cv2 is imported in the worker.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        "stimeout;5000000|timeout;5000000|loglevel;quiet"
+    )
     import cv2
     import mediapipe as mp_pkg  # noqa: F401  (loaded into worker)
     from mediapipe.tasks import python as mp_python
@@ -85,8 +90,9 @@ def _worker_init(model_path: str) -> None:
 
     # Cap libav threads per worker; otherwise N workers x M ffmpeg-threads
     # explodes thread count and triggers internal av_frame_get_buffer OOM
-    # on weirdly-encoded clips (observed on part 42).
+    # on weirdly-encoded clips (observed on parts 42/43).
     cv2.setNumThreads(1)
+    cv2.setLogLevel(0)  # silence stderr noise on bad files
 
     base = mp_python.BaseOptions(model_asset_path=model_path)
     opts = mp_vision.FaceLandmarkerOptions(
@@ -113,35 +119,50 @@ def _rot_to_euler_yxz(R) -> tuple[float, float, float]:
 
 
 def _screen_video(path: str, max_frames: int = 24) -> dict:
-    """Returns {} on failure (no detectable face / cannot decode)."""
+    """Returns {} on failure (no detectable face / cannot decode).
+
+    Bounded by signal.alarm(15s): a single hung mp4 raises RuntimeError,
+    caught by _worker_screen, worker continues with next file. Plus
+    try/finally guarantees cv2.VideoCapture is released even on exception
+    so libav state doesn't accumulate across hundreds of clips.
+    """
+    import signal
     import cv2
     import mediapipe as mp_pkg
     import numpy as np
 
+    def _alarm(signum, frame):
+        raise RuntimeError("decode timeout >15s")
+
+    signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(15)
+
     cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        return {}
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total <= 0:
-        cap.release()
-        return {}
-    step = max(1, total // max_frames)
     series = []
-    f_idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if f_idx % step == 0:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp_pkg.Image(image_format=mp_pkg.ImageFormat.SRGB, data=rgb)
-            res = _landmarker.detect(mp_image)
-            if res.facial_transformation_matrixes:
-                M = np.array(res.facial_transformation_matrixes[0])
-                pitch, yaw, roll = _rot_to_euler_yxz(M[:3, :3])
-                series.append((yaw, pitch, roll))
-        f_idx += 1
-    cap.release()
+    try:
+        if not cap.isOpened():
+            return {}
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            return {}
+        step = max(1, total // max_frames)
+        f_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if f_idx % step == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp_pkg.Image(image_format=mp_pkg.ImageFormat.SRGB, data=rgb)
+                res = _landmarker.detect(mp_image)
+                if res.facial_transformation_matrixes:
+                    M = np.array(res.facial_transformation_matrixes[0])
+                    pitch, yaw, roll = _rot_to_euler_yxz(M[:3, :3])
+                    series.append((yaw, pitch, roll))
+            f_idx += 1
+    finally:
+        cap.release()
+        signal.alarm(0)
 
     if len(series) < 2:
         return {"n": len(series)}
@@ -447,7 +468,7 @@ def main():
     pool = mp.Pool(processes=args.workers,
                    initializer=_worker_init,
                    initargs=(args.model_path,),
-                   maxtasksperchild=50)
+                   maxtasksperchild=20)
 
     # ---- Download thread (one part ahead).
     download_q: queue.Queue = queue.Queue(maxsize=1)
