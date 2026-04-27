@@ -477,7 +477,7 @@ def main():
     pool = mp.Pool(processes=args.workers,
                    initializer=_worker_init,
                    initargs=(args.model_path,),
-                   maxtasksperchild=20)
+                   maxtasksperchild=1000)
 
     # ---- Download thread (one part ahead).
     download_q: queue.Queue = queue.Queue(maxsize=1)
