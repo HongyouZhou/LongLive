@@ -28,10 +28,24 @@ set -euo pipefail
 : "${PROMPTS_DIR:=/home/hongyou/dev/data/wm/prompts}"
 : "${STAGING_DIR:=/home/hongyou/longlive_work/hf_upload_staging}"
 
-if ! command -v hf &>/dev/null; then
-    echo "[upload][error] 'hf' CLI not found in PATH; activate longlive env first." >&2
-    exit 1
+# Resolve a Python interpreter that has huggingface_hub installed. Prefer
+# an explicit override; fall back to the lab-local env we rsync'd, then
+# the sshfs-mounted arp env. We invoke python -m huggingface_hub instead
+# of the `hf` wrapper because the latter's shebang points to arp paths
+# which fail on lab after rsync.
+: "${LL_PY:=}"
+if [ -z "$LL_PY" ]; then
+    if [ -x "/home/hongyou/longlive_envs/longlive-blackwell/bin/python" ]; then
+        LL_PY="/home/hongyou/longlive_envs/longlive-blackwell/bin/python"
+    elif [ -x "/home/hongyou/mnt/arp/miniforge3/envs/longlive-blackwell/bin/python" ]; then
+        LL_PY="/home/hongyou/mnt/arp/miniforge3/envs/longlive-blackwell/bin/python"
+    else
+        echo "[upload][error] cannot locate Python; set LL_PY=/path/to/python" >&2
+        exit 1
+    fi
 fi
+hf_cli() { "$LL_PY" -m huggingface_hub.commands.huggingface_cli "$@"; }
+echo "[upload] LL_PY          = $LL_PY"
 
 echo "[upload] LL_HF_REPO     = $LL_HF_REPO"
 echo "[upload] motion_refs    = $MOTION_REFS_DIR"
@@ -43,7 +57,7 @@ echo "[upload] mp4 count      = $n_mp4  ($sz)"
 
 # 1. Create the dataset repo if missing (idempotent).
 echo "[upload] ensuring repo $LL_HF_REPO exists ..."
-hf repo create "$LL_HF_REPO" --repo-type dataset --private -y 2>&1 | tail -3 || true
+hf_cli repo create "$LL_HF_REPO" --repo-type dataset --private -y 2>&1 | tail -3 || true
 
 # 2. Stage manifests next to motion_refs in a single folder so the upload
 # is structured as motion_refs/*.mp4 + manifests/*.json* at repo root.
@@ -59,7 +73,7 @@ ln -f "$MOTION_REFS_DIR"/*.mp4 "$STAGING_DIR/motion_refs/" 2>/dev/null || true
 
 # 3. Upload via upload-large-folder (chunked, parallel, resumable).
 echo "[upload] running hf upload-large-folder (resumable; safe to re-run) ..."
-hf upload-large-folder "$LL_HF_REPO" "$STAGING_DIR" \
+hf_cli upload-large-folder "$LL_HF_REPO" "$STAGING_DIR" \
     --repo-type=dataset \
     --num-workers=8
 
