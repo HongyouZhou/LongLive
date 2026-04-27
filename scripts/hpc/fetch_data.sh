@@ -16,7 +16,10 @@
 # Override via:
 #   LL_OPENVID_PART=0          which OpenVid zip part to use
 #   LL_OPENVID_NUM_KEEP=1000   how many clips to keep
-#   LL_REMOTE_HOST=hongyou@arp opt-in to rsync from arp (legacy, faster if reachable)
+#   LL_REMOTE_HOST=hongyou@lab opt-in to rsync from lab (data source-of-truth
+#                              since 2026-04-26: ~360 GB motion_refs +
+#                              headmotion-mined JSONLs; arp's wm/ is now
+#                              just the original 1000-clip backup).
 #
 # Run on a *login* node (compute nodes typically have no outbound network).
 # Run from the cloned repo root.
@@ -44,7 +47,7 @@ cd "$LL_REPO"
 echo "[data] LL_REPO   = $LL_REPO"
 echo "[data] LL_DATA   = $LL_DATA"
 echo "[data] LL_CONFIG = $LL_CONFIG"
-[ -n "${LL_REMOTE_HOST:-}" ] && echo "[data] LL_REMOTE_HOST = $LL_REMOTE_HOST (arp rsync mode)"
+[ -n "${LL_REMOTE_HOST:-}" ] && echo "[data] LL_REMOTE_HOST = $LL_REMOTE_HOST (rsync mode)"
 
 # All real data lives flat under $LL_DATA (single namespace, no subdirs):
 #   wan_models/        Wan2.1-T2V-{14B,1.3B}/
@@ -75,14 +78,16 @@ export TRANSFORMERS_CACHE="$LL_DATA/hf_cache"
 : "${HF_TOKEN:?HF_TOKEN not set — your .bashrc should export it}"
 
 # -------- helpers --------
-arp_mode() { [ -n "${LL_REMOTE_HOST:-}" ]; }
+remote_mode() { [ -n "${LL_REMOTE_HOST:-}" ]; }
+arp_mode()    { remote_mode; }   # backward-compat alias
 
-sync_arp() {  # rsync remote_path local_path
+sync_remote() {  # rsync remote_path local_path
   local src="$LL_REMOTE_HOST:$1"
   local dst="$2"
-  echo "[data] (arp) rsync $src -> $dst"
+  echo "[data] (remote) rsync $src -> $dst"
   rsync -aP --inplace "$src/" "$dst/"
 }
+sync_arp() { sync_remote "$@"; }   # backward-compat alias
 
 # -------- 1. LongLive-1.3B base ckpt (5.3 GB) --------
 if [ ! -f "$LL_DATA/longlive_models/models/longlive_base.pt" ]; then
@@ -123,47 +128,54 @@ else
   echo "[data] Wan2.1-T2V-1.3B already present, skipping."
 fi
 
-# -------- 3. Motion data (~1.2 GB; private, not on any public hub) --------
-# Sub-layout expected:
-#   data/wm/motion_refs/*.mp4            (CelebV reference clips)
-#   data/wm/prompts/motion_pairs_*.jsonl (train/val pair prompts)
-need_motion=0
-[ -z "$(ls -A "$LL_DATA/motion_refs" 2>/dev/null)" ] && need_motion=1
-[ ! -f "$LL_DATA/prompts/motion_pairs_train.jsonl" ] && need_motion=1
-
-if [ "$need_motion" -eq 1 ]; then
-  if arp_mode; then
-    # arp's data lives at /home/hongyou/dev/data/wm/{motion_refs,meta,prompts}
-    # — sync each subdir individually into our flat layout.
-    sync_arp "/home/hongyou/dev/data/wm/motion_refs" "$LL_DATA/motion_refs"
-    sync_arp "/home/hongyou/dev/data/wm/meta"        "$LL_DATA/meta"
-    sync_arp "/home/hongyou/dev/data/wm/prompts"     "$LL_DATA/prompts"
-  else
-    # Default path: build motion data from OpenVid-1M via prepare_openvid.py.
-    # Step 1: caption CSV (~400 MB, lives in the same HF dataset repo).
-    if [ ! -f "$LL_DATA/meta/data/train/OpenVid-1M.csv" ]; then
-      echo "[data] downloading OpenVid-1M caption CSV ..."
-      hf download nkp37/OpenVid-1M --repo-type dataset \
-          --include "data/train/OpenVid-1M.csv" \
-          --local-dir "$LL_DATA/meta"
-    fi
-    # Step 2: prepare_openvid.py — downloads part zip (~25 GB), filters & extracts.
-    echo "[data] preparing motion data from OpenVid-1M part=$LL_OPENVID_PART, num_keep=$LL_OPENVID_NUM_KEEP"
-    echo "[data] (downloads ~25 GB zip; takes 10-30 min depending on network)"
-    python scripts/prepare_openvid.py \
-        --part "$LL_OPENVID_PART" \
-        --num_keep "$LL_OPENVID_NUM_KEEP" \
-        --data_root "$LL_DATA"
-    # Step 3: cross-pair JSONL (reuses the refs extracted above; no re-download).
-    python scripts/prepare_openvid.py \
-        --part "$LL_OPENVID_PART" \
-        --num_keep "$LL_OPENVID_NUM_KEEP" \
-        --data_root "$LL_DATA" \
-        --cross_pair --output_suffix _cross \
-        --skip_download --skip_extract
+# -------- 3. Motion data (lab is source-of-truth since 2026-04-26) --------
+# Sub-layout expected on the source host:
+#   /home/hongyou/dev/data/wm/motion_refs/*.mp4            (~360 GB,
+#                                                           ~118k OpenVid
+#                                                           clips post
+#                                                           head-motion sweep)
+#   /home/hongyou/dev/data/wm/prompts/motion_pairs_*.jsonl  (train/val pairs,
+#                                                           includes
+#                                                           motion_pairs_cross_headmotion_*.jsonl
+#                                                           emitted by
+#                                                           scripts/build_headmotion_jsonl.py)
+#   /home/hongyou/dev/data/wm/meta/data/train/OpenVid-1M.csv (~400 MB)
+#
+# We rsync unconditionally in remote_mode -- rsync is incremental, so this
+# only transfers deltas (new mp4s + updated JSONLs). The previous logic
+# guarded on motion_pairs_train.jsonl existence, which silently skipped the
+# new headmotion JSONLs whenever any old motion pair file was present.
+if remote_mode; then
+  sync_remote "/home/hongyou/dev/data/wm/motion_refs" "$LL_DATA/motion_refs"
+  sync_remote "/home/hongyou/dev/data/wm/meta"        "$LL_DATA/meta"
+  sync_remote "/home/hongyou/dev/data/wm/prompts"     "$LL_DATA/prompts"
+elif [ -z "$(ls -A "$LL_DATA/motion_refs" 2>/dev/null)" ] \
+     || [ ! -f "$LL_DATA/prompts/motion_pairs_train.jsonl" ]; then
+  # Fallback (no LL_REMOTE_HOST): build a tiny self-contained dataset from
+  # OpenVid-1M via prepare_openvid.py. This produces only the legacy 1000
+  # self-pair clips; head-motion-aware mining is NOT done here (see
+  # scripts/mine_openvid_headmotion.py + build_headmotion_jsonl.py, which
+  # require the full 6.7 TB sweep and produce the JSONLs synced above).
+  if [ ! -f "$LL_DATA/meta/data/train/OpenVid-1M.csv" ]; then
+    echo "[data] downloading OpenVid-1M caption CSV ..."
+    hf download nkp37/OpenVid-1M --repo-type dataset \
+        --include "data/train/OpenVid-1M.csv" \
+        --local-dir "$LL_DATA/meta"
   fi
+  echo "[data] preparing motion data from OpenVid-1M part=$LL_OPENVID_PART, num_keep=$LL_OPENVID_NUM_KEEP"
+  echo "[data] (downloads ~25 GB zip; takes 10-30 min depending on network)"
+  python scripts/prepare_openvid.py \
+      --part "$LL_OPENVID_PART" \
+      --num_keep "$LL_OPENVID_NUM_KEEP" \
+      --data_root "$LL_DATA"
+  python scripts/prepare_openvid.py \
+      --part "$LL_OPENVID_PART" \
+      --num_keep "$LL_OPENVID_NUM_KEEP" \
+      --data_root "$LL_DATA" \
+      --cross_pair --output_suffix _cross \
+      --skip_download --skip_extract
 else
-  echo "[data] motion data present, skipping."
+  echo "[data] motion data present (no LL_REMOTE_HOST set, skipping HF rebuild)."
 fi
 
 # -------- 4. Render an HPC-pathed config --------
