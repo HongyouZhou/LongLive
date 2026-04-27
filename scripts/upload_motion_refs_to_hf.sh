@@ -22,8 +22,25 @@
 set -euo pipefail
 
 : "${LL_HF_REPO:?LL_HF_REPO not set, e.g. hongyou/longlive-headmotion}"
-# HF_TOKEN can come from env OR from a prior `hf auth login` (stored at
-# ~/.cache/huggingface/token). Don't fail hard if env-only is missing.
+# HF_TOKEN can come from env OR from a prior `huggingface-cli login`
+# (stored at ~/.cache/huggingface/token). Read whichever is present and
+# pass it explicitly to the CLI -- letting huggingface_hub auto-discover
+# has been flaky in non-interactive shells.
+TOKEN_SRC=""
+if [ -n "${HF_TOKEN:-}" ]; then
+    TOKEN_SRC="env"
+elif [ -f "$HOME/.cache/huggingface/token" ]; then
+    HF_TOKEN=$(cat "$HOME/.cache/huggingface/token")
+    TOKEN_SRC="~/.cache/huggingface/token"
+fi
+if [ -z "${HF_TOKEN:-}" ]; then
+    echo "[upload][error] no HF_TOKEN found." >&2
+    echo "    fix:   export HF_TOKEN=hf_xxx in this shell, OR" >&2
+    echo "           /home/hongyou/longlive_envs/longlive-blackwell/bin/python \\" >&2
+    echo "             -m huggingface_hub.commands.huggingface_cli login" >&2
+    exit 1
+fi
+echo "[upload] token source   = $TOKEN_SRC  (len=${#HF_TOKEN})"
 : "${MOTION_REFS_DIR:=/home/hongyou/dev/data/wm/motion_refs}"
 : "${MASTER_JSON:=/home/hongyou/longlive_work/logs/master_all.json}"
 : "${PROMPTS_DIR:=/home/hongyou/dev/data/wm/prompts}"
@@ -58,7 +75,7 @@ echo "[upload] mp4 count      = $n_mp4  ($sz)"
 
 # 1. Create the dataset repo if missing (idempotent).
 echo "[upload] ensuring repo $LL_HF_REPO exists ..."
-hf_cli repo create "$LL_HF_REPO" --repo-type dataset --private -y 2>&1 | tail -3 || true
+hf_cli repo create "$LL_HF_REPO" --repo-type dataset --private --token "$HF_TOKEN" -y 2>&1 | tail -3 || true
 
 # 2. Stage manifests next to motion_refs in a single folder so the upload
 # is structured as motion_refs/*.mp4 + manifests/*.json* at repo root.
@@ -82,7 +99,8 @@ echo "[upload]   linked $n_linked mp4s into staging"
 echo "[upload] running hf upload-large-folder (resumable; safe to re-run) ..."
 hf_cli upload-large-folder "$LL_HF_REPO" "$STAGING_DIR" \
     --repo-type=dataset \
-    --num-workers=8
+    --num-workers=8 \
+    --token "$HF_TOKEN"
 
 echo "[upload] DONE. Browse: https://huggingface.co/datasets/$LL_HF_REPO"
 echo "[upload] HPC fetch:    LL_HF_DATASET=$LL_HF_REPO bash scripts/hpc/fetch_data.sh"
