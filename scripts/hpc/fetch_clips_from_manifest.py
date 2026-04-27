@@ -125,8 +125,13 @@ def fetch_part(part_idx: int, clips: list[str], raw_dir: Path,
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--master_json", required=True,
-                    help="merged master from merge_master_jsons.py "
-                         "(provides clip -> part lookup)")
+                    help="Either the full merged master from "
+                         "merge_master_jsons.py (~76 MB) OR the slim "
+                         "clip_to_part_*.json emitted by "
+                         "build_headmotion_jsonl.py (~2-3 MB). Both are "
+                         "read as JSON dicts; the slim form maps "
+                         "clip_name -> part_idx directly, the full form "
+                         "wraps part_idx in an inner dict.")
     ap.add_argument("--jsonls", nargs="+", required=True,
                     help="motion_pairs_*.jsonl files; "
                          "motion_a/motion_b fields are extracted")
@@ -154,15 +159,26 @@ def main():
     wanted = collect_wanted(args.jsonls)
     log(f"  {len(wanted)} unique clips referenced by JSONLs")
 
-    # ---- Group by part.
+    # ---- Group by part. Accept either the full master schema
+    # ({clip: {part, yaw_range, ...}}) or the slim manifest schema
+    # ({clip: part_idx}).
+    def get_part(name):
+        v = master.get(name)
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, dict):
+            return v.get("part")
+        return None
     by_part: dict[int, list[str]] = defaultdict(list)
     n_no_part = 0
     for name in wanted:
-        meta = master.get(name)
-        if not meta or "part" not in meta:
+        p = get_part(name)
+        if p is None:
             n_no_part += 1
             continue
-        by_part[int(meta["part"])].append(name)
+        by_part[int(p)].append(name)
     parts = sorted(p for p in by_part if args.start_part <= p < args.end_part)
     log(f"  in {len(parts)} parts (range [{args.start_part}, {args.end_part}))"
         f"; clips with no part lookup: {n_no_part}")

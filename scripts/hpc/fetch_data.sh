@@ -128,48 +128,74 @@ else
   echo "[data] Wan2.1-T2V-1.3B already present, skipping."
 fi
 
-# -------- 3. Motion data (head-motion sweep, lab=index source, HF=clip source) --------
+# -------- 3. Motion data (head-motion sweep, repo=index source, HF=clip source) --------
 #
-# Two-step strategy:
+# Index artifacts (committed to repo under $LL_REPO/prompts/):
+#   prompts/motion_pairs_cross_headmotion_train.jsonl.gz  (~13 MB compressed)
+#   prompts/motion_pairs_cross_headmotion_val.jsonl.gz    (~1.5 MB compressed)
+#   prompts/clip_to_part_cross_headmotion.json            (~2.5 MB; clip-name
+#                                                           -> OpenVid zip
+#                                                           part_idx, slim
+#                                                           form of the
+#                                                           full master)
 #
-# (3a) Sync the SMALL artifacts from lab (a few hundred MB total): the
-#      master_all.json id-list + the training JSONLs + meta/OpenVid-1M.csv.
-#      master_all.json is what scripts/merge_master_jsons.py emitted -- it
-#      maps every screened clip to its OpenVid zip part index, so we know
-#      which zip to download for each clip.
+# Steps:
+#   3a. Decompress JSONLs from repo into $LL_DATA/prompts/ (where
+#       MotionSwitchDataset expects them); copy clip_to_part manifest.
+#   3b. fetch_clips_from_manifest.py groups wanted clips by their
+#       OpenVid zip part_idx, downloads each part's zip from HF, extracts
+#       only the wanted clips into motion_refs/, deletes the zip.
+#       Rolling -- peak disk ~50 GB per part instead of 360 GB total.
 #
-# (3b) For each clip referenced by the JSONLs, fetch_clips_from_manifest.py
-#      groups by part, downloads only the relevant zips from HF Hub
-#      (one at a time, rolling, ~50 GB peak), extracts only the wanted
-#      clips into motion_refs/, then deletes the zip. This avoids the
-#      360 GB lab->HPC rsync and uses HF's bandwidth directly.
-#
-# The (3a) sync is incremental and tiny (<300 MB). The (3b) fetch is
-# CPU/disk-light but network-heavy: total HF download ~ sum(zip_sizes for
+# No lab dependency: HPC reads the manifest from the cloned repo and
+# pulls clips directly from HF. Total HF download ~ sum(zip_sizes for
 # parts containing any wanted clip), typically the entire 6.7 TB if the
 # JSONL spans all parts. Plan for 12-24 h on a stable login-node link.
-if remote_mode; then
-  echo "[data] step 3a: rsync index artifacts from $LL_REMOTE_HOST (small)"
-  sync_remote "/home/hongyou/dev/data/wm/meta"        "$LL_DATA/meta"
-  sync_remote "/home/hongyou/dev/data/wm/prompts"     "$LL_DATA/prompts"
-  # master_all.json lives under longlive_work/logs on lab (where the
-  # mining ran). Pull it directly to $LL_DATA so fetch_clips can find it.
-  rsync -aP --inplace \
-    "${LL_REMOTE_HOST}:/home/hongyou/longlive_work/logs/master_all.json" \
-    "$LL_DATA/master_all.json"
-elif [ ! -f "$LL_DATA/master_all.json" ] \
+
+# 3a: Stage manifests from repo into $LL_DATA.
+TRAIN_GZ="$LL_REPO/prompts/motion_pairs_cross_headmotion_train.jsonl.gz"
+VAL_GZ="$LL_REPO/prompts/motion_pairs_cross_headmotion_val.jsonl.gz"
+MANIFEST="$LL_REPO/prompts/clip_to_part_cross_headmotion.json"
+
+if [ -f "$TRAIN_GZ" ] && [ -f "$VAL_GZ" ] && [ -f "$MANIFEST" ]; then
+  echo "[data] step 3a: staging head-motion manifests from repo"
+  TRAIN_LOCAL="$LL_DATA/prompts/$(basename "${TRAIN_GZ%.gz}")"
+  VAL_LOCAL="$LL_DATA/prompts/$(basename "${VAL_GZ%.gz}")"
+  if [ ! -f "$TRAIN_LOCAL" ] || [ "$TRAIN_GZ" -nt "$TRAIN_LOCAL" ]; then
+    gunzip -c "$TRAIN_GZ" > "$TRAIN_LOCAL"
+    echo "[data] decompressed $(basename "$TRAIN_LOCAL")"
+  fi
+  if [ ! -f "$VAL_LOCAL" ] || [ "$VAL_GZ" -nt "$VAL_LOCAL" ]; then
+    gunzip -c "$VAL_GZ" > "$VAL_LOCAL"
+    echo "[data] decompressed $(basename "$VAL_LOCAL")"
+  fi
+  cp -u "$MANIFEST" "$LL_DATA/$(basename "$MANIFEST")"
+
+  if [ ! -f "$LL_DATA/meta/data/train/OpenVid-1M.csv" ]; then
+    echo "[data] downloading OpenVid-1M caption CSV (~400 MB) ..."
+    hf download nkp37/OpenVid-1M --repo-type dataset \
+        --include "data/train/OpenVid-1M.csv" \
+        --local-dir "$LL_DATA/meta"
+  fi
+
+  # 3b: Fetch mp4 clips from HF based on the manifest + JSONLs.
+  echo "[data] step 3b: fetching mp4 clips from HuggingFace"
+  python scripts/hpc/fetch_clips_from_manifest.py \
+      --master_json "$LL_DATA/$(basename "$MANIFEST")" \
+      --jsonls "$TRAIN_LOCAL" "$VAL_LOCAL" \
+      --output_dir "$LL_DATA/motion_refs" \
+      --raw_dir "$LL_DATA/openvid_raw"
+elif [ -z "$(ls -A "$LL_DATA/motion_refs" 2>/dev/null)" ] \
      || [ ! -f "$LL_DATA/prompts/motion_pairs_train.jsonl" ]; then
-  # No remote source AND no local master/JSONL: this script can't bootstrap
-  # the full head-motion sweep (that takes 6.7 TB transient + 24 h). Fall
-  # back to the legacy 1000-clip self-pair build only, which is enough to
-  # run the original (non-headmotion) configs.
+  # Legacy fallback: head-motion manifests not committed yet, build the
+  # tiny self-pair dataset from scratch via prepare_openvid.py.
   if [ ! -f "$LL_DATA/meta/data/train/OpenVid-1M.csv" ]; then
     echo "[data] downloading OpenVid-1M caption CSV ..."
     hf download nkp37/OpenVid-1M --repo-type dataset \
         --include "data/train/OpenVid-1M.csv" \
         --local-dir "$LL_DATA/meta"
   fi
-  echo "[data] no master_all.json available; falling back to legacy 1000-clip build"
+  echo "[data] head-motion manifests absent; building legacy 1000-clip dataset"
   echo "[data] preparing motion data from OpenVid-1M part=$LL_OPENVID_PART, num_keep=$LL_OPENVID_NUM_KEEP"
   python scripts/prepare_openvid.py \
       --part "$LL_OPENVID_PART" \
@@ -181,44 +207,6 @@ elif [ ! -f "$LL_DATA/master_all.json" ] \
       --data_root "$LL_DATA" \
       --cross_pair --output_suffix _cross \
       --skip_download --skip_extract
-fi
-
-# -------- 3b. Fetch clip mp4s from HF based on master + JSONLs --------
-# Determine which JSONL the chosen LL_CONFIG references and pass them to
-# the manifest fetcher. We fetch only the clips actually used by the
-# config so HPC disk doesn't bloat with unrelated clips.
-if [ -f "$LL_DATA/master_all.json" ]; then
-  echo "[data] step 3b: fetching mp4 clips from HF based on master + JSONLs"
-  TRAIN_JSONL=$(python - <<EOF
-from omegaconf import OmegaConf
-import os
-cfg = OmegaConf.load("$LL_REPO/$LL_CONFIG")
-print(cfg.motion_pair_jsonl if "motion_pair_jsonl" in cfg else "")
-EOF
-)
-  VAL_JSONL=$(python - <<EOF
-from omegaconf import OmegaConf
-import os
-cfg = OmegaConf.load("$LL_REPO/$LL_CONFIG")
-print(cfg.val_motion_pair_jsonl if "val_motion_pair_jsonl" in cfg else "")
-EOF
-)
-  # Map source-host paths to local $LL_DATA paths (basename rewrite).
-  TRAIN_LOCAL="$LL_DATA/prompts/$(basename "$TRAIN_JSONL")"
-  VAL_LOCAL="$LL_DATA/prompts/$(basename "$VAL_JSONL")"
-  if [ ! -f "$TRAIN_LOCAL" ]; then
-    echo "[data][error] train JSONL not on disk: $TRAIN_LOCAL"
-    echo "             Did the rsync from $LL_REMOTE_HOST complete?"
-    exit 1
-  fi
-  python scripts/hpc/fetch_clips_from_manifest.py \
-      --master_json "$LL_DATA/master_all.json" \
-      --jsonls "$TRAIN_LOCAL" "$VAL_LOCAL" \
-      --output_dir "$LL_DATA/motion_refs" \
-      --raw_dir "$LL_DATA/openvid_raw"
-else
-  echo "[data] no master_all.json present; skipping 3b clip fetch"
-  echo "       (legacy fallback already populated motion_refs/ above)"
 fi
 
 # -------- 4. Render an HPC-pathed config --------

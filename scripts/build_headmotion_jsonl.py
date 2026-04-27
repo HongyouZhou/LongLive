@@ -213,6 +213,31 @@ def main():
     print(f"[done] wrote {train_path} ({len(train_pairs)} rows)")
     print(f"[done] wrote {val_path} ({len(val_pairs)} rows)")
 
+    # ---- Slim manifest: clip_name -> part_idx for every clip referenced.
+    # This is what HPC's fetch_clips_from_manifest.py needs: just enough to
+    # group clips by their OpenVid zip and download from HF. Much smaller
+    # than the full master JSON (no yaw stats, only saved-and-referenced
+    # clips), so the repo can ship it alongside the JSONLs.
+    referenced = set()
+    for p in train_pairs + val_pairs:
+        for k in ("motion_a", "motion_b"):
+            v = p.get(k)
+            if v:
+                referenced.add(v)
+    clip_to_part = {}
+    n_no_part = 0
+    for name in referenced:
+        meta = master.get(name)
+        if not meta or "part" not in meta:
+            n_no_part += 1
+            continue
+        clip_to_part[name] = int(meta["part"])
+    manifest_path = out_dir / f"clip_to_part{args.output_suffix}.json"
+    with open(manifest_path, "w") as f:
+        json.dump(clip_to_part, f, separators=(",", ":"), sort_keys=False)
+    print(f"[done] wrote {manifest_path} "
+          f"({len(clip_to_part)} entries, no_part_lookup={n_no_part})")
+
 
 if __name__ == "__main__":
     main()
