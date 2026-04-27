@@ -157,7 +157,33 @@ TRAIN_GZ="$LL_REPO/prompts/motion_pairs_cross_headmotion_train.jsonl.gz"
 VAL_GZ="$LL_REPO/prompts/motion_pairs_cross_headmotion_val.jsonl.gz"
 MANIFEST="$LL_REPO/prompts/clip_to_part_cross_headmotion.json"
 
-if [ -f "$TRAIN_GZ" ] && [ -f "$VAL_GZ" ] && [ -f "$MANIFEST" ]; then
+# Optional: pull motion_refs/ from a private HF dataset uploaded by
+# scripts/upload_motion_refs_to_hf.sh (~360 GB, ~18x less network than
+# the OpenVid zip-extraction path). Set LL_HF_DATASET to enable.
+if [ -n "${LL_HF_DATASET:-}" ] && [ -f "$TRAIN_GZ" ] && [ -f "$VAL_GZ" ] && [ -f "$MANIFEST" ]; then
+  echo "[data] step 3 (HF dataset path): pulling motion_refs from $LL_HF_DATASET"
+  TRAIN_LOCAL="$LL_DATA/prompts/$(basename "${TRAIN_GZ%.gz}")"
+  VAL_LOCAL="$LL_DATA/prompts/$(basename "${VAL_GZ%.gz}")"
+  if [ ! -f "$TRAIN_LOCAL" ] || [ "$TRAIN_GZ" -nt "$TRAIN_LOCAL" ]; then
+    gunzip -c "$TRAIN_GZ" > "$TRAIN_LOCAL"
+  fi
+  if [ ! -f "$VAL_LOCAL" ] || [ "$VAL_GZ" -nt "$VAL_LOCAL" ]; then
+    gunzip -c "$VAL_GZ" > "$VAL_LOCAL"
+  fi
+  cp -u "$MANIFEST" "$LL_DATA/$(basename "$MANIFEST")"
+  if [ ! -f "$LL_DATA/meta/data/train/OpenVid-1M.csv" ]; then
+    hf download nkp37/OpenVid-1M --repo-type dataset \
+        --include "data/train/OpenVid-1M.csv" \
+        --local-dir "$LL_DATA/meta"
+  fi
+  # snapshot_download pulls everything in motion_refs/ subfolder of the
+  # private dataset (already filtered to the head-motion subset by the
+  # upload script). Resumable: re-runs only fetch missing files.
+  hf download "$LL_HF_DATASET" --repo-type=dataset \
+      --include "motion_refs/*" \
+      --local-dir "$LL_DATA"
+  echo "[data] HF dataset pull done; $(ls -1 "$LL_DATA/motion_refs" | wc -l) mp4 in motion_refs/"
+elif [ -f "$TRAIN_GZ" ] && [ -f "$VAL_GZ" ] && [ -f "$MANIFEST" ]; then
   echo "[data] step 3a: staging head-motion manifests from repo"
   TRAIN_LOCAL="$LL_DATA/prompts/$(basename "${TRAIN_GZ%.gz}")"
   VAL_LOCAL="$LL_DATA/prompts/$(basename "${VAL_GZ%.gz}")"
