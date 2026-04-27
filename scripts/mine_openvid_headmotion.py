@@ -235,8 +235,10 @@ def load_face_kw_csv(csv_path: Path, face_kws: list[str],
     return caption, score
 
 
-def download_part(part_idx: int, raw_dir: Path, retries: int = 3) -> Path:
-    """Download one zip part via huggingface_hub. Returns local path."""
+def download_part(part_idx: int, raw_dir: Path, retries: int = 3):
+    """Download one zip part via huggingface_hub. Returns Path on success,
+    None on 404 (HF index has gaps; e.g. parts 73, 76, 78, 83, ... are
+    legitimately absent and should be silently skipped)."""
     name = f"OpenVid_part{part_idx}.zip"
     dst = raw_dir / name
     if dst.exists():
@@ -259,6 +261,10 @@ def download_part(part_idx: int, raw_dir: Path, retries: int = 3) -> Path:
             return Path(path)
         except Exception as e:
             last_err = e
+            err_text = str(e).lower()
+            if "404" in err_text or "entry not found" in err_text:
+                log(f"  part{part_idx} not found on HF (404) — skipping")
+                return None
             log(f"  part{part_idx} download error: {type(e).__name__}: {e}")
             time.sleep(5)
     raise RuntimeError(f"part{part_idx} download failed after {retries} attempts: {last_err}")
@@ -386,7 +392,10 @@ def main():
     ap.add_argument("--face_keywords", default=DEFAULT_FACE_KEYWORDS,
                     help="space-separated keyword list")
     ap.add_argument("--start_part", type=int, default=0)
-    ap.add_argument("--end_part", type=int, default=170)
+    ap.add_argument("--end_part", type=int, default=183,
+                    help="Exclusive upper bound. HF has 170 zips total but "
+                         "indices go up to 182 (with 13 gaps in 0..170). "
+                         "Default 183 covers all existing parts.")
     ap.add_argument("--master_json", default="logs/diag_head_pose_all_parts.json")
     ap.add_argument("--progress_json", default="logs/mining_progress.json")
     ap.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
@@ -478,6 +487,10 @@ def main():
         try:
             for p in parts_plan:
                 zp = download_part(p, raw_dir)
+                if zp is None:
+                    # HF 404 — record as skipped in progress and move on.
+                    progress_data.setdefault("skipped_404_parts", []).append(p)
+                    continue
                 download_q.put((p, zp))
             download_q.put(None)
         except Exception as e:
