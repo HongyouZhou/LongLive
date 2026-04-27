@@ -22,7 +22,8 @@
 set -euo pipefail
 
 : "${LL_HF_REPO:?LL_HF_REPO not set, e.g. hongyou/longlive-headmotion}"
-: "${HF_TOKEN:?HF_TOKEN not set in env}"
+# HF_TOKEN can come from env OR from a prior `hf auth login` (stored at
+# ~/.cache/huggingface/token). Don't fail hard if env-only is missing.
 : "${MOTION_REFS_DIR:=/home/hongyou/dev/data/wm/motion_refs}"
 : "${MASTER_JSON:=/home/hongyou/longlive_work/logs/master_all.json}"
 : "${PROMPTS_DIR:=/home/hongyou/dev/data/wm/prompts}"
