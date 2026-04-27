@@ -68,9 +68,15 @@ cp -u "$MASTER_JSON" "$STAGING_DIR/manifests/master_all.json"
 cp -u "$PROMPTS_DIR"/motion_pairs_cross_headmotion_train.jsonl "$STAGING_DIR/manifests/" 2>/dev/null || true
 cp -u "$PROMPTS_DIR"/motion_pairs_cross_headmotion_val.jsonl   "$STAGING_DIR/manifests/" 2>/dev/null || true
 cp -u "$PROMPTS_DIR"/clip_to_part_cross_headmotion.json        "$STAGING_DIR/manifests/" 2>/dev/null || true
-# Hard-link the mp4s into staging so we don't blow up disk; rsync also OK.
+# Hard-link the mp4s into staging so we don't blow up disk. Use find +exec
+# because `ln *.mp4` exceeds ARG_MAX with 100k+ files (silently fails via
+# the prior `|| true`). Same-fs assumption holds: both paths live under
+# /home/hongyou (single nvme on lab).
 echo "[upload] hard-linking mp4s into staging (no extra disk used) ..."
-ln -f "$MOTION_REFS_DIR"/*.mp4 "$STAGING_DIR/motion_refs/" 2>/dev/null || true
+find "$MOTION_REFS_DIR" -maxdepth 1 -name "*.mp4" \
+    -exec ln -f -t "$STAGING_DIR/motion_refs" {} +
+n_linked=$(find "$STAGING_DIR/motion_refs" -maxdepth 1 -name "*.mp4" | wc -l)
+echo "[upload]   linked $n_linked mp4s into staging"
 
 # 3. Upload via upload-large-folder (chunked, parallel, resumable).
 echo "[upload] running hf upload-large-folder (resumable; safe to re-run) ..."
