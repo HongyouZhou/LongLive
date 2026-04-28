@@ -65,6 +65,15 @@ HPC_CONFIG="${LL_CONFIG%.yaml}_hpc.yaml"
 echo "[SLURM] Config: $LL_CONFIG"
 
 ##############################
+# Per-run logdir: <config>_<jobid> so concurrent / sequential runs of
+# different configs cannot overwrite each other's checkpoints.
+##############################
+RUN_NAME="$(basename "${LL_CONFIG%.yaml}")_${SLURM_JOB_ID}"
+RUN_LOGDIR="$PROJECT_DIR/logs/$RUN_NAME"
+mkdir -p "$RUN_LOGDIR"
+echo "[SLURM] Run logdir: $RUN_LOGDIR"
+
+##############################
 # Distributed + NCCL env
 ##############################
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
@@ -115,7 +124,7 @@ if [ "$NNODES" -gt 1 ]; then
             --rdzv_id=$SLURM_JOB_ID \
             train.py \
             --config_path $LL_CONFIG \
-            --logdir $PROJECT_DIR/logs \
+            --logdir $RUN_LOGDIR \
             --wandb-save-dir $PROJECT_DIR/wandb
     "
 else
@@ -125,7 +134,7 @@ else
         --master_port="$MASTER_PORT" \
         train.py \
         --config_path "$LL_CONFIG" \
-        --logdir "$PROJECT_DIR/logs" \
+        --logdir "$RUN_LOGDIR" \
         --wandb-save-dir "$PROJECT_DIR/wandb"
 fi
 
