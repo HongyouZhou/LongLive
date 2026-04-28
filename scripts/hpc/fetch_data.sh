@@ -158,10 +158,12 @@ VAL_GZ="$LL_REPO/prompts/motion_pairs_cross_headmotion_val.jsonl.gz"
 MANIFEST="$LL_REPO/prompts/clip_to_part_cross_headmotion.json"
 
 # Optional: pull motion_refs/ from a private HF dataset uploaded by
-# scripts/upload_motion_refs_to_hf.sh (~360 GB, ~18x less network than
-# the OpenVid zip-extraction path). Set LL_HF_DATASET to enable.
+# scripts/upload_motion_refs_tar_to_hf.sh (~720 GB across 12 tar shards,
+# ~9x less network than re-extracting OpenVid zips, and bypasses the
+# 10000-files-per-directory git limit that broke the per-mp4 upload).
+# Set LL_HF_DATASET to enable.
 if [ -n "${LL_HF_DATASET:-}" ] && [ -f "$TRAIN_GZ" ] && [ -f "$VAL_GZ" ] && [ -f "$MANIFEST" ]; then
-  echo "[data] step 3 (HF dataset path): pulling motion_refs from $LL_HF_DATASET"
+  echo "[data] step 3 (HF dataset path): pulling tar shards from $LL_HF_DATASET"
   TRAIN_LOCAL="$LL_DATA/prompts/$(basename "${TRAIN_GZ%.gz}")"
   VAL_LOCAL="$LL_DATA/prompts/$(basename "${VAL_GZ%.gz}")"
   if [ ! -f "$TRAIN_LOCAL" ] || [ "$TRAIN_GZ" -nt "$TRAIN_LOCAL" ]; then
@@ -176,12 +178,35 @@ if [ -n "${LL_HF_DATASET:-}" ] && [ -f "$TRAIN_GZ" ] && [ -f "$VAL_GZ" ] && [ -f
         --include "data/train/OpenVid-1M.csv" \
         --local-dir "$LL_DATA/meta"
   fi
-  # snapshot_download pulls everything in motion_refs/ subfolder of the
-  # private dataset (already filtered to the head-motion subset by the
-  # upload script). Resumable: re-runs only fetch missing files.
-  hf download "$LL_HF_DATASET" --repo-type=dataset \
-      --include "motion_refs/*" \
-      --local-dir "$LL_DATA"
+
+  # Roll shard-by-shard to keep peak disk small: download tar -> extract
+  # into motion_refs/ -> delete tar. Sentinel file marks done shards so
+  # re-runs skip cleanly. ~60 GB peak per shard on top of the growing
+  # motion_refs/ tree.
+  : "${LL_TAR_SHARDS:=12}"
+  : "${LL_TAR_DIR:=$LL_DATA/shards_tmp}"
+  mkdir -p "$LL_TAR_DIR" "$LL_DATA/motion_refs"
+  for i in $(seq 0 $((LL_TAR_SHARDS - 1))); do
+    name=$(printf "shards/%03d.tar" "$i")
+    sentinel="$LL_TAR_DIR/.$(printf "%03d" "$i").extracted"
+    if [ -f "$sentinel" ]; then
+      echo "[data]   shard $(printf "%03d" "$i") already extracted, skip"
+      continue
+    fi
+    tar_path="$LL_TAR_DIR/$(printf "%03d" "$i").tar"
+    if [ ! -f "$tar_path" ]; then
+      echo "[data]   downloading $name from $LL_HF_DATASET"
+      hf download "$LL_HF_DATASET" --repo-type=dataset \
+          --include "$name" \
+          --local-dir "$LL_TAR_DIR"
+      # hf download lays the file at $LL_TAR_DIR/shards/NNN.tar; move flat.
+      mv "$LL_TAR_DIR/$name" "$tar_path"
+    fi
+    echo "[data]   extracting $tar_path -> motion_refs/"
+    tar -xf "$tar_path" -C "$LL_DATA/motion_refs"
+    rm -f "$tar_path"
+    touch "$sentinel"
+  done
   echo "[data] HF dataset pull done; $(ls -1 "$LL_DATA/motion_refs" | wc -l) mp4 in motion_refs/"
 elif [ -f "$TRAIN_GZ" ] && [ -f "$VAL_GZ" ] && [ -f "$MANIFEST" ]; then
   echo "[data] step 3a: staging head-motion manifests from repo"
