@@ -198,6 +198,9 @@ class Trainer:
             # 1. Load base model first (config.generator_ckpt) - before applying LoRA and FSDP
             base_checkpoint_path = getattr(config, "generator_ckpt", None)
             if base_checkpoint_path:
+                # Expand $LL_DATA / ~ so configs can be portable across machines
+                # without going through fetch_data.sh's yaml render step.
+                base_checkpoint_path = os.path.expandvars(os.path.expanduser(base_checkpoint_path))
                 if self.is_main_process:
                     print(f"Loading base model from {base_checkpoint_path} (before applying LoRA)")
                 base_checkpoint = torch.load(base_checkpoint_path, map_location="cpu")

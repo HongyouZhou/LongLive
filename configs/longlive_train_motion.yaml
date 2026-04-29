@@ -3,7 +3,11 @@
 # Set `motion.enabled = false` to fall back to vanilla DMD (a single switch
 # of behavior, no other changes needed).
 
-generator_ckpt: checkpoints/longlive_init.pt
+# NVlabs's released LongLive 1.3B Stage-2 ckpt; path expands $LL_DATA at load
+# time. We continue-train this (generator is trainable, not frozen) with the
+# motion-DMD score correction injected, rather than redo Stage 1+2 from
+# scratch (would add ~5 weeks of distillation we already have for free).
+generator_ckpt: $LL_DATA/longlive_models/models/longlive_base.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
