@@ -656,7 +656,91 @@ class Trainer:
         
         if self.one_logger is not None:
             self.one_logger.on_train_start(train_iterations_start = self.step, train_samples_start = self.step * self.config.batch_size)
-        
+
+        # Motion-DMD: load V_ref latent cache + pre-encode captions when enabled.
+        # Must run AFTER FSDP-wrap of text_encoder (line ~377). No-op when disabled.
+        self._maybe_load_motion_refs()
+
+    def _maybe_load_motion_refs(self):
+        """Load V_ref latent cache from `config.motion.refs_path` and pre-encode
+        captions via the (FSDP-wrapped) text encoder. Idempotent and safe to call
+        when motion is disabled (returns immediately)."""
+        mc = getattr(self.model, "motion_cfg", None)
+        if mc is None or not mc.enabled:
+            return
+        if mc.refs_path is None:
+            if self.is_main_process:
+                print("[motion] enabled=True but refs_path is null — disabling motion")
+            mc.enabled = False
+            return
+        # Expand $LL_DATA / ~ so configs can be portable across machines.
+        mc.refs_path = os.path.expandvars(os.path.expanduser(mc.refs_path))
+        if not os.path.exists(mc.refs_path):
+            if self.is_main_process:
+                print(f"[motion] refs_path does not exist: {mc.refs_path} — disabling motion")
+            mc.enabled = False
+            return
+
+        cache = torch.load(mc.refs_path, map_location="cpu")
+        latents = cache["latents"]  # [N, F=21, C=16, H=60, W=104]
+        captions = cache["captions"]
+        if hasattr(latents, "pin_memory"):
+            try:
+                latents = latents.pin_memory()
+            except RuntimeError:
+                pass  # CPU pinning unavailable in some envs (no-op)
+        mc.v_ref_latents = latents
+        mc.captions = captions
+
+        # Pre-encode each caption once (text encoder is deterministic; same input
+        # ⇒ same embedding, so all ranks get identical dicts).
+        with torch.no_grad():
+            mc.motion_caption_dicts = []
+            for cap in captions:
+                d = self.model.text_encoder(text_prompts=[cap])
+                d = {k: v.detach() for k, v in d.items()}
+                mc.motion_caption_dicts.append(d)
+
+        if self.is_main_process:
+            print(f"[motion] loaded {len(captions)} V_ref latents from "
+                  f"{mc.refs_path}, latent shape={tuple(latents.shape)}, "
+                  f"dtype={latents.dtype}")
+
+    def _maybe_pick_motion_ref(self):
+        """Per-sequence Bernoulli + ref index pick (rank-0 broadcasts to all).
+        Returns a `motion_info` dict ready to be stashed into streaming state, or
+        None when motion is disabled / Bernoulli came up 0 / no refs loaded."""
+        mc = getattr(self.model, "motion_cfg", None)
+        if mc is None or not mc.enabled:
+            return None
+        if mc.v_ref_latents is None or mc.motion_caption_dicts is None:
+            return None
+
+        # Rank-0 picks (inject_flag, ref_idx); broadcast as int tensor [2].
+        decision = torch.zeros(2, device=self.device, dtype=torch.int64)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            inject = 1 if (random.random() < mc.inject_prob) else 0
+            ref_idx = random.randint(0, mc.v_ref_latents.shape[0] - 1) if inject else 0
+            decision[0] = inject
+            decision[1] = ref_idx
+        if dist.is_initialized():
+            dist.broadcast(decision, src=0)
+        inject = int(decision[0].item())
+        if inject == 0:
+            return None
+        ref_idx = int(decision[1].item())
+
+        # Send the chosen V_ref latent to GPU (small: ~3.5 MB / ref).
+        v_ref = mc.v_ref_latents[ref_idx:ref_idx + 1].to(
+            device=self.device, dtype=self.dtype, non_blocking=True
+        )
+        caption_dict = mc.motion_caption_dicts[ref_idx]
+        return {
+            "v_ref_latent": v_ref,
+            "caption_dict": caption_dict,
+            "ref_idx": ref_idx,
+        }
+
     def _move_optimizer_to_device(self, optimizer, device):
         """Move optimizer state to the specified device."""
         for state in optimizer.state.values():
@@ -1098,10 +1182,16 @@ class Trainer:
             if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
                 log_gpu_memory(f"streaming Training: After switch text encoding", device=self.device, rank=dist.get_rank())
         
+        # Motion-DMD: rank-0 samples V_ref + Bernoulli, broadcasts to all ranks.
+        motion_info = self._maybe_pick_motion_ref()
+        if motion_info is not None and DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SeqTrain-Trainer] motion_info: ref_idx={motion_info['ref_idx']}, "
+                  f"v_ref shape={tuple(motion_info['v_ref_latent'].shape)}")
+
         # Set up the sequence
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SeqTrain-Trainer] Calling streaming_model.setup_sequence")
-            
+
         self.streaming_model.setup_sequence(
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
@@ -1109,8 +1199,9 @@ class Trainer:
             switch_conditional_dict=switch_conditional_dict,
             switch_frame_index=switch_frame_index,
             temp_max_length=temp_max_length,
+            motion_info=motion_info,
         )
-        
+
         self.streaming_active = True
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -1239,6 +1330,11 @@ class Trainer:
         start_step = self.step
         try:
             while True:
+                # Sync the trainer's step counter into the base model so that
+                # `motion_cfg.beta_at(...)` uses a fresh warmup-step value each
+                # iteration. No-op when motion is disabled.
+                self.model.global_step = self.step
+
                 # Check if we should train generator on this optimization step
                 TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
                 if LOG_GPU_MEMORY:
@@ -1394,6 +1490,18 @@ class Trainer:
                                 "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                             }
                         )
+                        # Forward any motion-DMD diagnostic keys (motion_beta,
+                        # motion_alpha, motion_inject, motion_attn_norm_b*).
+                        for k, v in generator_log_dict.items():
+                            if not k.startswith("motion"):
+                                continue
+                            if isinstance(v, torch.Tensor):
+                                wandb_loss_dict[k] = v.float().mean().item()
+                            else:
+                                try:
+                                    wandb_loss_dict[k] = float(v)
+                                except (TypeError, ValueError):
+                                    pass
 
 
                     wandb_loss_dict.update(

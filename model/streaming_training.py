@@ -129,6 +129,7 @@ class StreamingTrainingModel:
             "has_switched": False,  # Track whether prompt has been switched
             "previous_frames": None,  # Store last generated frames for overlap (up to 21)
             "temp_max_length": None,  # Temporary max length for the current sequence
+            "motion_info": None,  # Motion-DMD V_ref + caption_dict for this sequence
         }
 
         self.inference_pipeline.clear_kv_cache()
@@ -287,6 +288,7 @@ class StreamingTrainingModel:
         switch_conditional_dict: Optional[Dict] = None,
         switch_frame_index: Optional[int] = None,
         temp_max_length: Optional[int] = None,
+        motion_info: Optional[Dict] = None,
     ):
         """Set up a new sequence"""
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
@@ -361,6 +363,10 @@ class StreamingTrainingModel:
             "conditional_dict": conditional_dict,
             "unconditional_dict": unconditional_dict,
         }
+
+        # Motion-DMD: stash the per-sequence V_ref selection (None when motion
+        # is disabled or this sequence opted out).
+        self.state["motion_info"] = motion_info
         
         # DMDSwitch related information
         if switch_conditional_dict is not None and switch_frame_index is not None:
@@ -577,6 +583,13 @@ class StreamingTrainingModel:
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] Using conditional_dict and unconditional_dict for loss calculation at frame {chunk_start_frame}")
         
+        # Motion-DMD plumbing: forward V_ref and its pre-encoded caption when
+        # this sequence was tagged for motion injection (set up by trainer in
+        # start_new_sequence; None when motion is disabled or this step skipped).
+        motion_info = self.state.get("motion_info") or {}
+        v_ref_latent = motion_info.get("v_ref_latent")
+        motion_caption_dict = motion_info.get("caption_dict")
+
         # Compute DMD loss
         dmd_loss, dmd_log_dict = self.base_model.compute_distribution_matching_loss(
             image_or_video=chunk,
@@ -584,7 +597,9 @@ class StreamingTrainingModel:
             unconditional_dict=unconditional_dict,
             gradient_mask=gradient_mask,  # Pass gradient_mask
             denoised_timestep_from=chunk_info["denoised_timestep_from"],
-            denoised_timestep_to=chunk_info["denoised_timestep_to"]
+            denoised_timestep_to=chunk_info["denoised_timestep_to"],
+            v_ref_latent=v_ref_latent,
+            motion_caption_dict=motion_caption_dict,
         )
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:

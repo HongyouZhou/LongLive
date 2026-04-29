@@ -6,6 +6,7 @@ import torch
 import time
 
 from model.base import SelfForcingModel
+from model.motion_hooks import MotionAttnInjector
 from utils.memory import log_gpu_memory
 import torch.distributed as dist
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY
@@ -131,6 +132,125 @@ class DMD(SelfForcingModel):
             "timestep": timestep.detach()
         }
 
+    def _motion_inject_bernoulli(self, motion_cfg) -> bool:
+        """Sample whether to inject motion this step. Rank 0 samples + broadcasts
+        so all FSDP ranks agree (else the dispatch would diverge across ranks)."""
+        device = self.device
+        if dist.is_initialized():
+            tensor = torch.zeros(1, device=device, dtype=torch.float32)
+            if dist.get_rank() == 0:
+                tensor[0] = float(torch.rand(1).item() < motion_cfg.inject_prob)
+            dist.broadcast(tensor, src=0)
+            return bool(tensor.item() > 0.5)
+        return float(torch.rand(1).item()) < motion_cfg.inject_prob
+
+    def _compute_kl_grad_with_motion(
+        self, noisy_image_or_video: torch.Tensor,
+        estimated_clean_image_or_video: torch.Tensor,
+        timestep: torch.Tensor,
+        conditional_dict: dict, unconditional_dict: dict,
+        v_ref_latent: torch.Tensor,
+        motion_caption_dict: dict,
+        beta: float, alpha: float, block_idxs: list,
+        normalization: bool = True
+    ) -> Tuple[torch.Tensor, dict]:
+        """Motion-DMD variant: blend `pred_real_image` with `pred_real_image_motion`,
+        which is the teacher run on student's noisy_latent with attn at
+        `block_idxs` blended toward V_ref's attn at the same timestep.
+
+        Total teacher forwards per call: cond + uncond (vanilla CFG)
+                                       + V_ref capture
+                                       + student inject  =  4
+        """
+        # Step 1: fake score (unchanged)
+        _, pred_fake_image_cond = self.fake_score(
+            noisy_image_or_video=noisy_image_or_video,
+            conditional_dict=conditional_dict,
+            timestep=timestep
+        )
+        if self.fake_guidance_scale != 0.0:
+            _, pred_fake_image_uncond = self.fake_score(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=unconditional_dict,
+                timestep=timestep
+            )
+            pred_fake_image = pred_fake_image_cond + (
+                pred_fake_image_cond - pred_fake_image_uncond
+            ) * self.fake_guidance_scale
+        else:
+            pred_fake_image = pred_fake_image_cond
+
+        # Step 2: vanilla real score (cond+uncond CFG, unchanged)
+        _, pred_real_image_cond = self.real_score(
+            noisy_image_or_video=noisy_image_or_video,
+            conditional_dict=conditional_dict,
+            timestep=timestep
+        )
+        _, pred_real_image_uncond = self.real_score(
+            noisy_image_or_video=noisy_image_or_video,
+            conditional_dict=unconditional_dict,
+            timestep=timestep
+        )
+        pred_real_image = pred_real_image_cond + (
+            pred_real_image_cond - pred_real_image_uncond
+        ) * self.real_guidance_scale
+
+        # Step 3: motion forward — capture V_ref attn at `timestep`, then run
+        # teacher on student's noisy_latent with attn injected.
+        # `noisy_v_ref` matches student's batch and frame dims so the cached
+        # attn shape will line up with the student inject pass.
+        batch_size, num_frame = noisy_image_or_video.shape[:2]
+        v_ref_b = v_ref_latent.to(
+            device=noisy_image_or_video.device, dtype=noisy_image_or_video.dtype
+        )
+        if v_ref_b.shape[0] == 1 and batch_size > 1:
+            v_ref_b = v_ref_b.expand(batch_size, *v_ref_b.shape[1:])
+        v_ref_noise = torch.randn_like(v_ref_b)
+        noisy_v_ref = self.scheduler.add_noise(
+            v_ref_b.flatten(0, 1),
+            v_ref_noise.flatten(0, 1),
+            timestep.flatten(0, 1),
+        ).unflatten(0, (batch_size, num_frame))
+
+        injector = MotionAttnInjector(self.real_score.model, block_idxs, alpha=alpha)
+        with injector:
+            injector.set_mode("capture")
+            _ = self.real_score(
+                noisy_image_or_video=noisy_v_ref,
+                conditional_dict=motion_caption_dict,
+                timestep=timestep,
+            )
+            cache_norms = injector.attn_norm_summary()
+
+            injector.set_mode("inject")
+            _, pred_real_image_motion = self.real_score(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+            )
+
+        # Step 4: blend teacher score
+        pred_real_blended = (1.0 - beta) * pred_real_image + beta * pred_real_image_motion
+
+        # Step 5: DMD gradient with motion-blended teacher
+        grad = (pred_fake_image - pred_real_blended)
+        if normalization:
+            p_real = (estimated_clean_image_or_video - pred_real_blended)
+            normalizer = torch.abs(p_real).mean(dim=[1, 2, 3, 4], keepdim=True)
+            grad = grad / normalizer
+        grad = torch.nan_to_num(grad)
+
+        log_dict = {
+            "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
+            "timestep": timestep.detach(),
+            "motion_beta": float(beta),
+            "motion_alpha": float(alpha),
+            "motion_inject": 1.0,
+        }
+        for i, v in cache_norms.items():
+            log_dict[f"motion_attn_norm_b{i}"] = float(v)
+        return grad, log_dict
+
     def compute_distribution_matching_loss(
         self,
         image_or_video: torch.Tensor,
@@ -138,7 +258,9 @@ class DMD(SelfForcingModel):
         unconditional_dict: dict,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
-        denoised_timestep_to: int = 0
+        denoised_timestep_to: int = 0,
+        v_ref_latent: Optional[torch.Tensor] = None,
+        motion_caption_dict: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -182,14 +304,39 @@ class DMD(SelfForcingModel):
                 timestep.flatten(0, 1)
             ).detach().unflatten(0, (batch_size, num_frame))
 
-            # Step 2: Compute the KL grad
-            grad, dmd_log_dict = self._compute_kl_grad(
-                noisy_image_or_video=noisy_latent,
-                estimated_clean_image_or_video=original_latent,
-                timestep=timestep,
-                conditional_dict=conditional_dict,
-                unconditional_dict=unconditional_dict
+            # Step 2: Compute the KL grad — vanilla DMD or motion-DMD branch.
+            motion_cfg = getattr(self, "motion_cfg", None)
+            inject_this_step = (
+                motion_cfg is not None
+                and motion_cfg.enabled
+                and v_ref_latent is not None
+                and motion_caption_dict is not None
+                and self._motion_inject_bernoulli(motion_cfg)
             )
+            if inject_this_step:
+                grad, dmd_log_dict = self._compute_kl_grad_with_motion(
+                    noisy_image_or_video=noisy_latent,
+                    estimated_clean_image_or_video=original_latent,
+                    timestep=timestep,
+                    conditional_dict=conditional_dict,
+                    unconditional_dict=unconditional_dict,
+                    v_ref_latent=v_ref_latent,
+                    motion_caption_dict=motion_caption_dict,
+                    beta=motion_cfg.beta_at(int(getattr(self, "global_step", 0))),
+                    alpha=motion_cfg.alpha,
+                    block_idxs=motion_cfg.block_idxs,
+                )
+            else:
+                grad, dmd_log_dict = self._compute_kl_grad(
+                    noisy_image_or_video=noisy_latent,
+                    estimated_clean_image_or_video=original_latent,
+                    timestep=timestep,
+                    conditional_dict=conditional_dict,
+                    unconditional_dict=unconditional_dict
+                )
+                if motion_cfg is not None and motion_cfg.enabled:
+                    # Motion enabled but skipped this step (Bernoulli=0 or no ref).
+                    dmd_log_dict["motion_inject"] = 0.0
 
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
