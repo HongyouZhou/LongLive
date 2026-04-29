@@ -1,0 +1,39 @@
+# Motion-LoRA full-scale fine-tune on Wan2.1-T2V-1.3B base, intended for the
+# 8-GPU DDP launch (sbatch_motion_lora_full.sh). With effective batch =
+# world_size, we don't need as many steps as the single-GPU smoke config but
+# we keep more variants for stronger appearance disentanglement signal.
+#
+# Diff vs configs/motion_lora.yaml:
+#   - n_augment_variants: 20 → 30 (more diversity per ref)
+#   - train.steps:        600 → 1500 (more steps; effective work = steps × world_size)
+#   - log_every:           20 → 50 (less spam from rank 0 across 8 ranks)
+
+timestep_shift: 8.0
+
+lora:
+  rank: 32
+  alpha: 32
+
+data:
+  height: 480
+  width: 832
+  num_frames: 81
+  n_augment_variants: 30
+
+loss:
+  attention_weight: 1.0
+  anchor_weight: 0.01
+  pixel_weight: 0.1
+  timestep_min: 500
+  timestep_max: 999
+  anchor_every: 2
+
+optim:
+  lr: 5.0e-4
+  beta1: 0.0
+  beta2: 0.999
+  weight_decay: 0.01
+
+train:
+  steps: 1500
+  log_every: 50

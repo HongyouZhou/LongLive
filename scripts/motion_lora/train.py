@@ -50,9 +50,11 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 from omegaconf import OmegaConf
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms
 
 # Repo root on sys.path so `from utils...` and `from wan...` resolve.
@@ -66,6 +68,38 @@ from utils.wan_wrapper import (  # noqa: E402
     WanTextEncoder,
     WanVAEWrapper,
 )
+
+
+# ---------------------------------------------------------------------------
+# Distributed setup
+# ---------------------------------------------------------------------------
+# Single-GPU and multi-GPU (DDP) modes share this code. torchrun sets
+# LOCAL_RANK/RANK/WORLD_SIZE env vars; their absence == single-GPU.
+# Each rank loads its own copy of the model, VAE, text_encoder, and variant
+# cache. Per step, each rank samples its own variant + anchor prompt; DDP
+# all-reduces gradients on LoRA params. Effective batch size = world_size.
+# ---------------------------------------------------------------------------
+
+def init_distributed():
+    """Returns (rank, world_size, device, is_main). Idempotent."""
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ.get("RANK", str(local_rank)))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        if world_size > 1 and not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+    else:
+        rank = 0
+        world_size = 1
+        device = torch.device("cuda")
+    return rank, world_size, device, rank == 0
+
+
+def log(msg: str, is_main: bool = True):
+    if is_main:
+        print(msg, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -368,15 +402,25 @@ def main():
 
     cfg = OmegaConf.load(args.config)
     out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(cfg, out_dir / "config.yaml")
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    device = torch.device("cuda")
+    rank, world_size, device, is_main = init_distributed()
+
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, out_dir / "config.yaml")
+    if world_size > 1:
+        dist.barrier()
+
+    # Per-rank seed: same base seed + rank offset → different sample paths but
+    # reproducible. Necessary so DDP ranks visit different variants per step
+    # (otherwise effective batch = 1).
+    torch.manual_seed(args.seed + rank)
+    random.seed(args.seed + rank)
+
+    log(f"[motion-lora] world_size={world_size} rank={rank} device={device}", is_main)
 
     # ---- 1. Load Wan2.1-T2V-1.3B base ------------------------------------
-    print("[motion-lora] loading Wan2.1-T2V-1.3B base ...", flush=True)
+    log("[motion-lora] loading Wan2.1-T2V-1.3B base ...", is_main)
     diffusion = WanDiffusionWrapper(
         model_name="Wan2.1-T2V-1.3B", is_causal=False,
         timestep_shift=cfg.get("timestep_shift", 8.0),
@@ -388,35 +432,52 @@ def main():
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16)
 
     # ---- 2. Inject motion LoRA -------------------------------------------
-    print(f"[motion-lora] injecting LoRA: blocks={MOTION_LORA_BLOCKS} "
-          f"submodules={MOTION_LORA_SUBMODULES} projs={MOTION_LORA_PROJS} "
-          f"rank={cfg.lora.rank} alpha={cfg.lora.alpha}", flush=True)
+    log(f"[motion-lora] injecting LoRA: blocks={MOTION_LORA_BLOCKS} "
+        f"submodules={MOTION_LORA_SUBMODULES} projs={MOTION_LORA_PROJS} "
+        f"rank={cfg.lora.rank} alpha={cfg.lora.alpha}", is_main)
     diffusion.model = inject_motion_lora(
         diffusion.model, rank=cfg.lora.rank, alpha=cfg.lora.alpha
     )
-    diffusion.model.print_trainable_parameters()
+    if is_main:
+        diffusion.model.print_trainable_parameters()
 
-    # ---- 3. Install attention hooks --------------------------------------
+    # Keep an unwrapped reference to the PeftModel so `disable_adapter()` and
+    # `get_peft_model_state_dict()` work uniformly with or without DDP.
+    peft_model = diffusion.model
+
+    # ---- 3. Install attention hooks (BEFORE DDP wrap) -------------------
+    # Hooks live on the underlying nn.Module and fire regardless of DDP.
     capture = AttentionCapture()
     capture.install(diffusion.model, MOTION_LORA_BLOCKS, MOTION_LORA_SUBMODULES)
-    print(f"[motion-lora] attention hooks installed at "
-          f"{len(MOTION_LORA_BLOCKS) * len(MOTION_LORA_SUBMODULES)} sites", flush=True)
+    log(f"[motion-lora] attention hooks installed at "
+        f"{len(MOTION_LORA_BLOCKS) * len(MOTION_LORA_SUBMODULES)} sites",
+        is_main)
+
+    # Wrap with DDP after hooks + LoRA are in place. find_unused_parameters=False
+    # is fine because every LoRA module sees grad each forward (q/k/v/o all
+    # visited in self-attn + cross-attn paths).
+    if world_size > 1:
+        diffusion.model = DDP(
+            diffusion.model,
+            device_ids=[device.index],
+            output_device=device.index,
+            find_unused_parameters=False,
+        )
 
     # ---- 4. Resolve and encode all references ---------------------------
     refs = _resolve_references(args)
-    print(f"[motion-lora] {len(refs)} reference(s):", flush=True)
-    for r in refs:
-        print(f"  - {Path(r['path']).name}  '{r['caption'][:80]}...'", flush=True)
+    log(f"[motion-lora] {len(refs)} reference(s):", is_main)
+    if is_main:
+        for r in refs:
+            log(f"  - {Path(r['path']).name}  '{r['caption'][:80]}...'", True)
 
     H = cfg.data.height
     W = cfg.data.width
     F_pixels = cfg.data.num_frames
     n_variants = cfg.data.n_augment_variants
 
-    # Each variant carries (latent, text_emb_idx). text_embs is a small list keyed
-    # by reference; latent variants are flattened across all (ref, augment) pairs.
-    print(f"[motion-lora] loading + augmenting + encoding via VAE "
-          f"({len(refs)} refs × {n_variants} variants) ...", flush=True)
+    log(f"[motion-lora] loading + augmenting + encoding via VAE "
+        f"({len(refs)} refs × {n_variants} variants) ...", is_main)
     variants_latent: list[torch.Tensor] = []
     variants_ref_idx: list[int] = []
     text_embs: list[torch.Tensor] = []
@@ -432,8 +493,8 @@ def main():
             text_embs.append(
                 text_encoder([ref["caption"]])["prompt_embeds"]
             )
-    print(f"[motion-lora] total {len(variants_latent)} variants, "
-          f"latent shape {variants_latent[0].shape}", flush=True)
+    log(f"[motion-lora] total {len(variants_latent)} variants, "
+        f"latent shape {variants_latent[0].shape}", is_main)
 
     # ---- 5. Encode anchor prompts ---------------------------------------
 
@@ -442,8 +503,8 @@ def main():
     ]
     if not anchor_texts:
         raise ValueError(f"no anchor prompts in {args.anchor_prompts}")
-    print(f"[motion-lora] caching {len(anchor_texts)} anchor prompt embeddings ...",
-          flush=True)
+    log(f"[motion-lora] caching {len(anchor_texts)} anchor prompt embeddings ...",
+        is_main)
     anchor_embs = []
     with torch.no_grad():
         for ap_text in anchor_texts:
@@ -452,7 +513,9 @@ def main():
             )
 
     # ---- 6. Optimizer ----------------------------------------------------
-    trainable = [p for p in diffusion.model.parameters() if p.requires_grad]
+    # Optimize the LoRA params on the unwrapped peft_model (DDP wrapper exposes
+    # the same parameters but routing through .module is more explicit).
+    trainable = [p for p in peft_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable,
         lr=cfg.optim.lr,
@@ -469,12 +532,14 @@ def main():
     ANCHOR_EVERY = cfg.loss.anchor_every  # 2 (anchor every Nth step)
     LOG_EVERY = cfg.train.log_every
 
-    diffusion.model.train()
-    print(f"[motion-lora] beginning training: {cfg.train.steps} steps", flush=True)
+    peft_model.train()
+    log(f"[motion-lora] beginning training: {cfg.train.steps} steps "
+        f"(world_size={world_size} → effective batch={world_size})", is_main)
 
     for step in range(cfg.train.steps):
         # ---- on-reference branch ----
-        # Sample a (variant, its reference's caption) pair.
+        # Each rank picks its own variant (different RNG seed) → DDP all-reduce
+        # gives effective batch = world_size.
         var_idx = random.randint(0, len(variants_latent) - 1)
         x0 = variants_latent[var_idx].to(device=device, dtype=torch.bfloat16)
         cur_text_emb = text_embs[variants_ref_idx[var_idx]]
@@ -482,10 +547,12 @@ def main():
         eps = torch.randn_like(x0)
         t = sample_structural_timestep(B, T_MIN, T_MAX, device)
 
-        # LoRA OFF (frozen base) — capture reference attention outputs
+        # LoRA OFF (frozen base) — capture reference attention outputs.
+        # disable_adapter() lives on PeftModel; works whether DDP-wrapped or not
+        # because forward dispatch goes ddp_model.forward → module.forward → peft.
         capture.clear()
         capture.enable()
-        with diffusion.model.disable_adapter():
+        with peft_model.disable_adapter():
             with torch.no_grad():
                 _ = diffusion_forward(diffusion, x0, eps, t, cur_text_emb)
         attn_ref = {k: v.detach() for k, v in capture.outputs.items()}
@@ -512,7 +579,7 @@ def main():
             t_anc = sample_structural_timestep(B, T_MIN, T_MAX, device)
 
             capture.disable()  # don't need attn maps for anchor branch
-            with diffusion.model.disable_adapter():
+            with peft_model.disable_adapter():
                 with torch.no_grad():
                     flow_base, _ = diffusion_forward(
                         diffusion, z0_anchor, z_noise, t_anc, anc_emb
@@ -530,23 +597,27 @@ def main():
         optimizer.step()
         optimizer.zero_grad()
 
-        if step % LOG_EVERY == 0 or step == cfg.train.steps - 1:
-            print(
+        if (step % LOG_EVERY == 0 or step == cfg.train.steps - 1) and is_main:
+            log(
                 f"[motion-lora] step={step:4d}/{cfg.train.steps} "
                 f"L_att={L_attention.item():.4f} "
                 f"L_anc={L_anchor.item():.4f} "
                 f"L_pix={L_pixel.item():.4f} "
                 f"total={loss.item():.4f}",
-                flush=True,
+                True,
             )
 
-    # ---- 8. Save LoRA ----------------------------------------------------
-    save_path = out_dir / "motion_lora.pt"
-    state = peft.get_peft_model_state_dict(diffusion.model)
-    torch.save(state, save_path)
-    print(f"[motion-lora] saved {len(state)} keys to {save_path}", flush=True)
+    # ---- 8. Save LoRA (rank 0 only) -------------------------------------
+    if is_main:
+        save_path = out_dir / "motion_lora.pt"
+        state = peft.get_peft_model_state_dict(peft_model)
+        torch.save(state, save_path)
+        log(f"[motion-lora] saved {len(state)} keys to {save_path}", True)
 
     capture.remove()
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
