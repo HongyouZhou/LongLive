@@ -1,0 +1,41 @@
+# Motion-LoRA fine-tune on Wan2.1-T2V-1.3B base.
+# Synthesized from MotionMatcher (ICCV'25), rCM (NVIDIA Oct'25),
+# Distilling Diversity & Control (ICLR'25). See scripts/motion_lora/train.py
+# header for the full design rationale.
+
+timestep_shift: 8.0  # Wan default
+
+lora:
+  rank: 32           # MotionMatcher omits exact value; Wan-LoRA community standard
+  alpha: 32          # alpha = rank (neutral scaling)
+
+data:
+  height: 480        # Wan native
+  width: 832         # Wan native
+  num_frames: 81     # 81 pixel frames → 21 latent frames @ 16 fps ≈ 5.06s
+  n_augment_variants: 20
+
+loss:
+  attention_weight: 1.0          # MotionMatcher main signal
+  anchor_weight: 0.01            # rCM λ — tiny mode-seeking term to anchor
+                                 # LoRA-on output to LoRA-off output on
+                                 # unrelated prompts. Prevents drift /
+                                 # reverse-distillation on out-of-domain prompts
+  pixel_weight: 0.1              # vanilla flow MSE on reference; small but
+                                 # nonzero so LoRA can't trivially solve
+                                 # attention loss without reproducing dynamics
+  timestep_min: 500              # MotionMatcher's w'_t mask: train only on
+                                 # high-noise / structural timesteps
+  timestep_max: 999
+  anchor_every: 2                # anchor branch every Nth step (saves compute)
+
+optim:
+  lr: 5.0e-4                     # MotionMatcher
+  beta1: 0.0                     # rCM
+  beta2: 0.999                   # rCM
+  weight_decay: 0.01             # rCM
+
+train:
+  steps: 600                     # MotionMatcher 400 on UNet; up to 600 for
+                                 # 32-layer Wan DiT
+  log_every: 20
