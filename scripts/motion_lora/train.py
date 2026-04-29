@@ -19,13 +19,27 @@ v1 design (synthesized from MotionMatcher / rCM / "Distilling Diversity & Contro
   - Output: peft state dict at output_dir/motion_lora.pt — pluggable into base Wan
             via configure_lora_for_model + set_peft_model_state_dict.
 
-Usage:
+Two modes — single reference or multi-reference (same motion class):
+
+  Single ref (instance-level — locks this exact video's motion):
     python scripts/motion_lora/train.py \\
         --config configs/motion_lora.yaml \\
-        --reference_video $LL_DATA/motion_refs/walking_v1.mp4 \\
-        --reference_caption "a person walking through a park" \\
-        --anchor_prompts $LL_DATA/motion_refs/anchor_prompts.txt \\
+        --reference_video celebv_X.mp4 --reference_caption "a man walking ..." \\
+        --anchor_prompts scripts/motion_lora/anchor_prompts_default.txt \\
         --output_dir logs/motion_lora_walking_v1
+
+  Multi-ref (class-level — learns generic motion class with stronger appearance
+  disentanglement; recommended after single-ref smoke validates pipeline):
+    python scripts/motion_lora/pick_reference.py --keyword walking ... \\
+        --output refs.jsonl
+    python scripts/motion_lora/train.py \\
+        --config configs/motion_lora.yaml \\
+        --references_jsonl refs.jsonl \\
+        --anchor_prompts scripts/motion_lora/anchor_prompts_default.txt \\
+        --output_dir logs/motion_lora_walking_v2
+
+  references_jsonl format: one JSON object per line, with keys 'path' (or 'video',
+  in which case it's resolved against $LL_DATA/motion_refs) and 'caption'.
 """
 from __future__ import annotations
 
@@ -287,11 +301,65 @@ def diffusion_forward(diffusion: WanDiffusionWrapper,
 # Main
 # ---------------------------------------------------------------------------
 
+def _resolve_references(args) -> list[dict]:
+    """Returns a list of {'path': abs_path, 'caption': str}. Supports two modes:
+
+    Single ref: --reference_video + --reference_caption (legacy / smoke test mode).
+    Multi-ref:  --references_jsonl (each line has 'path' or 'video' + 'caption').
+
+    For 'video' (no 'path'), the caller's pick_reference output convention is
+    used: resolve against $LL_DATA/motion_refs first, else $LL_DATA, else cwd.
+    """
+    refs = []
+    if args.references_jsonl:
+        ll_data = os.environ.get("LL_DATA", "")
+        with open(args.references_jsonl) as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                row = __import__("json").loads(line)
+                cap = row.get("caption")
+                if not cap:
+                    raise ValueError(
+                        f"{args.references_jsonl}:{line_no} missing 'caption'")
+                p = row.get("path")
+                if not p:
+                    name = row.get("video")
+                    if not name:
+                        raise ValueError(
+                            f"{args.references_jsonl}:{line_no} needs 'path' or 'video'")
+                    cands = [
+                        Path(ll_data) / "motion_refs" / name,
+                        Path(ll_data) / name,
+                        Path(name),
+                    ] if ll_data else [Path(name)]
+                    p = next((c for c in cands if c.exists()), None)
+                    if p is None:
+                        raise FileNotFoundError(
+                            f"{name} not found in any of {cands}")
+                refs.append({"path": str(p), "caption": cap})
+    elif args.reference_video and args.reference_caption:
+        refs.append({"path": args.reference_video,
+                     "caption": args.reference_caption})
+    else:
+        raise ValueError(
+            "must give either --references_jsonl OR (--reference_video + --reference_caption)"
+        )
+    return refs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--reference_video", required=True)
-    ap.add_argument("--reference_caption", required=True)
+    ap.add_argument("--reference_video", default=None,
+                    help="single-reference mode: path to one mp4")
+    ap.add_argument("--reference_caption", default=None,
+                    help="single-reference mode: caption for --reference_video")
+    ap.add_argument("--references_jsonl", default=None,
+                    help="multi-reference mode: jsonl with {path|video, caption} per line. "
+                         "Mutually exclusive with --reference_video. "
+                         "pick_reference.py output is directly compatible.")
     ap.add_argument("--anchor_prompts", required=True,
                     help="txt file: one unrelated prompt per line")
     ap.add_argument("--output_dir", required=True)
@@ -334,30 +402,40 @@ def main():
     print(f"[motion-lora] attention hooks installed at "
           f"{len(MOTION_LORA_BLOCKS) * len(MOTION_LORA_SUBMODULES)} sites", flush=True)
 
-    # ---- 4. Encode reference video --------------------------------------
+    # ---- 4. Resolve and encode all references ---------------------------
+    refs = _resolve_references(args)
+    print(f"[motion-lora] {len(refs)} reference(s):", flush=True)
+    for r in refs:
+        print(f"  - {Path(r['path']).name}  '{r['caption'][:80]}...'", flush=True)
+
     H = cfg.data.height
     W = cfg.data.width
-    F_pixels = cfg.data.num_frames  # e.g. 81 for 21 latent frames @ 4 stride
-    print(f"[motion-lora] loading reference {args.reference_video} "
-          f"@ {H}x{W} x {F_pixels} frames", flush=True)
-    ref_pixels = load_video_pixels(args.reference_video, F_pixels, H, W, device)
-
+    F_pixels = cfg.data.num_frames
     n_variants = cfg.data.n_augment_variants
-    print(f"[motion-lora] generating {n_variants} augmented variants ...", flush=True)
-    variants_pixel = make_augmented_variants(ref_pixels, n_variants)
 
-    print(f"[motion-lora] encoding variants via VAE ...", flush=True)
+    # Each variant carries (latent, text_emb_idx). text_embs is a small list keyed
+    # by reference; latent variants are flattened across all (ref, augment) pairs.
+    print(f"[motion-lora] loading + augmenting + encoding via VAE "
+          f"({len(refs)} refs × {n_variants} variants) ...", flush=True)
     variants_latent: list[torch.Tensor] = []
-    for v in variants_pixel:
+    variants_ref_idx: list[int] = []
+    text_embs: list[torch.Tensor] = []
+    for ref_idx, ref in enumerate(refs):
+        pixels = load_video_pixels(ref["path"], F_pixels, H, W, device)
+        variants_pixel = make_augmented_variants(pixels, n_variants)
+        for v in variants_pixel:
+            with torch.no_grad():
+                lat = vae.encode_to_latent(v.unsqueeze(0))
+            variants_latent.append(lat)
+            variants_ref_idx.append(ref_idx)
         with torch.no_grad():
-            lat = vae.encode_to_latent(v.unsqueeze(0))  # [1, F_lat, 16, H/8, W/8]
-        variants_latent.append(lat)
-    print(f"[motion-lora] latent shape: {variants_latent[0].shape}", flush=True)
+            text_embs.append(
+                text_encoder([ref["caption"]])["prompt_embeds"]
+            )
+    print(f"[motion-lora] total {len(variants_latent)} variants, "
+          f"latent shape {variants_latent[0].shape}", flush=True)
 
-    # ---- 5. Encode reference caption + anchor prompts -------------------
-    with torch.no_grad():
-        ref_emb = text_encoder([args.reference_caption])["prompt_embeds"]  # [1, 512, 4096]
-    print(f"[motion-lora] reference caption emb: {ref_emb.shape}", flush=True)
+    # ---- 5. Encode anchor prompts ---------------------------------------
 
     anchor_texts = [
         line.strip() for line in open(args.anchor_prompts) if line.strip()
@@ -396,7 +474,10 @@ def main():
 
     for step in range(cfg.train.steps):
         # ---- on-reference branch ----
-        x0 = random.choice(variants_latent).to(device=device, dtype=torch.bfloat16)
+        # Sample a (variant, its reference's caption) pair.
+        var_idx = random.randint(0, len(variants_latent) - 1)
+        x0 = variants_latent[var_idx].to(device=device, dtype=torch.bfloat16)
+        cur_text_emb = text_embs[variants_ref_idx[var_idx]]
         B = x0.shape[0]
         eps = torch.randn_like(x0)
         t = sample_structural_timestep(B, T_MIN, T_MAX, device)
@@ -406,12 +487,12 @@ def main():
         capture.enable()
         with diffusion.model.disable_adapter():
             with torch.no_grad():
-                _ = diffusion_forward(diffusion, x0, eps, t, ref_emb)
+                _ = diffusion_forward(diffusion, x0, eps, t, cur_text_emb)
         attn_ref = {k: v.detach() for k, v in capture.outputs.items()}
 
         # LoRA ON — gradients flow
         capture.clear()
-        flow_pred, flow_target = diffusion_forward(diffusion, x0, eps, t, ref_emb)
+        flow_pred, flow_target = diffusion_forward(diffusion, x0, eps, t, cur_text_emb)
         attn_lora = capture.outputs
 
         # L_attention: L2 distance on attn module outputs across blocks 10/11/12 × {self,cross}

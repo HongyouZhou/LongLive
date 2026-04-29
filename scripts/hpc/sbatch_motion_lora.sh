@@ -12,38 +12,70 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --exclude=s-sc-dgx[01-02]
 #
-# Train motion LoRA on a single reference video, then run inference on a few
-# new prompts to qualitatively check motion transfer + appearance change.
+# Train motion LoRA on one or more reference videos, then run inference on a
+# few new prompts and score baseline-vs-LoRA on pose-similarity + CLIP-text.
 #
-# Usage:
-#   sbatch scripts/hpc/sbatch_motion_lora.sh <reference_video> <reference_caption> [<run_id>]
+# Two calling conventions:
 #
-# Example:
-#   sbatch scripts/hpc/sbatch_motion_lora.sh \
-#     "$LL_DATA/motion_refs/walking_v1.mp4" \
-#     "a person walking through a park" \
-#     walking_v1
+#   Single ref (instance-level):
+#     sbatch scripts/hpc/sbatch_motion_lora.sh \
+#         "$LL_DATA/motion_refs/celebv_X.mp4" \
+#         "a man walking down a street" \
+#         walking_v1
+#
+#   Multi-ref (class-level — recommended after single-ref smoke validates):
+#     # 1. produce refs.jsonl via pick_reference.py
+#     python scripts/motion_lora/pick_reference.py --keyword walking ... \
+#         --output $LL_DATA/motion_refs/walking_refs.jsonl
+#     # 2. train on the JSONL
+#     sbatch scripts/hpc/sbatch_motion_lora.sh \
+#         "$LL_DATA/motion_refs/walking_refs.jsonl" \
+#         walking_class_v1
+#
+# (The script auto-detects mode by extension: *.jsonl → multi-ref, else single.)
 #
 # Environment overrides:
 #   LL_MOTION_CONFIG=...   default configs/motion_lora.yaml
 #   LL_ANCHOR_PROMPTS=...  default scripts/motion_lora/anchor_prompts_default.txt
-#   LL_INF_PROMPTS=...     newline-separated inference prompts, default 5 walking prompts inline
+#   LL_INF_PROMPTS=...     newline-separated inference prompts, default 5 walking inline
 
 set -e
 
-if [ "$#" -lt 2 ]; then
-    echo "[SLURM][error] usage: sbatch $0 <reference_video> <reference_caption> [<run_id>]" >&2
-    exit 1
-fi
-
-REF_VIDEO="$1"
-REF_CAPTION="$2"
-RUN_ID="${3:-motion_lora}_${SLURM_JOB_ID}"
+REF_ARG="${1:-}"
+case "$REF_ARG" in
+    *.jsonl)
+        # Multi-ref mode: $1 = JSONL, $2 = run_id
+        if [ "$#" -lt 1 ]; then
+            echo "[SLURM][error] usage: sbatch $0 <refs.jsonl> [<run_id>]" >&2
+            exit 1
+        fi
+        REF_MODE="multi"
+        REF_JSONL_ARG="$1"
+        RUN_ID="${2:-motion_lora}_${SLURM_JOB_ID}"
+        ;;
+    *)
+        # Single-ref mode: $1 = mp4, $2 = caption, $3 = run_id
+        if [ "$#" -lt 2 ]; then
+            echo "[SLURM][error] usage: sbatch $0 <reference_video.mp4> <caption> [<run_id>]" >&2
+            echo "[SLURM][error]    or: sbatch $0 <refs.jsonl> [<run_id>]" >&2
+            exit 1
+        fi
+        REF_MODE="single"
+        REF_VIDEO="$1"
+        REF_CAPTION="$2"
+        RUN_ID="${3:-motion_lora}_${SLURM_JOB_ID}"
+        ;;
+esac
 
 echo "[SLURM] Job ID:     $SLURM_JOB_ID"
 echo "[SLURM] Node:       $(hostname)"
-echo "[SLURM] Reference:  $REF_VIDEO"
-echo "[SLURM] Caption:    $REF_CAPTION"
+echo "[SLURM] Mode:       $REF_MODE-ref"
+if [ "$REF_MODE" = "multi" ]; then
+    echo "[SLURM] References: $REF_JSONL_ARG"
+else
+    echo "[SLURM] Reference:  $REF_VIDEO"
+    echo "[SLURM] Caption:    $REF_CAPTION"
+fi
 echo "[SLURM] Run ID:     $RUN_ID"
 
 ##############################
@@ -84,32 +116,66 @@ mkdir -p "$OUT_DIR/inference"
 echo "[SLURM] Output dir:  $OUT_DIR"
 
 ##############################
-# Resolve reference video path (absolute > $LL_DATA-relative > $PROJECT_DIR-relative)
+# Resolve reference path (single mp4 OR multi-ref JSONL).
+#   Tries: absolute > $LL_DATA/motion_refs > $LL_DATA > $PROJECT_DIR.
 ##############################
-case "$REF_VIDEO" in
-    /*) REF_VIDEO_PATH="$REF_VIDEO" ;;
-     *) if   [ -f "$LL_DATA/$REF_VIDEO"     ]; then REF_VIDEO_PATH="$LL_DATA/$REF_VIDEO"
-        elif [ -f "$PROJECT_DIR/$REF_VIDEO" ]; then REF_VIDEO_PATH="$PROJECT_DIR/$REF_VIDEO"
-        else REF_VIDEO_PATH="$REF_VIDEO"
-        fi ;;
-esac
-if [ ! -f "$REF_VIDEO_PATH" ]; then
-    echo "[SLURM][error] reference video not found: $REF_VIDEO" >&2
-    echo "  tried: $REF_VIDEO_PATH" >&2
-    exit 1
+_resolve_path() {
+    local arg="$1"
+    case "$arg" in
+        /*) echo "$arg"; return ;;
+    esac
+    for cand in "$LL_DATA/motion_refs/$arg" "$LL_DATA/$arg" "$PROJECT_DIR/$arg"; do
+        if [ -e "$cand" ]; then echo "$cand"; return; fi
+    done
+    echo "$arg"
+}
+
+if [ "$REF_MODE" = "multi" ]; then
+    REF_JSONL_PATH="$(_resolve_path "$REF_JSONL_ARG")"
+    if [ ! -f "$REF_JSONL_PATH" ]; then
+        echo "[SLURM][error] references jsonl not found: $REF_JSONL_ARG" >&2
+        exit 1
+    fi
+    REF_VIDEO_PATH=""  # used by Stage 3 eval; pick first ref from JSONL
+    REF_VIDEO_PATH=$(python -c "
+import json
+with open('$REF_JSONL_PATH') as f:
+    row = json.loads(f.readline())
+print(row.get('path') or row.get('video', ''))
+")
+    if [ -z "$REF_VIDEO_PATH" ] || [ ! -f "$REF_VIDEO_PATH" ]; then
+        REF_VIDEO_PATH="$(_resolve_path "$REF_VIDEO_PATH")"
+    fi
+    echo "[SLURM] Stage 3 eval reference (1st in JSONL): $REF_VIDEO_PATH"
+else
+    REF_VIDEO_PATH="$(_resolve_path "$REF_VIDEO")"
+    if [ ! -f "$REF_VIDEO_PATH" ]; then
+        echo "[SLURM][error] reference video not found: $REF_VIDEO" >&2
+        echo "  tried: $REF_VIDEO_PATH" >&2
+        exit 1
+    fi
 fi
 
 ##############################
 # Stage 1: train motion LoRA
 ##############################
 echo "[SLURM] === Stage 1: train motion LoRA ==="
-python scripts/motion_lora/train.py \
-    --config "$LL_MOTION_CONFIG" \
-    --reference_video "$REF_VIDEO_PATH" \
-    --reference_caption "$REF_CAPTION" \
-    --anchor_prompts "$LL_ANCHOR_PROMPTS" \
-    --output_dir "$OUT_DIR" \
-    --seed 0
+if [ "$REF_MODE" = "multi" ]; then
+    python scripts/motion_lora/train.py \
+        --config "$LL_MOTION_CONFIG" \
+        --references_jsonl "$REF_JSONL_PATH" \
+        --anchor_prompts "$LL_ANCHOR_PROMPTS" \
+        --output_dir "$OUT_DIR" \
+        --seed 0
+else
+    python scripts/motion_lora/train.py \
+        --config "$LL_MOTION_CONFIG" \
+        --reference_video "$REF_VIDEO_PATH" \
+        --reference_caption "$REF_CAPTION" \
+        --anchor_prompts "$LL_ANCHOR_PROMPTS" \
+        --output_dir "$OUT_DIR" \
+        --seed 0
+fi
 
 if [ ! -f "$OUT_DIR/motion_lora.pt" ]; then
     echo "[SLURM][error] motion_lora.pt not produced" >&2
