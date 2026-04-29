@@ -137,22 +137,70 @@ else
     INF_PROMPTS=("${DEFAULT_PROMPTS[@]}")
 fi
 
+# Reset prompts.jsonl (consumed by Stage 3 eval for CLIP-text alignment)
+PROMPTS_JSONL="$OUT_DIR/inference/prompts.jsonl"
+> "$PROMPTS_JSONL"
+
 for i in "${!INF_PROMPTS[@]}"; do
     PROMPT="${INF_PROMPTS[$i]}"
     echo "[SLURM] inf $i/$(( ${#INF_PROMPTS[@]} - 1 )): $PROMPT"
 
+    BASE_MP4="baseline_${i}.mp4"
+    LORA_MP4="motion_lora_${i}.mp4"
+
     # Baseline (no LoRA) — run once per prompt
     python scripts/motion_lora/inference.py \
         --prompt "$PROMPT" \
-        --output_mp4 "$OUT_DIR/inference/baseline_${i}.mp4" \
+        --output_mp4 "$OUT_DIR/inference/$BASE_MP4" \
         --seed 0
 
     # With motion LoRA
     python scripts/motion_lora/inference.py \
         --prompt "$PROMPT" \
         --motion_lora "$OUT_DIR/motion_lora.pt" \
-        --output_mp4 "$OUT_DIR/inference/motion_lora_${i}.mp4" \
+        --output_mp4 "$OUT_DIR/inference/$LORA_MP4" \
         --seed 0
+
+    # Record prompts → mp4 mapping for Stage 3 eval (CLIP-text alignment)
+    python -c "
+import json
+with open('$PROMPTS_JSONL', 'a') as f:
+    for v in ['$BASE_MP4', '$LORA_MP4']:
+        f.write(json.dumps({'video': v, 'prompt': '''$PROMPT'''}, ensure_ascii=False) + '\n')
+"
 done
+
+##############################
+# Stage 3: pose-similarity + CLIP-text eval (vs the training reference)
+##############################
+echo "[SLURM] === Stage 3: pose + CLIP eval ==="
+SCORES_JSONL="$OUT_DIR/inference/scores.jsonl"
+python scripts/motion_lora/eval_pose.py \
+    --reference "$REF_VIDEO_PATH" \
+    --generated_dir "$OUT_DIR/inference" \
+    --prompts_jsonl "$PROMPTS_JSONL" \
+    --output "$SCORES_JSONL" || echo "[SLURM][warn] eval_pose failed — check deps (mediapipe, transformers)"
+
+if [ -f "$SCORES_JSONL" ]; then
+    echo "[SLURM] === Score summary (lower pose_dist = better; higher clip_text = better) ==="
+    python -c "
+import json
+rows = [json.loads(l) for l in open('$SCORES_JSONL')]
+for r in rows:
+    print(f\"  {r['generated']:30s} pose_dist={r['pose_dist']:.4f}  clip_text={r['clip_text']:.4f}\")
+# group baseline vs motion_lora
+b = [r for r in rows if r['generated'].startswith('baseline_')]
+l = [r for r in rows if r['generated'].startswith('motion_lora_')]
+import statistics as st
+def avg(xs, k):
+    vals = [x[k] for x in xs if x[k] == x[k]]  # NaN check
+    return st.mean(vals) if vals else float('nan')
+print()
+print(f'  baseline    avg pose_dist={avg(b,\"pose_dist\"):.4f}  clip_text={avg(b,\"clip_text\"):.4f}  (n={len(b)})')
+print(f'  motion_lora avg pose_dist={avg(l,\"pose_dist\"):.4f}  clip_text={avg(l,\"clip_text\"):.4f}  (n={len(l)})')
+print()
+print('  motion_lora win condition: pose_dist (vs baseline) DECREASES, clip_text not far below baseline')
+"
+fi
 
 echo "[SLURM] DONE → $OUT_DIR"
