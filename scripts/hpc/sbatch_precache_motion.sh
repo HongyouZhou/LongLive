@@ -3,11 +3,12 @@
 # No --partition: requesting 1 GPU on the multi-GPU `pgpu` partition triggers
 # SLURM's "Request for single GPU Tres on a multi-GPU partition found" warning
 # and forces a redirect. Let SLURM pick the right single-GPU partition.
+#SBATCH --partition=pgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --time=0:30:00
 #SBATCH --output=logs/%x-%j.out
 #
