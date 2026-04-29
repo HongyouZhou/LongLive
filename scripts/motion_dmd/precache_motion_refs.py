@@ -43,19 +43,22 @@ LATENT_W = 104
 
 def load_video_pixels(path: str, num_frames: int, height: int, width: int,
                       device: torch.device) -> torch.Tensor:
-    """Returns [C, F, H, W] in [-1, 1] bfloat16, on `device`."""
-    import decord
-    decord.bridge.set_bridge("torch")
-    vr = decord.VideoReader(path)
-    total = len(vr)
+    """Returns [C, F, H, W] in [-1, 1] bfloat16, on `device`.
+
+    Uses torchvision.io.read_video (already a hard dep of LongLive). decord
+    is faster but optional and not installed on the HPC longlive env.
+    """
+    from torchvision.io import read_video
+    video, _, _ = read_video(path, pts_unit="sec")  # [F_total, H, W, C] uint8
+    total = video.shape[0]
     if total < num_frames:
         raise ValueError(f"Video {path} has {total} frames, need {num_frames}")
-    indices = torch.linspace(0, total - 1, num_frames).long().tolist()
-    frames = vr.get_batch(indices)
-    frames = frames.permute(0, 3, 1, 2).float() / 255.0
+    indices = torch.linspace(0, total - 1, num_frames).long()
+    frames = video[indices]                          # [F, H, W, C] uint8
+    frames = frames.permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
     frames = transforms.functional.resize(frames, [height, width], antialias=True)
     frames = frames * 2.0 - 1.0
-    frames = frames.permute(1, 0, 2, 3).contiguous()
+    frames = frames.permute(1, 0, 2, 3).contiguous()  # [C, F, H, W]
     return frames.to(device=device, dtype=torch.bfloat16)
 
 
