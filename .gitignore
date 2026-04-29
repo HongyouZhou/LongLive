@@ -1,0 +1,20 @@
+__pycache__
+
+longlive_models
+wan_models
+checkpoints
+
+videos
+
+wandb
+logs
+
+# HPC scratch (fetched by scripts/hpc/fetch_data.sh)
+data
+hf_cache
+configs/*_hpc.yaml
+
+.claude
+
+# MediaPipe model file (downloaded once via curl, ~3.7MB binary)
+scripts/_models/
