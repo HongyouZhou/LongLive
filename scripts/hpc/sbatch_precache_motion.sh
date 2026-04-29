@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=motion_precache
-#SBATCH --partition=pgpu
+# No --partition: requesting 1 GPU on the multi-GPU `pgpu` partition triggers
+# SLURM's "Request for single GPU Tres on a multi-GPU partition found" warning
+# and forces a redirect. Let SLURM pick the right single-GPU partition.
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
