@@ -43,10 +43,11 @@ LATENT_W = 104
 
 def load_video_pixels(path: str, num_frames: int, height: int, width: int,
                       device: torch.device) -> torch.Tensor:
-    """Returns [C, F, H, W] in [-1, 1] bfloat16, on `device`.
+    """Returns [C, F, H, W] in [-1, 1] float32, on `device`.
 
-    Uses torchvision.io.read_video (already a hard dep of LongLive). decord
-    is faster but optional and not installed on the HPC longlive env.
+    Returns float32 because the Wan VAE encoder is fp32 (its conv biases are
+    fp32 even when input is bf16, triggering RuntimeError). Caller is
+    responsible for casting the output latent to bf16 for the cache.
     """
     from torchvision.io import read_video
     video, _, _ = read_video(path, pts_unit="sec")  # [F_total, H, W, C] uint8
@@ -59,7 +60,7 @@ def load_video_pixels(path: str, num_frames: int, height: int, width: int,
     frames = transforms.functional.resize(frames, [height, width], antialias=True)
     frames = frames * 2.0 - 1.0
     frames = frames.permute(1, 0, 2, 3).contiguous()  # [C, F, H, W]
-    return frames.to(device=device, dtype=torch.bfloat16)
+    return frames.to(device=device, dtype=torch.float32)
 
 
 def resolve_ref_path(ref: dict, refs_root: Path | None) -> Path:
