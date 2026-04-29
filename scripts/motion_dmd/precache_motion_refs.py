@@ -52,8 +52,15 @@ def load_video_pixels(path: str, num_frames: int, height: int, width: int,
     from torchvision.io import read_video
     video, _, _ = read_video(path, pts_unit="sec")  # [F_total, H, W, C] uint8
     total = video.shape[0]
+    if total < 2:
+        raise ValueError(f"Video {path} has only {total} frames; cannot resample")
+    # `torch.linspace(0, total-1, num_frames).long()` works in BOTH directions:
+    # - total > num_frames: uniform downsample
+    # - total < num_frames: uniform oversample (some frames repeat). Acceptable
+    #   for short refs since VAE/teacher don't care about exact frame distinctness.
     if total < num_frames:
-        raise ValueError(f"Video {path} has {total} frames, need {num_frames}")
+        print(f"  [warn] {path} has {total} < {num_frames} frames; "
+              f"oversampling with frame repeats", flush=True)
     indices = torch.linspace(0, total - 1, num_frames).long()
     frames = video[indices]                          # [F, H, W, C] uint8
     frames = frames.permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
