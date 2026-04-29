@@ -126,6 +126,9 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 # Data source
 ##############################
 : "${LL_DATA:=$PROJECT_DATA/wm}"
+# Export so torchrun children can resolve `$LL_DATA` in yaml paths via
+# `os.path.expandvars` (e.g. generator_ckpt, motion.refs_path).
+export LL_DATA
 export WAN_MODELS_ROOT="$LL_DATA/wan_models"
 export HF_HOME="$LL_DATA/hf_cache"
 export TRANSFORMERS_CACHE="$LL_DATA/hf_cache"
