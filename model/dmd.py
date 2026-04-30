@@ -132,18 +132,6 @@ class DMD(SelfForcingModel):
             "timestep": timestep.detach()
         }
 
-    def _motion_inject_bernoulli(self, motion_cfg) -> bool:
-        """Sample whether to inject motion this step. Rank 0 samples + broadcasts
-        so all FSDP ranks agree (else the dispatch would diverge across ranks)."""
-        device = self.device
-        if dist.is_initialized():
-            tensor = torch.zeros(1, device=device, dtype=torch.float32)
-            if dist.get_rank() == 0:
-                tensor[0] = float(torch.rand(1).item() < motion_cfg.inject_prob)
-            dist.broadcast(tensor, src=0)
-            return bool(tensor.item() > 0.5)
-        return float(torch.rand(1).item()) < motion_cfg.inject_prob
-
     def _compute_kl_grad_with_motion(
         self, noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
@@ -305,15 +293,24 @@ class DMD(SelfForcingModel):
             ).detach().unflatten(0, (batch_size, num_frame))
 
             # Step 2: Compute the KL grad — vanilla DMD or motion-DMD branch.
+            #
+            # Dispatch rule: take the motion path iff motion is enabled AND a
+            # V_ref is available AND the current schedule yields β > 0. A
+            # schedule that returns β=0 for some steps (e.g. `warmup_cyclic`)
+            # makes those steps run vanilla DMD — the deterministic, RNG-free
+            # replacement of v1's Bernoulli `inject_prob` mixture.
             motion_cfg = getattr(self, "motion_cfg", None)
-            inject_this_step = (
+            beta_now = 0.0
+            if motion_cfg is not None and motion_cfg.enabled:
+                beta_now = motion_cfg.beta_at(int(getattr(self, "global_step", 0)))
+            run_motion = (
                 motion_cfg is not None
                 and motion_cfg.enabled
                 and v_ref_latent is not None
                 and motion_caption_dict is not None
-                and self._motion_inject_bernoulli(motion_cfg)
+                and beta_now > 1e-6
             )
-            if inject_this_step:
+            if run_motion:
                 grad, dmd_log_dict = self._compute_kl_grad_with_motion(
                     noisy_image_or_video=noisy_latent,
                     estimated_clean_image_or_video=original_latent,
@@ -322,7 +319,7 @@ class DMD(SelfForcingModel):
                     unconditional_dict=unconditional_dict,
                     v_ref_latent=v_ref_latent,
                     motion_caption_dict=motion_caption_dict,
-                    beta=motion_cfg.beta_at(int(getattr(self, "global_step", 0))),
+                    beta=beta_now,
                     alpha=motion_cfg.alpha,
                     block_idxs=motion_cfg.block_idxs,
                 )
@@ -335,7 +332,8 @@ class DMD(SelfForcingModel):
                     unconditional_dict=unconditional_dict
                 )
                 if motion_cfg is not None and motion_cfg.enabled:
-                    # Motion enabled but skipped this step (Bernoulli=0 or no ref).
+                    # Motion enabled but β=0 this step (cyclic schedule trough).
+                    dmd_log_dict["motion_beta"] = float(beta_now)
                     dmd_log_dict["motion_inject"] = 0.0
 
         if gradient_mask is not None:

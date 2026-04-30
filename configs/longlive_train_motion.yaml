@@ -112,10 +112,14 @@ adapter:
   verbose: true
 
 ## Motion-DMD configuration -------------------------------------------------
-# When `enabled: true`, each generator step that wins the Bernoulli draw
+# When `enabled: true`, each generator step (where the schedule yields β > 0)
 # replaces the vanilla teacher score with `(1-β)·v_real + β·v_real_motion`,
 # where v_real_motion is the 14B teacher run with V_ref attention injected
 # at `block_idxs`. See `model/dmd.py:_compute_kl_grad_with_motion`.
+#
+# v2: replaced v1's Bernoulli `inject_prob` mixture with a deterministic β
+# schedule. `β=0` steps automatically skip the motion path → vanilla DMD,
+# so "vanilla coverage" is encoded directly in the schedule, no RNG bias.
 motion:
   enabled: true
   # Path to the V_ref latent cache produced by
@@ -128,11 +132,22 @@ motion:
   # Hook-blend weight α ∈ [0,1]: out = (1-α)·orig + α·V_ref. 0.5 is the
   # MotionMatcher prescription; lower for weaker motion bias.
   alpha: 0.5
-  # Score-blend weight β; warmup linear from `beta_warmup_start` over
-  # `beta_warmup_steps` to `beta_max`.
-  beta_max: 0.2
-  beta_warmup_start: 0.05
+
+  # β schedule. Choices:
+  #   "constant"      — β = beta_max for every step.
+  #   "linear_warmup" — linear ramp beta_warmup_start → beta_max over
+  #                     beta_warmup_steps, then hold at beta_max.
+  #   "warmup_cyclic" — warmup then cycles between beta_max and 0 in periods
+  #                     of `cyclic_period` steps; first cyclic_high_ratio
+  #                     of each cycle at beta_max, rest at 0 (= deterministic
+  #                     analog of v1's Bernoulli mixture).
+  beta_schedule: linear_warmup
+  beta_max: 0.15           # constant β value steady-state (pick lower than v1's
+                           # 0.2: v2 has β active 100% of post-warmup steps,
+                           # so per-step contribution is the same as v1's
+                           # 0.7×0.2 = 0.14 average effective signal)
+  beta_warmup_start: 0.0
   beta_warmup_steps: 200
-  # Per-step Bernoulli probability that motion is injected. The remaining
-  # (1 - inject_prob) steps run vanilla DMD to preserve general capability.
-  inject_prob: 0.7
+  # Only used when beta_schedule="warmup_cyclic".
+  cyclic_period: 10
+  cyclic_high_ratio: 0.7

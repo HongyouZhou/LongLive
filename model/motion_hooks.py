@@ -112,28 +112,57 @@ class MotionConfig:
 
     `enabled=False` → DMD path is unchanged; `compute_distribution_matching_loss`
     skips the dispatch and runs vanilla `_compute_kl_grad`.
+
+    The β schedule replaces the v1 design's Bernoulli inject_prob mixture: a step
+    with `β=0` IS a vanilla DMD step (motion path skipped), so a schedule that
+    spends some fraction of steps at β=0 plays the same "vanilla coverage" role
+    as Bernoulli inject_prob<1 — but deterministically, with no RNG bias.
+
+    Schedule shapes (set via `beta_schedule`):
+      - "constant"      : β = beta_max for all steps
+      - "linear_warmup" : β linearly ramps beta_warmup_start → beta_max over
+                          beta_warmup_steps, then holds at beta_max
+      - "warmup_cyclic" : after warmup, β cycles in periods of cyclic_period
+                          steps; first cyclic_high_ratio fraction of each period
+                          is at beta_max, remainder at 0 (= deterministic
+                          analog of v1's Bernoulli "70% motion + 30% vanilla").
     """
     enabled: bool = False
     refs_path: Optional[str] = None         # path to .pt cache from precache_motion_refs.py
     block_idxs: List[int] = field(default_factory=lambda: [18, 19, 20])
     alpha: float = 0.5                       # hook-blend weight inside MotionAttnInjector
-    beta_max: float = 0.2                    # score-blend weight steady-state
-    beta_warmup_steps: int = 200             # linear warmup 0.05 → beta_max
-    beta_warmup_start: float = 0.05
-    inject_prob: float = 0.7                 # Bernoulli prob a step is motion-injected
-    seed: int = 0                            # RNG seed for ref-pick + Bernoulli (rank 0)
+    beta_max: float = 0.15                   # score-blend weight steady-state (post-warmup)
+    beta_schedule: str = "linear_warmup"     # "constant" | "linear_warmup" | "warmup_cyclic"
+    beta_warmup_steps: int = 200             # warmup length (linear ramp 0 → beta_max)
+    beta_warmup_start: float = 0.0
+    cyclic_period: int = 10                  # only used when beta_schedule="warmup_cyclic"
+    cyclic_high_ratio: float = 0.7           # fraction of each cycle at beta_max, rest at 0
+    seed: int = 0                            # RNG seed for ref-pick (rank 0)
 
     # Filled at trainer init time (not from yaml):
     v_ref_latents: Optional[torch.Tensor] = None  # [N, F=21, C=16, H=60, W=104] bf16, cpu pinned
     captions: Optional[List[str]] = None          # length N
 
     def beta_at(self, step: int) -> float:
-        if step >= self.beta_warmup_steps:
-            return self.beta_max
-        if self.beta_warmup_steps <= 0:
-            return self.beta_max
-        frac = max(0, step) / float(self.beta_warmup_steps)
-        return self.beta_warmup_start + frac * (self.beta_max - self.beta_warmup_start)
+        # Phase 1: warmup (linear ramp). Schedules "constant" skip warmup.
+        if self.beta_schedule != "constant" and step < self.beta_warmup_steps:
+            if self.beta_warmup_steps <= 0:
+                return self.beta_max
+            frac = max(0, step) / float(self.beta_warmup_steps)
+            return self.beta_warmup_start + frac * (self.beta_max - self.beta_warmup_start)
+
+        # Phase 2: post-warmup. Either constant or cyclic.
+        if self.beta_schedule == "warmup_cyclic":
+            if self.cyclic_period <= 0:
+                return self.beta_max
+            post_warmup = max(0, step - self.beta_warmup_steps)
+            in_cycle = post_warmup % self.cyclic_period
+            cutoff = max(0, min(self.cyclic_period,
+                                int(round(self.cyclic_period * self.cyclic_high_ratio))))
+            return self.beta_max if in_cycle < cutoff else 0.0
+
+        # "constant" or "linear_warmup": post-warmup β = beta_max
+        return self.beta_max
 
 
 def attach_motion_config(model_obj, args) -> None:
@@ -157,10 +186,21 @@ def attach_motion_config(model_obj, args) -> None:
         refs_path=_get("refs_path", None),
         block_idxs=list(_get("block_idxs", [18, 19, 20])),
         alpha=float(_get("alpha", 0.5)),
-        beta_max=float(_get("beta_max", 0.2)),
+        beta_max=float(_get("beta_max", 0.15)),
+        beta_schedule=str(_get("beta_schedule", "linear_warmup")),
         beta_warmup_steps=int(_get("beta_warmup_steps", 200)),
-        beta_warmup_start=float(_get("beta_warmup_start", 0.05)),
-        inject_prob=float(_get("inject_prob", 0.7)),
+        beta_warmup_start=float(_get("beta_warmup_start", 0.0)),
+        cyclic_period=int(_get("cyclic_period", 10)),
+        cyclic_high_ratio=float(_get("cyclic_high_ratio", 0.7)),
         seed=int(_get("seed", getattr(args, "seed", 0))),
     )
+    if cfg.beta_schedule not in ("constant", "linear_warmup", "warmup_cyclic"):
+        raise ValueError(
+            f"motion.beta_schedule must be one of "
+            f"('constant', 'linear_warmup', 'warmup_cyclic'); got {cfg.beta_schedule!r}"
+        )
+    # Soft warning if user specified the deprecated `inject_prob`.
+    if hasattr(motion, "inject_prob") or (isinstance(motion, dict) and "inject_prob" in motion):
+        print("[motion] WARN: `inject_prob` is deprecated; use beta_schedule='warmup_cyclic' "
+              "with cyclic_high_ratio to recover the old Bernoulli behavior deterministically")
     model_obj.motion_cfg = cfg
