@@ -68,13 +68,17 @@ model_kwargs:
   sink_size: 3
 
 # Visualization
+# Use a curated motion-test prompt set so vis videos exercise the cross-form
+# human walking case (different ages, builds, scenes) instead of whatever
+# happens to be the first batch of vidprom (e.g. "Kenyan golfers", which
+# does not exercise walking-class motion).
 vis_interval: 500
 vis_ema: false
 vis_video_lengths:
 - 240
-val_batch_size: 1
-val_data_path: prompts/vidprom_filtered_extended.txt
-val_switch_prompt_path: prompts/vidprom_filtered_extended_switch.txt
+val_batch_size: 4                                  # 4 videos per vis attempt (was 1)
+val_data_path: prompts/motion_vis_prompts.txt
+val_switch_prompt_path: prompts/motion_vis_prompts_switch.txt
 
 slice_last_frames: 21
 
