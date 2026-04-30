@@ -121,9 +121,17 @@ adapter:
 # where v_real_motion is the 14B teacher run with V_ref attention injected
 # at `block_idxs`. See `model/dmd.py:_compute_kl_grad_with_motion`.
 #
-# v2: replaced v1's Bernoulli `inject_prob` mixture with a deterministic β
-# schedule. `β=0` steps automatically skip the motion path → vanilla DMD,
-# so "vanilla coverage" is encoded directly in the schedule, no RNG bias.
+# v3 (conservative): tuned down after observing detail loss in ur1sey9l
+# step-500 vis. The dominant cause was identified as L2-to-noisy-target
+# averaging in DMD's surrogate loss: when α=0.5, teacher attn at blocks
+# 18/19/20 sees 50% V_ref attn replacement on student inputs that were
+# never paired with that motion class, so pred_real_motion is OOD-noisy
+# and DMD's MSE-surrogate averages over noisy targets → mode-covering-like
+# blur in LoRA. Reductions here:
+#   α 0.5 → 0.3   (40% less attn replacement = much less score-noise)
+#   β 0.15 → 0.10 (lower peak motion strength)
+#   warmup 200 → 600 steps (gentler onset, lets LoRA settle each Δβ before
+#                           the next increment, reducing transient noise)
 motion:
   enabled: true
   # Path to the V_ref latent cache produced by
@@ -133,9 +141,9 @@ motion:
   # mid-third (18..20) targets motion-binding semantics without disturbing
   # the late reconstruction-head residuals.
   block_idxs: [18, 19, 20]
-  # Hook-blend weight α ∈ [0,1]: out = (1-α)·orig + α·V_ref. 0.5 is the
-  # MotionMatcher prescription; lower for weaker motion bias.
-  alpha: 0.5
+  # Hook-blend weight α ∈ [0,1]: out = (1-α)·orig + α·V_ref. Lower α →
+  # less attn replacement → less OOD signal in pred_real_motion.
+  alpha: 0.3
 
   # β schedule. Choices:
   #   "constant"      — β = beta_max for every step.
@@ -146,12 +154,9 @@ motion:
   #                     of each cycle at beta_max, rest at 0 (= deterministic
   #                     analog of v1's Bernoulli mixture).
   beta_schedule: linear_warmup
-  beta_max: 0.15           # constant β value steady-state (pick lower than v1's
-                           # 0.2: v2 has β active 100% of post-warmup steps,
-                           # so per-step contribution is the same as v1's
-                           # 0.7×0.2 = 0.14 average effective signal)
+  beta_max: 0.10
   beta_warmup_start: 0.0
-  beta_warmup_steps: 200
+  beta_warmup_steps: 600   # 20% of total 3000 iters; gentler onset
   # Only used when beta_schedule="warmup_cyclic".
   cyclic_period: 10
   cyclic_high_ratio: 0.7
