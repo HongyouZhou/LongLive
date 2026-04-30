@@ -19,8 +19,8 @@ With the default 3-block plan that is ≈ 1 GB peak; freed on context exit.
 
 Also defines `MotionConfig`, the dataclass attached to BaseModel that carries
 all the knobs the DMD branch consults: which blocks to hook, alpha (hook
-strength), beta (score-blend strength) with linear warmup, inject_prob, and
-the loaded V_ref latent cache.
+strength), beta (score-blend strength) and its schedule, and the loaded
+V_ref latent cache.
 """
 from __future__ import annotations
 

@@ -710,28 +710,26 @@ class Trainer:
                   f"dtype={latents.dtype}")
 
     def _maybe_pick_motion_ref(self):
-        """Per-sequence Bernoulli + ref index pick (rank-0 broadcasts to all).
-        Returns a `motion_info` dict ready to be stashed into streaming state, or
-        None when motion is disabled / Bernoulli came up 0 / no refs loaded."""
+        """Per-sequence ref index pick (rank-0 broadcasts to all). Returns a
+        `motion_info` dict to stash into streaming state, or None when motion
+        is disabled / no refs loaded.
+
+        In v2 the per-step "skip motion" decision lives entirely in the β
+        scheduler (β=0 ⇒ vanilla DMD), so this fn always picks a ref when
+        motion is enabled. The Bernoulli inject_prob mixture from v1 is gone."""
         mc = getattr(self.model, "motion_cfg", None)
         if mc is None or not mc.enabled:
             return None
         if mc.v_ref_latents is None or mc.motion_caption_dicts is None:
             return None
 
-        # Rank-0 picks (inject_flag, ref_idx); broadcast as int tensor [2].
-        decision = torch.zeros(2, device=self.device, dtype=torch.int64)
+        # Rank-0 picks ref_idx; broadcast as int tensor [1].
+        decision = torch.zeros(1, device=self.device, dtype=torch.int64)
         if not dist.is_initialized() or dist.get_rank() == 0:
-            inject = 1 if (random.random() < mc.inject_prob) else 0
-            ref_idx = random.randint(0, mc.v_ref_latents.shape[0] - 1) if inject else 0
-            decision[0] = inject
-            decision[1] = ref_idx
+            decision[0] = random.randint(0, mc.v_ref_latents.shape[0] - 1)
         if dist.is_initialized():
             dist.broadcast(decision, src=0)
-        inject = int(decision[0].item())
-        if inject == 0:
-            return None
-        ref_idx = int(decision[1].item())
+        ref_idx = int(decision[0].item())
 
         # Send the chosen V_ref latent to GPU (small: ~3.5 MB / ref).
         v_ref = mc.v_ref_latents[ref_idx:ref_idx + 1].to(
