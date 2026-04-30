@@ -486,17 +486,16 @@ class Trainer:
             if dist.get_rank() == 0:
                 print("VAL DATASET SIZE %d" % len(val_dataset))
 
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                val_dataset, shuffle=False, drop_last=False)
-            # streaming sampling to keep prompts fixed
+            # Use SequentialSampler (no DistributedSampler) so rank 0 sees the
+            # full val set; vis runs on rank 0 only, so sharding would shrink
+            # the panel to 1/world_size of val_batch_size.
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset,
                 batch_size=getattr(config, "val_batch_size", 1),
-                sampler=sampler,
+                shuffle=False,
                 num_workers=dataloader_num_workers,
             )
 
-            # Take the first batch as fixed visualization batch
             try:
                 self.fixed_vis_batch = next(iter(val_dataloader))
             except StopIteration:
