@@ -17,8 +17,10 @@ _spec = importlib.util.spec_from_file_location(
     "motion_hooks", str(REPO_ROOT / "model" / "motion_hooks.py")
 )
 _mod = importlib.util.module_from_spec(_spec)
+sys.modules["motion_hooks"] = _mod  # required for dataclasses to resolve cls.__module__
 _spec.loader.exec_module(_mod)
 MotionAttnInjector = _mod.MotionAttnInjector
+MotionConfig = _mod.MotionConfig
 
 
 class FakeSelfAttn(torch.nn.Module):
@@ -186,11 +188,81 @@ def test_realistic_shapes():
     print(f"  ✓ realistic 40-block × {L}-token shape OK")
 
 
+def test_beta_schedule_constant():
+    cfg = MotionConfig(beta_max=0.15, beta_schedule="constant")
+    for s in [0, 50, 200, 500, 2999]:
+        assert abs(cfg.beta_at(s) - 0.15) < 1e-9, f"step {s}: got {cfg.beta_at(s)}"
+    print("  ✓ constant β=0.15 at every step")
+
+
+def test_beta_schedule_linear_warmup():
+    cfg = MotionConfig(
+        beta_max=0.15, beta_warmup_start=0.0, beta_warmup_steps=200,
+        beta_schedule="linear_warmup",
+    )
+    assert abs(cfg.beta_at(0) - 0.0) < 1e-9
+    assert abs(cfg.beta_at(100) - 0.075) < 1e-9
+    assert abs(cfg.beta_at(199) - 0.149250) < 1e-4
+    assert abs(cfg.beta_at(200) - 0.15) < 1e-9
+    assert abs(cfg.beta_at(500) - 0.15) < 1e-9  # plateau
+    print("  ✓ linear_warmup ramps 0 → 0.15 over 200 then plateau")
+
+
+def test_beta_schedule_warmup_cyclic():
+    cfg = MotionConfig(
+        beta_max=0.2, beta_warmup_start=0.0, beta_warmup_steps=200,
+        beta_schedule="warmup_cyclic", cyclic_period=10, cyclic_high_ratio=0.7,
+    )
+    # warmup region behaves linearly
+    assert abs(cfg.beta_at(100) - 0.1) < 1e-9
+    # post-warmup: 7-on, 3-off cycle
+    expected_post = [0.2] * 7 + [0.0] * 3  # cycle of 10
+    for i, expected in enumerate(expected_post):
+        got = cfg.beta_at(200 + i)
+        assert abs(got - expected) < 1e-9, f"step {200+i}: got {got}, expected {expected}"
+    # cycle wraps: step 210 should be 0.2 again
+    assert abs(cfg.beta_at(210) - 0.2) < 1e-9
+    # ensure overall fraction at β_max equals cyclic_high_ratio
+    n_high = sum(1 for s in range(200, 1000) if cfg.beta_at(s) > 0)
+    frac = n_high / 800
+    assert abs(frac - 0.7) < 0.01, f"high fraction = {frac}, expected 0.7"
+    print(f"  ✓ warmup_cyclic 7-on/3-off; high fraction = {frac:.3f}")
+
+
+def test_beta_schedule_zero_warmup():
+    """beta_warmup_steps=0 should plateau at beta_max from step 0."""
+    cfg = MotionConfig(beta_max=0.2, beta_warmup_steps=0, beta_schedule="linear_warmup")
+    assert abs(cfg.beta_at(0) - 0.2) < 1e-9
+    assert abs(cfg.beta_at(1000) - 0.2) < 1e-9
+    print("  ✓ beta_warmup_steps=0 → constant β_max from step 0")
+
+
+def test_beta_schedule_invalid_raises():
+    """attach_motion_config rejects unknown beta_schedule string."""
+    class A:
+        seed = 0
+        motion = {"enabled": True, "beta_schedule": "not_a_schedule"}
+    class H: pass
+    h = H()
+    try:
+        _mod.attach_motion_config(h, A())
+    except ValueError as e:
+        assert "beta_schedule" in str(e)
+        print("  ✓ invalid beta_schedule raises ValueError")
+        return
+    raise AssertionError("expected ValueError")
+
+
 if __name__ == "__main__":
-    print("running motion_hooks shape tests:")
+    print("running motion_hooks tests:")
     test_capture_then_inject_round_trip()
     test_inject_without_capture_raises()
     test_alpha_zero_is_passthrough()
     test_alpha_one_replaces_completely()
     test_realistic_shapes()
+    test_beta_schedule_constant()
+    test_beta_schedule_linear_warmup()
+    test_beta_schedule_warmup_cyclic()
+    test_beta_schedule_zero_warmup()
+    test_beta_schedule_invalid_raises()
     print("all passed")

@@ -1183,7 +1183,9 @@ class Trainer:
             if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
                 log_gpu_memory(f"streaming Training: After switch text encoding", device=self.device, rank=dist.get_rank())
         
-        # Motion-DMD: rank-0 samples V_ref + Bernoulli, broadcasts to all ranks.
+        # Motion-DMD: rank-0 samples V_ref index, broadcasts to all ranks.
+        # In v2 the per-step skip decision is made by the β scheduler (β=0 ⇒
+        # vanilla DMD), so this fn always returns a ref when motion is enabled.
         motion_info = self._maybe_pick_motion_ref()
         if motion_info is not None and DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SeqTrain-Trainer] motion_info: ref_idx={motion_info['ref_idx']}, "
