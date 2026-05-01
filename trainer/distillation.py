@@ -1542,7 +1542,9 @@ class Trainer:
                     try:
                         self._visualize()
                     except Exception as e:
-                        print(f"[Warning] Visualization failed at step {self.step}: {e}")
+                        import traceback
+                        print(f"[VIS-FAIL] step={self.step} rank={dist.get_rank()} err={type(e).__name__}: {e}")
+                        traceback.print_exc()
                 
                     if self.one_logger is not None:
                         self.one_logger.on_validation_end()
