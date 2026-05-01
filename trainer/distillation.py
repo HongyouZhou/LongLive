@@ -1695,11 +1695,24 @@ class Trainer:
                 print(f"Generating videos in LoRA mode (step {self.step})")
         
         for vid_len in self.vis_video_lengths:
-            print(f"Generating video of length {vid_len}")
-            if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
-                videos = self.generate_video_with_switch(self.vis_pipeline, vid_len, prompts, switch_prompts, switch_frame_index, image=image)
-            else:
-                videos = self.generate_video(self.vis_pipeline, vid_len, prompts, image=image)
+            print(f"Generating video of length {vid_len} ({len(prompts)} prompts × 1 batch)")
+            # Run inference one prompt at a time so peak VRAM stays at the
+            # batch=1 level rf4snq9s used (batch=4 inference of full 240-frame
+            # 14B teacher OOMs at vis time even though training is fine).
+            videos_list = []
+            for p_idx in range(len(prompts)):
+                single_prompts = [prompts[p_idx]]
+                if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
+                    single_switch = [switch_prompts[p_idx]]
+                    v = self.generate_video_with_switch(
+                        self.vis_pipeline, vid_len, single_prompts,
+                        single_switch, switch_frame_index, image=image,
+                    )
+                else:
+                    v = self.generate_video(self.vis_pipeline, vid_len, single_prompts, image=image)
+                videos_list.append(v[0])
+                torch.cuda.empty_cache()
+            videos = videos_list
 
             # Save each sample
             for idx, video_np in enumerate(videos):
