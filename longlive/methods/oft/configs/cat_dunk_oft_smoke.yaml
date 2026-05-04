@@ -1,0 +1,130 @@
+# OFT-DMD smoke: ~50-step run to verify FSDP wraps OFT correctly, loss
+# does not blow up, and one vis renders. Motion-DMD settings carry
+# over verbatim from cat_dunk_oft_v1.yaml — smoke goal is OFT plumbing,
+# not motion β scheduling.
+#
+# Deltas from cat_dunk_oft_v1.yaml:
+#   max_iters       3000 → 50    (~10-15 min on 8×H100)
+#   vis_interval     500 → 50    (one vis at the end)
+#   log_iters         50 → 10    (denser early-step logs)
+#   max_checkpoints    3 → 1
+#   ema_start_step   200 → 30    (exercise EMA path within 50 iters)
+#   wandb_project              → longlive_motion_oft_smoke
+
+generator_ckpt: $LL_DATA/longlive_models/models/longlive_base.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+fake_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_key: YOUR_WANDB_KEY
+wandb_entity: hongyou
+wandb_project: longlive_motion_oft_smoke
+sharding_strategy: hybrid_full
+lr: 1.0e-05
+lr_critic: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: prompts/vidprom_filtered_extended.txt
+switch_prompt_path: prompts/vidprom_filtered_extended_switch.txt
+batch_size: 1
+gradient_accumulation_steps: 1
+ema_weight: 0.99
+ema_start_step: 30
+total_batch_size: 64
+log_iters: 10
+max_checkpoints: 1
+max_iters: 50
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 240
+- 16
+- 60
+- 104
+distribution_loss: dmd_switch
+global_sink: false
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+
+vis_interval: 50
+vis_ema: false
+vis_video_lengths:
+- 240
+val_batch_size: 4
+val_data_path: prompts/motion_vis_prompts.txt
+val_switch_prompt_path: prompts/motion_vis_prompts_switch.txt
+
+slice_last_frames: 21
+
+switch_mode: random_choice
+switch_choices:
+- 21
+- 39
+- 57
+- 75
+- 93
+- 111
+- 129
+- 147
+- 165
+- 183
+- 201
+
+streaming_training: true
+streaming_chunk_size: 21
+streaming_max_length: 240
+
+streaming_min_new_frame: 18
+train_first_chunk: true
+
+last_step_only: false
+
+## OFT Configuration — same as cat_dunk_oft_v1.yaml
+adapter:
+  type: "oft"
+  oft_block_size: 64
+  use_cayley_neumann: true
+  num_cayley_neumann_terms: 5
+  module_dropout: 0.0
+  dtype: "bfloat16"
+  apply_to_critic: true
+  verbose: true
+
+## Motion-DMD configuration — verbatim from cat_dunk_oft_v1.yaml
+motion:
+  enabled: true
+  refs_path: $LL_DATA/motion_dmd/walking_v1.latents.pt
+  block_idxs: [18, 19, 20]
+  alpha: 0.3
+
+  beta_schedule: linear_warmup
+  beta_max: 0.10
+  beta_warmup_start: 0.0
+  beta_warmup_steps: 600
+  cyclic_period: 10
+  cyclic_high_ratio: 0.7
