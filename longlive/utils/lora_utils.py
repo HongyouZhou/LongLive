@@ -16,63 +16,95 @@ from torch.distributed.fsdp import (
 )
 
 
-def configure_lora_for_model(transformer, model_name, lora_config, is_main_process=True):
-    """Configure LoRA for a WanDiffusionWrapper model
-    
-    Args:
-        transformer: The transformer model to apply LoRA to
-        model_name: 'generator' or 'fake_score'
-        lora_config: LoRA configuration
-        is_main_process: Whether this is the main process (for logging)
-    
-    Returns:
-        lora_model: The LoRA-wrapped model
+# Adapter registry — maps adapter_type string to a factory that builds a
+# peft.PeftConfig from (adapter_cfg, target_modules). Methods register
+# additional types via side-effect import; see longlive/methods/<idea>/__init__.py
+# and the auto-scan at the bottom of this module.
+_ADAPTER_REGISTRY = {}
+
+
+def register_adapter(name, peft_config_factory):
+    """Register an adapter type under `name` with a factory callable.
+
+    factory(adapter_cfg, target_modules) -> peft.PeftConfig
     """
-    # Find all Linear modules in WanAttentionBlock modules
+    if name in _ADAPTER_REGISTRY:
+        raise KeyError(f"Adapter '{name}' already registered")
+    _ADAPTER_REGISTRY[name] = peft_config_factory
+
+
+# Built-in LoRA. Lives here (rather than under longlive/methods/) because LoRA
+# is the default adapter and is the single dependency every entry-point already
+# imports indirectly.
+register_adapter("lora", lambda cfg, targets: peft.LoraConfig(
+    r=cfg.get('rank', 16),
+    lora_alpha=cfg.get('alpha', None) or cfg.get('rank', 16),
+    lora_dropout=cfg.get('dropout', 0.0),
+    target_modules=targets,
+))
+
+
+def configure_adapter_for_model(transformer, model_name, adapter_config, is_main_process=True):
+    """Wrap a WanDiffusionWrapper transformer with the adapter selected by
+    adapter_config.type (default 'lora'). LoRA / OFT / future adapters all
+    flow through PEFT.
+
+    Args:
+        transformer: The transformer model to wrap
+        model_name: 'generator' or 'fake_score'
+        adapter_config: dict-like with .type and adapter-specific fields
+        is_main_process: Whether this is the main process (for logging)
+
+    Returns:
+        peft-wrapped model with adapter parameters trainable, base frozen
+    """
     target_linear_modules = set()
-    
-    # Define the specific modules we want to apply LoRA to
+
     if model_name == 'generator':
         adapter_target_modules = ['CausalWanAttentionBlock']
     elif model_name == 'fake_score':
         adapter_target_modules = ['WanAttentionBlock']
     else:
         raise ValueError(f"Invalid model name: {model_name}")
-    
+
     for name, module in transformer.named_modules():
         if module.__class__.__name__ in adapter_target_modules:
             for full_submodule_name, submodule in module.named_modules(prefix=name):
                 if isinstance(submodule, torch.nn.Linear):
                     target_linear_modules.add(full_submodule_name)
-    
+
     target_linear_modules = list(target_linear_modules)
-    
+
+    adapter_type = adapter_config.get('type', 'lora')
+
     if is_main_process:
-        print(f"LoRA target modules for {model_name}: {len(target_linear_modules)} Linear layers")
-        if getattr(lora_config, 'verbose', False):
+        print(f"Adapter '{adapter_type}' target modules for {model_name}: "
+              f"{len(target_linear_modules)} Linear layers")
+        if adapter_config.get('verbose', False):
             for module_name in sorted(target_linear_modules):
                 print(f"  - {module_name}")
-    
-    # Create LoRA config
-    adapter_type = lora_config.get('type', 'lora')
-    if adapter_type == 'lora':
-        peft_config = peft.LoraConfig(
-            r=lora_config.get('rank', 16),
-            lora_alpha=lora_config.get('alpha', None) or lora_config.get('rank', 16),
-            lora_dropout=lora_config.get('dropout', 0.0),
-            target_modules=target_linear_modules,
+
+    factory = _ADAPTER_REGISTRY.get(adapter_type)
+    if factory is None:
+        raise ValueError(
+            f"Unknown adapter type: '{adapter_type}'. "
+            f"Registered: {sorted(_ADAPTER_REGISTRY)}"
         )
-    else:
-        raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-    
-    # Apply LoRA to the transformer
-    lora_model = peft.get_peft_model(transformer, peft_config)
+
+    peft_config = factory(adapter_config, target_linear_modules)
+    adapter_model = peft.get_peft_model(transformer, peft_config)
 
     if is_main_process:
         print('peft_config', peft_config)
-        lora_model.print_trainable_parameters()
-    
-    return lora_model
+        adapter_model.print_trainable_parameters()
+
+    return adapter_model
+
+
+# Backward-compat alias — call sites in trainer / inference / vbench import
+# this name. Function is now polymorphic (lora / oft / ...) but name kept to
+# avoid touching ~6 call sites in this PR.
+configure_lora_for_model = configure_adapter_for_model
 
 
 def gather_lora_state_dict(lora_model):
@@ -98,6 +130,24 @@ def load_lora_checkpoint(lora_model, lora_state_dict, model_name, is_main_proces
         print(f"Loading LoRA {model_name} weights: {len(lora_state_dict)} keys in checkpoint")
     
     peft.set_peft_model_state_dict(lora_model, lora_state_dict)
-    
+
     if is_main_process:
-        print(f"LoRA {model_name} weights loaded successfully") 
+        print(f"LoRA {model_name} weights loaded successfully")
+
+
+def _autoload_methods():
+    """Walk longlive/methods/* and import each subpackage so its __init__.py
+    can side-effect-register adapters / losses / DMD score variants.
+
+    Per docs/01.md "auto-scan + side-effect registration" convention. Run once
+    at module import — any caller of lora_utils gets the full registry.
+    """
+    import importlib
+    import pkgutil
+    import longlive.methods as _m
+    for _, name, ispkg in pkgutil.iter_modules(_m.__path__, _m.__name__ + "."):
+        if ispkg:
+            importlib.import_module(name)
+
+
+_autoload_methods()
