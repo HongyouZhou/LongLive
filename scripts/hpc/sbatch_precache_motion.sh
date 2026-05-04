@@ -34,9 +34,9 @@ mamba activate "$LL_ENV_NAME"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${LL_REPO:-}" ] && [ -d "$LL_REPO" ]; then
     PROJECT_DIR="$LL_REPO"
-elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "$SLURM_SUBMIT_DIR/train.py" ]; then
+elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "$SLURM_SUBMIT_DIR/scripts/local/train.py" ]; then
     PROJECT_DIR="$SLURM_SUBMIT_DIR"
-elif [ -f "$SCRIPT_DIR/../../train.py" ]; then
+elif [ -f "$SCRIPT_DIR/../../scripts/local/train.py" ]; then
     PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 else
     echo "[precache] cannot locate repo. Set LL_REPO or sbatch from repo root."

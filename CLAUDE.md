@@ -148,13 +148,16 @@ wgpus -n 5                # live GPU watch every 5 s
 
 ## Commands
 
+Entry-points live under `scripts/local/`(本地)和 `scripts/hpc/`(SLURM)。从 repo 根调用:
+
 ```bash
-python train.py --config configs/<config>.yaml                            # local train (single node)
-torchrun --nproc_per_node=8 train.py --config configs/<config>.yaml       # multi-GPU
-python inference.py --config configs/<config>.yaml                        # inference
-python -m pytest tests/                                                   # tests
-bash scripts/hpc/fetch_data.sh                                            # cross-machine data sync
-python scripts/motion_dmd/precache_motion_refs.py --refs_root ...         # VAE-encode refs offline
+python scripts/local/train.py --config configs/<config>.yaml                            # local train (single node)
+torchrun --nproc_per_node=8 scripts/local/train.py --config configs/<config>.yaml       # multi-GPU
+python scripts/local/inference.py --config configs/<config>.yaml                        # inference
+bash scripts/local/train_long.sh                                                        # thin torchrun wrapper
+python -m pytest tests/                                                                 # tests
+bash scripts/hpc/fetch_data.sh                                                          # cross-machine data sync
+python scripts/motion_dmd/precache_motion_refs.py --refs_root ...                       # VAE-encode refs offline
 ```
 
 **Always use parallel orchestrators / SLURM array for multi-config or multi-dataset work.** Do NOT loop single-GPU jobs in bash.

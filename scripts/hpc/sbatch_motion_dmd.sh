@@ -50,9 +50,9 @@ mamba activate "$LL_ENV_NAME"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${LL_REPO:-}" ] && [ -d "$LL_REPO" ]; then
     PROJECT_DIR="$LL_REPO"
-elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "$SLURM_SUBMIT_DIR/train.py" ]; then
+elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "$SLURM_SUBMIT_DIR/scripts/local/train.py" ]; then
     PROJECT_DIR="$SLURM_SUBMIT_DIR"
-elif [ -f "$SCRIPT_DIR/../../train.py" ]; then
+elif [ -f "$SCRIPT_DIR/../../scripts/local/train.py" ]; then
     PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 else
     echo "[SLURM] Error: cannot locate LongLive repo. Set LL_REPO or sbatch from repo root."
@@ -182,7 +182,7 @@ if [ "$NNODES" -gt 1 ]; then
             --rdzv_backend=c10d \
             --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
             --rdzv_id=$SLURM_JOB_ID \
-            train.py \
+            scripts/local/train.py \
             --config_path $LL_CONFIG \
             --logdir $RUN_LOGDIR \
             --wandb-save-dir $PROJECT_DIR/wandb \
@@ -192,7 +192,7 @@ else
     torchrun \
         --nproc_per_node="$GPUS_PER_NODE" \
         --master_port="$MASTER_PORT" \
-        train.py \
+        scripts/local/train.py \
         --config_path "$LL_CONFIG" \
         --logdir "$RUN_LOGDIR" \
         --wandb-save-dir "$PROJECT_DIR/wandb" \

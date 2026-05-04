@@ -26,7 +26,7 @@ Response on failure::
 Model + LoRA load happens once at boot; all requests in a dispatch run
 share the same checkpoint (VBench evaluates a single ckpt at a time).
 
-Mirrors ``inference.py``'s ckpt + LoRA loading sequence so the generated
+Mirrors ``scripts/local/inference.py``'s ckpt + LoRA loading sequence so the generated
 videos are byte-identical to what NVlabs's stock inference would produce
 for the same prompt + seed + ckpt.
 """
@@ -91,7 +91,7 @@ class EvalWorker:
         torch.set_grad_enabled(False)
         self.pipeline = CausalInferencePipeline(self.config, device=self.device)
 
-        # Load base generator weights (same logic as inference.py:73-95).
+        # Load base generator weights (same logic as scripts/local/inference.py:73-95).
         if self.config.generator_ckpt:
             _log(f"loading base generator from {self.config.generator_ckpt}")
             sd = torch.load(self.config.generator_ckpt, map_location="cpu")
@@ -113,7 +113,7 @@ class EvalWorker:
             else:
                 self.pipeline.generator.load_state_dict(gen_sd)
 
-        # Apply LoRA + load LoRA weights (mirrors inference.py:97-131).
+        # Apply LoRA + load LoRA weights (mirrors scripts/local/inference.py:97-131).
         self.pipeline.is_lora_enabled = False
         if getattr(self.config, "adapter", None):
             _log("wrapping generator with LoRA adapter")
@@ -135,7 +135,7 @@ class EvalWorker:
                         self.pipeline.generator.model, blob)
             self.pipeline.is_lora_enabled = True
 
-        # Move to device + dtype (matches inference.py:134-139).
+        # Move to device + dtype (matches scripts/local/inference.py:134-139).
         self.pipeline = self.pipeline.to(dtype=self.dtype)
         # Always low-memory on eval pool; 8 workers × ~5GB gen + critic budget.
         DynamicSwapInstaller.install_model(self.pipeline.text_encoder, device=self.device)
@@ -152,7 +152,7 @@ class EvalWorker:
         out_path = req["output_mp4"]
         set_seed(seed)
 
-        # Latent shape mirrors inference.py:194-196 — fixed at the model's
+        # Latent shape mirrors scripts/local/inference.py:194-196 — fixed at the model's
         # canonical [B, T_lat, 16, 60, 104] (480×832 pixel after VAE decode).
         T_lat = int(self.config.num_output_frames)
         noise = torch.randn(

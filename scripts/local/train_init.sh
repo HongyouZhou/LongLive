@@ -8,7 +8,7 @@ echo "CONFIG="$CONFIG
 
 torchrun \
   --nproc_per_node=8 \
-  train.py \
+  scripts/local/train.py \
   --config_path $CONFIG \
   --logdir $LOGDIR \
   --wandb-save-dir $WANDB_SAVE_DIR
