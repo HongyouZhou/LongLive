@@ -133,7 +133,7 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 ##############################
 # LongLive claims the "wm" sub-namespace under the shared $PROJECT_DATA.
 : "${LL_DATA:=$PROJECT_DATA/wm}"
-export WAN_MODELS_ROOT="$LL_DATA/wan_models"     # utils/wan_wrapper.py reads this
+export WAN_MODELS_ROOT="$LL_DATA/wan_models"     # longlive/utils/wan_wrapper.py reads this
 export HF_HOME="$LL_DATA/hf_cache"
 export TRANSFORMERS_CACHE="$LL_DATA/hf_cache"
 # WANDB_API_KEY + HF_TOKEN come from ~/.bashrc.

@@ -7,13 +7,13 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: Apache-2.0
-from utils.wan_wrapper import WanDiffusionWrapper
-from utils.scheduler import SchedulerInterface
+from longlive.utils.wan_wrapper import WanDiffusionWrapper
+from longlive.utils.scheduler import SchedulerInterface
 from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
-from utils.debug_option import DEBUG, LOG_GPU_MEMORY
-from utils.memory import log_gpu_memory
+from longlive.utils.debug_option import DEBUG, LOG_GPU_MEMORY
+from longlive.utils.memory import log_gpu_memory
 
 
 class StreamingTrainingPipeline:

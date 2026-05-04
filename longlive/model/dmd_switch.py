@@ -5,14 +5,14 @@ from typing import Optional, Tuple
 import torch
 import time
 
-from model.base import SelfForcingModel
-from utils.memory import log_gpu_memory
+from longlive.model.base import SelfForcingModel
+from longlive.utils.memory import log_gpu_memory
 import torch.distributed as dist
-from model.dmd import DMD
-from pipeline.streaming_switch_training import StreamingSwitchTrainingPipeline
+from longlive.model.dmd import DMD
+from longlive.pipeline.streaming_switch_training import StreamingSwitchTrainingPipeline
 from einops import rearrange
 
-from utils.debug_option import DEBUG, LOG_GPU_MEMORY
+from longlive.utils.debug_option import DEBUG, LOG_GPU_MEMORY
 
 
 class DMDSwitch(DMD):

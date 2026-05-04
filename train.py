@@ -6,7 +6,7 @@ from datetime import datetime
 from omegaconf import OmegaConf
 import wandb
 
-from trainer import ScoreDistillationTrainer
+from longlive.trainer import ScoreDistillationTrainer
 
 
 def main():

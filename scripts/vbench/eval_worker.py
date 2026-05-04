@@ -65,10 +65,10 @@ def _stdout_for_response():
         sys.stdout = prev
 
 
-from pipeline import CausalInferencePipeline  # noqa: E402
-from utils.misc import set_seed  # noqa: E402
-from utils.memory import DynamicSwapInstaller  # noqa: E402
-from utils.lora_utils import configure_lora_for_model  # noqa: E402
+from longlive.pipeline import CausalInferencePipeline  # noqa: E402
+from longlive.utils.misc import set_seed  # noqa: E402
+from longlive.utils.memory import DynamicSwapInstaller  # noqa: E402
+from longlive.utils.lora_utils import configure_lora_for_model  # noqa: E402
 import peft  # noqa: E402
 
 

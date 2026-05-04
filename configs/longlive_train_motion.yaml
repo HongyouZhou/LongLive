@@ -119,7 +119,7 @@ adapter:
 # When `enabled: true`, each generator step (where the schedule yields β > 0)
 # replaces the vanilla teacher score with `(1-β)·v_real + β·v_real_motion`,
 # where v_real_motion is the 14B teacher run with V_ref attention injected
-# at `block_idxs`. See `model/dmd.py:_compute_kl_grad_with_motion`.
+# at `block_idxs`. See `longlive/model/dmd.py:_compute_kl_grad_with_motion`.
 #
 # v3 (conservative): tuned down after observing detail loss in ur1sey9l
 # step-500 vis. The dominant cause was identified as L2-to-noisy-target

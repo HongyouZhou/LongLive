@@ -6,16 +6,16 @@ import random
 import re
 from pathlib import Path
 
-from utils.dataset import TextDataset, TwoTextDataset, cycle
-from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
-from utils.misc import (
+from longlive.utils.dataset import TextDataset, TwoTextDataset, cycle
+from longlive.utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from longlive.utils.misc import (
     set_seed,
     merge_dict_list
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import DMD, DMDSwitch
-from model.streaming_training import StreamingTrainingModel
+from longlive.model import DMD, DMDSwitch
+from longlive.model.streaming_training import StreamingTrainingModel
 import torch
 import wandb
 import time
@@ -41,12 +41,12 @@ try:
 except Exception:
     pass
 
-from utils.memory import gpu, get_cuda_free_memory_gb, log_gpu_memory
-from pipeline import (
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, log_gpu_memory
+from longlive.pipeline import (
     CausalInferencePipeline,
     SwitchCausalInferencePipeline
 )
-from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
+from longlive.utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
 try:
     from one_logger_utils import OneLoggerUtils
 except ImportError:

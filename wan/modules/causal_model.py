@@ -18,9 +18,9 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
 
-from utils.debug_option import DEBUG
+from longlive.utils.debug_option import DEBUG
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254

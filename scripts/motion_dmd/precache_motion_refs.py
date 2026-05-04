@@ -30,7 +30,7 @@ from torchvision import transforms
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from utils.wan_wrapper import WanVAEWrapper  # noqa: E402
+from longlive.utils.wan_wrapper import WanVAEWrapper  # noqa: E402
 
 PIXEL_FRAMES = 81
 PIXEL_H = 480

@@ -4,10 +4,10 @@ from typing import List, Optional
 import torch
 import os
 
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from longlive.utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
-from utils.debug_option import DEBUG
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
+from longlive.utils.debug_option import DEBUG
 import torch.distributed as dist
 
 class CausalInferencePipeline(torch.nn.Module):

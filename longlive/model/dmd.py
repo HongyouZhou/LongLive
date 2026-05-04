@@ -5,11 +5,11 @@ from typing import Optional, Tuple
 import torch
 import time
 
-from model.base import SelfForcingModel
-from model.motion_hooks import MotionAttnInjector
-from utils.memory import log_gpu_memory
+from longlive.model.base import SelfForcingModel
+from longlive.model.motion_hooks import MotionAttnInjector
+from longlive.utils.memory import log_gpu_memory
 import torch.distributed as dist
-from utils.debug_option import DEBUG, LOG_GPU_MEMORY
+from longlive.utils.debug_option import DEBUG, LOG_GPU_MEMORY
 
 
 class DMD(SelfForcingModel):
@@ -491,7 +491,7 @@ class DMD(SelfForcingModel):
 
         # Step 3: Compute the denoising loss for the fake critic
         if self.args.denoising_loss_type == "flow":
-            from utils.wan_wrapper import WanDiffusionWrapper
+            from longlive.utils.wan_wrapper import WanDiffusionWrapper
             flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
                 scheduler=self.scheduler,
                 x0_pred=pred_fake_image.flatten(0, 1),

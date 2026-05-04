@@ -39,7 +39,7 @@ echo "[data] LL_CONFIG = $LL_CONFIG"
 #   wan_models/        Wan2.1-T2V-{14B,1.3B}/
 #   longlive_models/   models/longlive_base.pt
 #   hf_cache/          HF download cache
-# - utils/wan_wrapper.py reads WAN_MODELS_ROOT (set by sbatch_train.sh)
+# - longlive/utils/wan_wrapper.py reads WAN_MODELS_ROOT (set by sbatch_train.sh)
 # - generator_ckpt is rewritten to an absolute path in the rendered *_hpc.yaml below
 mkdir -p "$LL_DATA"/{wan_models,longlive_models/models,hf_cache}
 

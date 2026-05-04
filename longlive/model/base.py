@@ -6,12 +6,12 @@ from torch import nn
 import torch.distributed as dist
 import torch
 
-from pipeline import SelfForcingTrainingPipeline
-from utils.loss import get_denoising_loss
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from longlive.pipeline import SelfForcingTrainingPipeline
+from longlive.utils.loss import get_denoising_loss
+from longlive.utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
-from utils.debug_option import DEBUG
-from model.motion_hooks import attach_motion_config
+from longlive.utils.debug_option import DEBUG
+from longlive.model.motion_hooks import attach_motion_config
 
 class BaseModel(nn.Module):
     def __init__(self, args, device):

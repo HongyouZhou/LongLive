@@ -12,13 +12,13 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from pipeline import (
+from longlive.pipeline import (
     CausalInferencePipeline,
 )
-from utils.dataset import TextDataset
-from utils.misc import set_seed
+from longlive.utils.dataset import TextDataset
+from longlive.utils.misc import set_seed
 
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -95,7 +95,7 @@ if config.generator_ckpt:
         pipeline.generator.load_state_dict(raw_gen_state_dict)
 
 # --------------------------- LoRA support (optional) ---------------------------
-from utils.lora_utils import configure_lora_for_model
+from longlive.utils.lora_utils import configure_lora_for_model
 import peft
 
 pipeline.is_lora_enabled = False

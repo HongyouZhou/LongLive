@@ -10,11 +10,11 @@
 from typing import List, Optional
 import torch
 
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
-from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
-from pipeline.causal_inference import CausalInferencePipeline  # reuse init utilities
+from longlive.utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
+from longlive.pipeline.causal_inference import CausalInferencePipeline  # reuse init utilities
 import torch.distributed as dist
-from utils.debug_option import DEBUG
+from longlive.utils.debug_option import DEBUG
 
 
 class SwitchCausalInferencePipeline(CausalInferencePipeline):

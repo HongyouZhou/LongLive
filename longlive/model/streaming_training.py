@@ -13,9 +13,9 @@ import torch.distributed as dist
 from typing import Tuple, Dict, Any, Optional, List
 from einops import rearrange
 
-from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
-from utils.memory import log_gpu_memory
-from pipeline.streaming_switch_training import StreamingSwitchTrainingPipeline
+from longlive.utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
+from longlive.utils.memory import log_gpu_memory
+from longlive.pipeline.streaming_switch_training import StreamingSwitchTrainingPipeline
 
 
 class StreamingTrainingModel:
@@ -138,7 +138,7 @@ class StreamingTrainingModel:
     def _should_switch_prompt(self, chunk_start_frame: int, chunk_size: int) -> bool:
         """Determine whether to switch prompt (DMDSwitch only)"""
         # Check if the model supports switching (DMDSwitch)
-        from pipeline.streaming_switch_training import StreamingSwitchTrainingPipeline
+        from longlive.pipeline.streaming_switch_training import StreamingSwitchTrainingPipeline
         if not isinstance(self.inference_pipeline, StreamingSwitchTrainingPipeline):
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[StreamingTrain-Model] Not a switch pipeline, no switching")
@@ -745,7 +745,7 @@ class StreamingTrainingModel:
         # Compute denoising loss
         denoising_loss_type = getattr(self.base_model.args, 'denoising_loss_type', 'mse')
         if denoising_loss_type == "flow":
-            from utils.wan_wrapper import WanDiffusionWrapper
+            from longlive.utils.wan_wrapper import WanDiffusionWrapper
             flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
                 scheduler=self.scheduler,
                 x0_pred=pred_fake_image.flatten(0, 1),

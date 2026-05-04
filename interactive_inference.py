@@ -21,14 +21,14 @@ from torchvision.io import write_video
 from torchvision import transforms  # noqa: F401
 from einops import rearrange
 
-from utils.misc import set_seed
-from utils.distributed import barrier  
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+from longlive.utils.misc import set_seed
+from longlive.utils.distributed import barrier  
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 
-from pipeline.interactive_causal_inference import (
+from longlive.pipeline.interactive_causal_inference import (
     InteractiveCausalInferencePipeline,
 )
-from utils.dataset import MultiTextDataset
+from longlive.utils.dataset import MultiTextDataset
 
 
 # ----------------------------- Argument parsing -----------------------------
@@ -97,7 +97,7 @@ if config.generator_ckpt:
         pipeline.generator.load_state_dict(raw_gen_state_dict)
 
 # --------------------------- LoRA support (optional) ---------------------------
-from utils.lora_utils import configure_lora_for_model
+from longlive.utils.lora_utils import configure_lora_for_model
 import peft
 
 pipeline.is_lora_enabled = False

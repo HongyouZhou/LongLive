@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import importlib.util  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
-    "motion_hooks", str(REPO_ROOT / "model" / "motion_hooks.py")
+    "motion_hooks", str(REPO_ROOT / "longlive" / "model" / "motion_hooks.py")
 )
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules["motion_hooks"] = _mod  # required for dataclasses to resolve cls.__module__
