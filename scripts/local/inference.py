@@ -1,24 +1,31 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 import argparse
-import torch
 import os
-from omegaconf import OmegaConf
-from tqdm import tqdm
-from torchvision import transforms
-from torchvision.io import write_video
-from einops import rearrange
-import torch.distributed as dist
-from torch.utils.data import DataLoader, SequentialSampler
-from torch.utils.data.distributed import DistributedSampler
+import sys
+from pathlib import Path
 
-from longlive.pipeline import (
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import torch  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+from torchvision import transforms  # noqa: E402
+from torchvision.io import write_video  # noqa: E402
+from einops import rearrange  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from torch.utils.data import DataLoader, SequentialSampler  # noqa: E402
+from torch.utils.data.distributed import DistributedSampler  # noqa: E402
+
+from longlive.pipeline import (  # noqa: E402
     CausalInferencePipeline,
 )
-from longlive.utils.dataset import TextDataset
-from longlive.utils.misc import set_seed
+from longlive.utils.dataset import TextDataset  # noqa: E402
+from longlive.utils.misc import set_seed  # noqa: E402
 
-from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")

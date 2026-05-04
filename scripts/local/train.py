@@ -2,11 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import os
+import sys
 from datetime import datetime
-from omegaconf import OmegaConf
-import wandb
+from pathlib import Path
 
-from longlive.trainer import ScoreDistillationTrainer
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from omegaconf import OmegaConf  # noqa: E402
+import wandb  # noqa: E402
+
+from longlive.trainer import ScoreDistillationTrainer  # noqa: E402
 
 
 def main():

@@ -9,26 +9,32 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import os
+import sys
+from pathlib import Path
 from typing import List
 
-import torch
-import torch.distributed as dist
-from omegaconf import OmegaConf
-from tqdm import tqdm
-from torch.utils.data import DataLoader, SequentialSampler
-from torch.utils.data.distributed import DistributedSampler
-from torchvision.io import write_video
-from torchvision import transforms  # noqa: F401
-from einops import rearrange
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from longlive.utils.misc import set_seed
-from longlive.utils.distributed import barrier  
-from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+from torch.utils.data import DataLoader, SequentialSampler  # noqa: E402
+from torch.utils.data.distributed import DistributedSampler  # noqa: E402
+from torchvision.io import write_video  # noqa: E402
+from torchvision import transforms  # noqa: F401, E402
+from einops import rearrange  # noqa: E402
 
-from longlive.pipeline.interactive_causal_inference import (
+from longlive.utils.misc import set_seed  # noqa: E402
+from longlive.utils.distributed import barrier  # noqa: E402
+from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller  # noqa: E402
+
+from longlive.pipeline.interactive_causal_inference import (  # noqa: E402
     InteractiveCausalInferencePipeline,
 )
-from longlive.utils.dataset import MultiTextDataset
+from longlive.utils.dataset import MultiTextDataset  # noqa: E402
 
 
 # ----------------------------- Argument parsing -----------------------------
