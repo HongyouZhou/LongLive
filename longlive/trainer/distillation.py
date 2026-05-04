@@ -1574,53 +1574,15 @@ class Trainer:
 
 
     def _configure_lora_for_model(self, transformer, model_name):
-        """Configure LoRA for a WanDiffusionWrapper model"""
-        # Find all Linear modules in WanAttentionBlock modules
-        target_linear_modules = set()
-        
-        # Define the specific modules we want to apply LoRA to
-        if model_name == 'generator':
-            adapter_target_modules = ['CausalWanAttentionBlock']
-        elif model_name == 'fake_score':
-            adapter_target_modules = ['WanAttentionBlock']
-        else:
-            raise ValueError(f"Invalid model name: {model_name}")
-        
-        for name, module in transformer.named_modules():
-            if module.__class__.__name__ in adapter_target_modules:
-                for full_submodule_name, submodule in module.named_modules(prefix=name):
-                    if isinstance(submodule, torch.nn.Linear):
-                        target_linear_modules.add(full_submodule_name)
-        
-        target_linear_modules = list(target_linear_modules)
-        
-        if self.is_main_process:
-            print(f"LoRA target modules for {model_name}: {len(target_linear_modules)} Linear layers")
-            if getattr(self.lora_config, 'verbose', False):
-                for module_name in sorted(target_linear_modules):
-                    print(f"  - {module_name}")
-        
-        # Create LoRA config
-        adapter_type = self.lora_config.get('type', 'lora')
-        if adapter_type == 'lora':
-            peft_config = peft.LoraConfig(
-                r=self.lora_config.get('rank', 16),
-                lora_alpha=self.lora_config.get('alpha', None) or self.lora_config.get('rank', 16),
-                lora_dropout=self.lora_config.get('dropout', 0.0),
-                target_modules=target_linear_modules,
-                # task_type="FEATURE_EXTRACTION"        # Remove this; not needed for diffusion models
-            )
-        else:
-            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-        
-        # Apply LoRA to the transformer
-        lora_model = peft.get_peft_model(transformer, peft_config)
-
-        if self.is_main_process:
-            print('peft_config', peft_config)
-            lora_model.print_trainable_parameters()
-
-        return lora_model
+        """Wrap transformer with adapter selected by self.lora_config.type
+        ('lora' | 'oft' | ...). Delegates to longlive.utils.lora_utils so the
+        adapter registry (auto-loaded from longlive/methods/*) is the single
+        source of truth — adding a new adapter type does not require editing
+        the trainer."""
+        from longlive.utils.lora_utils import configure_adapter_for_model
+        return configure_adapter_for_model(
+            transformer, model_name, self.lora_config, self.is_main_process
+        )
 
 
     def _gather_lora_state_dict(self, lora_model):
