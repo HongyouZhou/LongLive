@@ -133,6 +133,7 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 ##############################
 # LongLive claims the "wm" sub-namespace under the shared $PROJECT_DATA.
 : "${LL_DATA:=$PROJECT_DATA/wm}"
+export LL_DATA                                   # YAML configs use ${oc.env:LL_DATA} for ckpt paths
 export WAN_MODELS_ROOT="$LL_DATA/wan_models"     # longlive/utils/wan_wrapper.py reads this
 export HF_HOME="$LL_DATA/hf_cache"
 export TRANSFORMERS_CACHE="$LL_DATA/hf_cache"

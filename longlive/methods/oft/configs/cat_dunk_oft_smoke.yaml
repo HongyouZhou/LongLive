@@ -9,7 +9,7 @@
 #   ema_start_step   200 → 30    (exercise EMA path within 50 iters)
 #   wandb_project              → longlive_oft_smoke
 
-generator_ckpt: $LL_DATA/longlive_models/models/longlive_base.pt
+generator_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size

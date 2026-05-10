@@ -4,7 +4,7 @@
 # Per docs/01.md: method configs are full copies of the base — no _base_:
 # inheritance — so this file drifts independently from any base config.
 
-generator_ckpt: $LL_DATA/longlive_models/models/longlive_base.pt
+generator_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
