@@ -6,6 +6,7 @@ LongLive — video diffusion motion finetune research framework. Built on Wan2.1
 
 - **Confirm experiment config before launch.** Never start a training / eval run without explicit user sign-off on the config (model size, data, hyperparams, ckpt source, output logdir). Print the resolved config and wait for approval, even when the user has asked you to "go run X" — the resolved values may differ from what they expected.
 - **Read first, discuss second.** When the user opens a discussion that touches code, configs, or prior decisions, read the relevant files (linked docs, referenced source paths, latest `docs/NN.md`) before responding. Do not theorize on what the code probably does.
+- **Don't speculate on combinations of methods you haven't read.** Before recommending or borrowing from an external technique (e.g. "D-OPSD style on-policy", "Stand-In's KV-concat"), fetch and read the actual paper / code. Do not derive architecture from name-only citations, my own summaries, or paraphrases — name-only composition produces hallucinated designs and burns the user's time. If the source is not accessible, say so and stop, do not invent.
 - **One question at a time.** Stay on the question being discussed. Do not pre-emptively answer adjacent or future questions, do not pivot to a different aspect mid-thread, do not pile multiple proposals into one reply. Resolve the current question, then move to the next.
 - **Discuss before changing.** Architecture, algorithm, or interface changes must be proposed and approved before implementation.
 - **Clarify scope first.** When user describes an architectural change ("put X in the loop", "merge these stages"), ask about scope before implementing. Do not assume a narrower interpretation.
@@ -40,7 +41,7 @@ bash scripts/hpc/setup_mamba_env.sh    # idempotent; run on a login node
 |---|---|
 | **arp** | Code orchestration only. Push code, drive remote training, no heavy compute. |
 | **lab** (Mechatron) | **Primary `wm` data host + training** since 2026-04-26. arp's repo + data mounted via sshfs. |
-| **HPC** (Charité sc-projects cluster) | Training cluster. `fetch_data.sh` defaults to HuggingFace Hub for public ckpts; set `LL_REMOTE_HOST=hongyou@lab` only when rsync-ing **private** data (motion refs, custom clips) from lab, or as a fallback when HF is slow/unavailable. Sole writable storage is `/sc-projects/sc-proj-cc09-repair/hongyou` — never propose `/dev/shm`, `/tmp`, `$HOME`, or other "node-local" paths to speed up NFS. |
+| **HPC** (Charité sc-projects cluster) | Training cluster. `fetch_data.sh` defaults to HuggingFace Hub for public ckpts; set `LL_REMOTE_HOST=hongyou@lab` only when rsync-ing **private** data (custom clips) from lab, or as a fallback when HF is slow/unavailable. Sole writable storage is `/sc-projects/sc-proj-cc09-repair/hongyou` — never propose `/dev/shm`, `/tmp`, `$HOME`, or other "node-local" paths to speed up NFS. |
 
 Cross-machine path handling: configs reference **`$LL_DATA`**, not hard-coded absolute paths, so the same YAML works on all three machines. Concrete roots differ:
 - **arp / lab**: `~/dev/data/wm/` (lab sees arp's home via sshfs mount).
@@ -121,21 +122,15 @@ Submit / monitor examples:
 ```bash
 # core training
 sbatch scripts/hpc/sbatch_train.sh                                          # default config configs/longlive_train_long.yaml
-LL_AUTO_RESUME=1 sbatch scripts/hpc/sbatch_motion_dmd.sh                    # motion-DMD; auto-resume latest matching logdir
-
-# motion-DMD ref-latent cache (sbatch_motion_dmd.sh auto-runs this inline if missing,
-# but the dedicated job is faster — only requests 2 GPUs)
-sbatch scripts/hpc/sbatch_precache_motion.sh
-LL_MOTION_REFS=prompts/dancing_refs.jsonl \
-  LL_MOTION_CACHE='$LL_DATA/motion_dmd/dancing_v1.latents.pt' \
-  sbatch scripts/hpc/sbatch_precache_motion.sh
+LL_CONFIG=longlive/methods/oft/configs/cat_dunk_oft_v1.yaml \
+  sbatch scripts/hpc/sbatch_train.sh                                        # OFT-DMD on cat-dunking
 
 # eval (positional <ckpt> required; resolves abs / $LL_DATA-relative / repo-relative)
 sbatch scripts/hpc/sbatch_vbench.sh longlive_models/models/lora.pt paper_baseline
 LL_VBENCH_LIMIT=8 sbatch scripts/hpc/sbatch_vbench.sh longlive_models/models/lora.pt smoke
 
 # capture JID into the current shell for follow-up (gpus / scancel / tail):
-source scripts/hpc/submit.sh sbatch_motion_dmd.sh
+source scripts/hpc/submit.sh sbatch_train.sh
 echo $JID
 
 # monitoring
@@ -157,7 +152,6 @@ python scripts/local/inference.py --config configs/<config>.yaml                
 bash scripts/local/train_long.sh                                                        # thin torchrun wrapper
 python -m pytest tests/                                                                 # tests
 bash scripts/hpc/fetch_data.sh                                                          # cross-machine data sync
-python scripts/motion_dmd/precache_motion_refs.py --refs_root ...                       # VAE-encode refs offline
 ```
 
 **Always use parallel orchestrators / SLURM array for multi-config or multi-dataset work.** Do NOT loop single-GPU jobs in bash.
@@ -167,18 +161,17 @@ python scripts/motion_dmd/precache_motion_refs.py --refs_root ...               
 | Directory | Role |
 |---|---|
 | `wan/`, `wan_models/` | Wan2.1 base model code + checkpoints (vendored upstream; minor fork patches in `wan/modules/causal_model*.py`) |
-| `longlive/model/` | `BaseModel` (real_score / fake_score / generator triple), `DMD`, `MotionAttnInjector` hook system, `streaming_training` |
+| `longlive/model/` | `BaseModel` (real_score / fake_score / generator triple), `DMD`, `streaming_training` |
 | `longlive/pipeline/` | `causal_inference`, `streaming_training`, `self_forcing_training` — inference & rollout |
 | `longlive/trainer/` | `ScoreDistillationTrainer` — FSDP, LoRA attach, checkpoint/resume, WandB |
 | `longlive/utils/` | `loss.py` (DenoisingLoss plug-in), `wan_wrapper.py`, `scheduler.py`, `lora_utils.py`, `dataset.py`, `distributed.py`, `memory.py` |
 | `longlive/methods/` | per-method implementations (OFT, bridge, …); each is self-contained, only **reads** core modules, does not modify them |
-| `scripts/hpc/` | sbatch templates (`sbatch_train.sh`, `sbatch_motion_dmd.sh`, `sbatch_vbench.sh`, `sbatch_precache_motion.sh`) + `submit.sh` (source-able, captures `$JID`) + `fetch_data.sh` (HF Hub / rsync data staging, login-node only) + `setup_mamba_env.sh` (env build, login-node only) |
-| `scripts/motion_dmd/` | offline motion-ref VAE precache |
+| `scripts/hpc/` | sbatch templates (`sbatch_train.sh`, `sbatch_vbench.sh`) + `submit.sh` (source-able, captures `$JID`) + `fetch_data.sh` (HF Hub / rsync data staging, login-node only) + `setup_mamba_env.sh` (env build, login-node only) |
 | `scripts/vbench/` | distributed VBench eval |
 | `configs/` | OmegaConf YAMLs; `default_config.yaml` is the base, others inherit + override |
 | `docs/` | numbered design / discussion docs — read the **latest** (highest-numbered) for current context; older may be outdated |
 
-Data layout: `$LL_DATA/` (motion datasets, `wan_models/`, `hf_cache/`, `motion_refs/`, `motion_dmd/`). Resolves to `~/dev/data/wm/` on arp / lab and `$PROJECT_DATA/wm/` on HPC. Logs under `logs/<run>/`, wandb under `wandb/`.
+Data layout: `$LL_DATA/` (training clips, `wan_models/`, `hf_cache/`). Resolves to `~/dev/data/wm/` on arp / lab and `$PROJECT_DATA/wm/` on HPC. Logs under `logs/<run>/`, wandb under `wandb/`.
 
 ## Extension points (where new ideas plug in)
 
@@ -187,7 +180,7 @@ New ideas live under `longlive/methods/<idea>/` and inject through one of six pe
 Quick map of seams:
 
 - **L1 parameterization** (LoRA / OFT / DoRA): adapter dispatch in `longlive/utils/lora_utils.py`, YAML `adapter.type`.
-- **L2 forward hook** (attn / FFN runtime override): `MotionAttnInjector`-style hook in `longlive/model/motion_hooks.py`; FSDP-safe.
+- **L2 forward hook** (attn / FFN runtime override): use PyTorch `register_forward_hook`; keep return shape / device / dtype identical so FSDP all-gather is undisturbed.
 - **L3 teacher score** (DMD gradient term): subclass `DMD`, override `_compute_kl_grad(...)`. Signature stable.
 - **L4 loss form**: subclass `DenoisingLoss` in `longlive/utils/loss.py`, register in `NAME_TO_CLASS`, select via `denoising_loss_type`.
 - **L5 trainer phase**: subclass `ScoreDistillationTrainer` (rare; LoRA attach point ≈ line 350).

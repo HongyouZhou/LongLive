@@ -11,7 +11,6 @@ from longlive.utils.loss import get_denoising_loss
 from longlive.utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from longlive.utils.debug_option import DEBUG
-from longlive.model.motion_hooks import attach_motion_config
 
 class BaseModel(nn.Module):
     def __init__(self, args, device):
@@ -27,11 +26,7 @@ class BaseModel(nn.Module):
                 timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
-        # Attach motion-DMD config (defaults disabled — no behavior change unless
-        # `args.motion.enabled = true`). Trainer fills `motion_cfg.v_ref_latents`
-        # at start of training when enabled.
-        attach_motion_config(self, args)
-        self.global_step = 0  # trainer updates this each iter; consumed by motion beta warmup
+        self.global_step = 0
 
     def _initialize_models(self, args, device):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")

@@ -1,6 +1,5 @@
 """CPU-only adapter dispatch + OFT registration tests. No GPU / Wan / FSDP /
-14B teacher. Self-running like tests/test_motion_hooks.py since the env
-ships without pytest.
+14B teacher. Self-running since the env ships without pytest.
 """
 from __future__ import annotations
 
