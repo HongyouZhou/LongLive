@@ -33,7 +33,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch
-import torch.distributed as dist
 from torchvision.io import write_video
 
 from wan.configs.wan_t2v_14B import t2v_14B
@@ -59,13 +58,19 @@ def parse_args():
 
 
 def init_distributed():
+    """Each rank is fully independent in our data-parallel design — we only
+    use torchrun env vars (LOCAL_RANK / WORLD_SIZE / RANK) to shard work and
+    pick a GPU. We deliberately do NOT call dist.init_process_group: Wan's
+    upstream WanT2V.generate() is built for collaborative (USP / sequence
+    parallel) sampling where only rank 0 VAE-decodes and returns the video;
+    non-zero ranks return None. Bypass that by passing rank=0 to every
+    WanT2V instance (see main()) and skipping NCCL altogether.
+    """
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         rank = int(os.environ.get("RANK", str(local_rank)))
         torch.cuda.set_device(local_rank)
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
         return local_rank, rank, world_size
     torch.cuda.set_device(0)
     return 0, 0, 1
@@ -96,19 +101,17 @@ def main():
         print(f"[rank0] groups={sorted({r['group'] for r in records})}")
 
     out_root = Path(args.output_dir)
-    if is_main:
-        for r in records:
-            (out_root / r["group"]).mkdir(parents=True, exist_ok=True)
-    if world_size > 1:
-        dist.barrier()
+    for r in records:
+        (out_root / r["group"]).mkdir(parents=True, exist_ok=True)
 
     if is_main:
         print(f"[rank0] loading Wan2.1-T2V-14B from {args.ckpt_dir}")
+    # rank=0 is intentional on every process — see init_distributed() docstring.
     pipe = WanT2V(
         config=t2v_14B,
         checkpoint_dir=args.ckpt_dir,
         device_id=local_rank,
-        rank=rank,
+        rank=0,
         t5_fsdp=False,
         dit_fsdp=False,
         use_usp=False,
@@ -154,10 +157,8 @@ def main():
             manifest_f.flush()
             print(f"[rank{rank}] [{i+1}/{len(my_jobs)}] {group}/{idx:02d} seed={seed} ({dt:.1f}s)")
 
-    if world_size > 1:
-        dist.barrier()
     if is_main:
-        print(f"[rank0] all ranks done. manifests at {out_root}/manifest_rank*.jsonl")
+        print(f"[rank0] this rank done. manifests at {out_root}/manifest_rank*.jsonl")
 
 
 if __name__ == "__main__":
