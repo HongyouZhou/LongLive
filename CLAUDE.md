@@ -118,25 +118,25 @@ Submit via templates under `scripts/hpc/`:
 
 Wan2.1-T2V-14B teacher needs ≥80GB GPU + ≥240GB CPU peak (8 ranks × 30GB). Default sbatch requests `--mem=900G` and excludes 40GB DGX A100s. Pin GPU type via `--gres=gpu:nvidia_h200:8` etc. on the sbatch CLI.
 
+**Always submit via `source scripts/hpc/submit.sh <sbatch_script> [args...]`** — not bare `sbatch ...`. The wrapper captures the job id into `$JID` (export'd into your shell), prints the resolved log path, and auto-resolves bare script names against `scripts/hpc/`. Bare `sbatch` works but loses `$JID`, which is what every downstream tool (`gpus`, `scancel`, `tail logs/...`) keys off.
+
 Submit / monitor examples:
 ```bash
 # core training
-sbatch scripts/hpc/sbatch_train.sh                                          # default config configs/longlive_train_long.yaml
+source scripts/hpc/submit.sh sbatch_train.sh                                # default config configs/longlive_train_long.yaml
 LL_CONFIG=longlive/methods/oft/configs/cat_dunk_oft_v1.yaml \
-  sbatch scripts/hpc/sbatch_train.sh                                        # OFT-DMD on cat-dunking
+  source scripts/hpc/submit.sh sbatch_train.sh                              # OFT-DMD on cat-dunking
 
 # eval (positional <ckpt> required; resolves abs / $LL_DATA-relative / repo-relative)
-sbatch scripts/hpc/sbatch_vbench.sh longlive_models/models/lora.pt paper_baseline
-LL_VBENCH_LIMIT=8 sbatch scripts/hpc/sbatch_vbench.sh longlive_models/models/lora.pt smoke
+source scripts/hpc/submit.sh sbatch_vbench.sh longlive_models/models/lora.pt paper_baseline
+LL_VBENCH_LIMIT=8 source scripts/hpc/submit.sh sbatch_vbench.sh longlive_models/models/lora.pt smoke
+LL_MOTION_EVAL_LIMIT=8 source scripts/hpc/submit.sh sbatch_motion_eval.sh longlive_models/models/lora.pt smoke
 
-# capture JID into the current shell for follow-up (gpus / scancel / tail):
-source scripts/hpc/submit.sh sbatch_train.sh
-echo $JID
-
-# monitoring
+# monitoring (uses $JID set by submit.sh)
 myq                       # current queue
 jid && gpus               # latest job's GPU usage on its compute node
 wgpus -n 5                # live GPU watch every 5 s
+tail -f logs/<job-name>-$JID.out
 ```
 
 `fetch_data.sh` and `setup_mamba_env.sh` must run on a **login node** — compute nodes lack outbound network for HF Hub / pip wheels.
