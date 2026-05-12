@@ -1,0 +1,155 @@
+# UCF Sports Action motion-customization eval prompts.
+#
+# Source: MotionDirector (arXiv:2310.08465), §A.3 + Fig 5 / 8a / 9 / 10.
+#
+# RECONSTRUCTION SCOPE:
+#   - The paper does NOT release the 72 test prompts as a table; §A.3 only
+#     describes the construction rule ("substitute the subject 'person' with
+#     a non-human / fantastical subject"). One category (Skateboarding) is
+#     fully quoted in Fig 8a + Fig 10, plus scattered verbatim entries:
+#       * "A monkey is playing golf, side view." (§4.1)
+#       * "A person is riding a horse." / "A monkey is riding a horse." (§A.3)
+#       * "A panda is doing exercise on pommel horse." (Fig 9)
+#     Everything else is reconstructed by us via subject-swap PATTERN.
+#
+#   - We use UCF Sports Action's original 10 motion classes WITHOUT splitting
+#     Golf-Swing into 3 views. MotionDirector's public repo
+#     (https://github.com/showlab/MotionDirector) confirms only 4 sport
+#     subfolders in `assets/sports_results/` with a single combined
+#     "playing_golf" LoRA (README line ~312) — i.e. the 12-category split
+#     is an internal-only experimental detail never released. We follow the
+#     released convention: 10 categories × 6 cross-appearance prompts = 60
+#     test prompts.
+#
+#   => Aggregate UCF Sports metrics are an internal baseline (compare to our
+#      own MotionDirector reproduction), NOT a direct comparison to paper
+#      Table 1.
+#
+# Subject-swap pool (6 per category): monkey, bear, panda, lion, alien, robot
+#   - "alien" prompts may include an "on Mars" setting swap, matching the
+#     paper's occasional setting variation (Fig 5).
+#   - "A man ... on the moon" appears in the verbatim Skateboarding row;
+#     we preserve it for skateboarding only.
+
+subject_swap_pool:
+  - monkey
+  - bear
+  - panda
+  - lion
+  - alien
+  - robot
+
+categories:
+
+  Diving:
+    paper_verbatim: false
+    train_caption: "A person is diving."
+    inference_prompts:
+      - "A monkey is diving."
+      - "A bear is diving."
+      - "A panda is diving."
+      - "A lion is diving."
+      - "An alien is diving on Mars."
+      - "A robot is diving."
+
+  Golf-Swing:
+    paper_verbatim: false   # "A monkey is playing golf, side view." is verbatim §4.1 but
+                            # we drop the ", side view" qualifier (collapsed-views convention).
+    train_caption: "A person is playing golf."
+    inference_prompts:
+      - "A monkey is playing golf."
+      - "A bear is playing golf."
+      - "A panda is playing golf."
+      - "A lion is playing golf."
+      - "An alien is playing golf."
+      - "A robot is playing golf."
+
+  Kicking:
+    paper_verbatim: false
+    train_caption: "A person is kicking a ball."
+    inference_prompts:
+      - "A monkey is kicking a ball."
+      - "A bear is kicking a ball."
+      - "A panda is kicking a ball."
+      - "A lion is kicking a ball."
+      - "An alien is kicking a ball on Mars."
+      - "A robot is kicking a ball."
+
+  Lifting:
+    paper_verbatim: false
+    train_caption: "A person is lifting weights."
+    inference_prompts:
+      - "A monkey is lifting weights."
+      - "A bear is lifting weights."
+      - "A panda is lifting weights."
+      - "A lion is lifting weights."
+      - "An alien is lifting weights."
+      - "A robot is lifting weights."
+
+  Riding-Horse:
+    paper_verbatim: partial  # train + monkey are quoted §A.3
+    train_caption: "A person is riding a horse."
+    inference_prompts:
+      - "A monkey is riding a horse."
+      - "A bear is riding a horse."
+      - "A panda is riding a horse."
+      - "A lion is riding a horse."
+      - "An alien is riding a horse on Mars."
+      - "A robot is riding a horse."
+
+  Run-Side:
+    paper_verbatim: false
+    train_caption: "A person is running."
+    inference_prompts:
+      - "A monkey is running."
+      - "A bear is running."
+      - "A panda is running."
+      - "A lion is running."
+      - "An alien is running on Mars."
+      - "A robot is running."
+
+  Skateboarding:
+    paper_verbatim: true   # all 7 strings verbatim from Fig 8a + Fig 10
+    train_caption: "A person is skateboarding."
+    inference_prompts:
+      - "A man is skateboarding on the moon."
+      - "An alien is skateboarding on Mars."
+      - "A bear is skateboarding."
+      - "A monkey is skateboarding."
+      - "A lion is skateboarding."
+      - "A panda is skateboarding."
+
+  Swing-Bench:
+    # UCF class "Swing-Bench" = pommel-horse gymnastics exercise (cf. Fig 9).
+    paper_verbatim: partial  # "A panda is doing exercise on pommel horse." is verbatim Fig 9
+    train_caption: "A person is doing exercise on pommel horse."
+    inference_prompts:
+      - "A panda is doing exercise on pommel horse."
+      - "A monkey is doing exercise on pommel horse."
+      - "A bear is doing exercise on pommel horse."
+      - "A lion is doing exercise on pommel horse."
+      - "An alien is doing exercise on pommel horse."
+      - "A robot is doing exercise on pommel horse."
+
+  Swing-SideAngle:
+    # UCF class "Swing-SideAngle" = swinging on bars / parallel bars, side view.
+    paper_verbatim: false
+    train_caption: "A person is swinging on bars."
+    inference_prompts:
+      - "A monkey is swinging on bars."
+      - "A bear is swinging on bars."
+      - "A panda is swinging on bars."
+      - "A lion is swinging on bars."
+      - "An alien is swinging on bars."
+      - "A robot is swinging on bars."
+
+  Walk-Front:
+    paper_verbatim: false
+    train_caption: "A person is walking."
+    inference_prompts:
+      - "A monkey is walking."
+      - "A bear is walking."
+      - "A panda is walking."
+      - "A lion is walking."
+      - "An alien is walking on Mars."
+      - "A robot is walking."
