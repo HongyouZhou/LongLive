@@ -230,7 +230,15 @@ def _ucf_filter_and_layout(
     raw_root: Path, out_videos: Path, manifest_csv: Path,
     min_h: int, min_w: int, min_frames: int,
 ) -> None:
-    """Walk raw_root, apply size+length filter, write normalized mp4s + manifest."""
+    """Walk raw_root, apply size+length filter, write normalized mp4s + manifest.
+
+    Handles both common UCF Sports archive layouts by walking each top-level
+    category recursively (the categories — Diving, Golf-Swing-{Front,Back,Side},
+    etc. — are always at depth-1 from raw_root). For each category we collect
+    every .avi/.mp4/.mov file at any depth and infer clip_id from the closest
+    parent directory above the file (or the file stem if the file sits flat
+    at the category root).
+    """
     if manifest_csv.exists():
         print(f"[ucf] manifest already present at {manifest_csv}, skipping filter")
         return
@@ -239,24 +247,39 @@ def _ucf_filter_and_layout(
     rows = []
     seen_categories = set()
 
-    # UCF Sports layout: <raw_root>/<Category>/<clip_dir>/<clip>.avi
-    # Some clips are stored as frame folders without an .avi; skip those.
-    for cat_dir in sorted(raw_root.iterdir()):
+    top_entries = sorted(raw_root.iterdir())
+    n_dirs = sum(1 for e in top_entries if e.is_dir())
+    print(f"[ucf] walking {raw_root} ({len(top_entries)} top-level entries, "
+          f"{n_dirs} dirs)")
+    for e in top_entries[:20]:
+        kind = "dir" if e.is_dir() else "file"
+        print(f"[ucf]   {kind}: {e.name}")
+
+    VID_EXTS = (".avi", ".mp4", ".mov")
+    for cat_dir in top_entries:
         if not cat_dir.is_dir():
             continue
-        for clip_dir in sorted(cat_dir.iterdir()):
-            if not clip_dir.is_dir():
-                continue
-            # Find the .avi (or .mp4) file in this clip directory.
-            video_files = sorted(
-                p for p in clip_dir.iterdir()
-                if p.suffix.lower() in (".avi", ".mp4", ".mov")
-            )
-            if not video_files:
-                continue
-            src = video_files[0]
-            raw_category = cat_dir.name
-            raw_clip_id = clip_dir.name
+        raw_category = cat_dir.name
+        video_files: list[Path] = []
+        for root, _dirs, files in os.walk(cat_dir):
+            for fname in files:
+                if fname.lower().endswith(VID_EXTS):
+                    video_files.append(Path(root) / fname)
+        if not video_files:
+            print(f"[ucf]   {raw_category}: 0 video files (skipping)")
+            continue
+        print(f"[ucf]   {raw_category}: {len(video_files)} candidate video file(s)")
+
+        for src in sorted(video_files):
+            # clip_id = closest non-trivial parent dir name, else file stem.
+            # Layouts seen in the wild:
+            #   <cat>/<clip_num>/<file>.avi      -> clip_id = <clip_num>
+            #   <cat>/<file>.avi                 -> clip_id = file stem
+            if src.parent == cat_dir:
+                raw_clip_id = src.stem
+            else:
+                raw_clip_id = src.parent.name
+
             category, clip_id = _normalize_ucf_category(raw_category, raw_clip_id)
             seen_categories.add(category)
 
@@ -265,10 +288,13 @@ def _ucf_filter_and_layout(
                 continue
             h, w, n = probe
             if h < min_h or w < min_w or n < min_frames:
-                print(f"[ucf] drop {raw_category}/{raw_clip_id} ({w}x{h}, {n} frames)")
+                print(f"[ucf]   drop {raw_category}/{raw_clip_id} ({w}x{h}, {n} frames)")
                 continue
 
             dst = out_videos / category / f"{clip_id}.mp4"
+            if dst.exists():
+                # Same logical clip seen via a sibling .avi/.mov (rare); skip.
+                continue
             if not _ffmpeg_normalize(src, dst):
                 continue
             rows.append({
@@ -280,7 +306,6 @@ def _ucf_filter_and_layout(
                 "n_frames": n,
             })
 
-    # Sort for deterministic manifest.
     rows.sort(key=lambda r: (r["category"], r["clip_id"]))
 
     with open(manifest_csv, "w", newline="") as f:
@@ -291,6 +316,19 @@ def _ucf_filter_and_layout(
         writer.writerows(rows)
     print(f"[ucf] wrote {manifest_csv} with {len(rows)} clips "
           f"across {len(seen_categories)} categories")
+
+    if len(rows) == 0:
+        # Don't silently succeed — caller's cleanup would delete _raw/ and
+        # destroy our ability to debug. Raise so the exception path keeps
+        # _raw/ around for inspection.
+        manifest_csv.unlink(missing_ok=True)  # don't leave a 0-row stub
+        raise RuntimeError(
+            f"UCF filter produced 0 clips from {raw_root}. Check the "
+            "[ucf] debug log above (top-level dirs, per-category video "
+            "counts) and the actual zip layout. _raw/ has been preserved "
+            f"at {raw_root.parent} — `ls -R {raw_root.parent}/_raw | head -50` "
+            "to inspect."
+        )
 
 
 def _loveu_download(raw_dir: Path) -> Path:
