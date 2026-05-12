@@ -89,11 +89,46 @@ def _ucf_download(raw_dir: Path) -> Path:
 
     raw_dir.mkdir(parents=True, exist_ok=True)
     print(f"[ucf] downloading {UCF_URL} -> {zip_path} (~1.66 GiB)")
-    subprocess.run(
-        ["curl", "-L", "--fail", "-o", str(zip_path), UCF_URL],
-        check=True,
+
+    # Some clusters (Charite HPC observed 2026-05-12) have stale system
+    # CA bundles or TLS-intercepting proxies that fail to verify the
+    # crcv.ucf.edu cert. Try in order:
+    #   1. system CA  (curl default) — works on most machines
+    #   2. certifi's bundle           — fresh CAs shipped with Python
+    #   3. --insecure                 — last resort for known public URL
+    attempts = [
+        ("system CA", []),
+    ]
+    try:
+        import certifi  # type: ignore
+        attempts.append(("certifi CA", ["--cacert", certifi.where()]))
+    except ImportError:
+        pass
+    attempts.append(("insecure (TLS verify skipped)", ["--insecure"]))
+
+    last_err: Optional[subprocess.CalledProcessError] = None
+    for label, extra in attempts:
+        if last_err is not None:
+            print(f"[ucf] retry with {label}")
+        try:
+            subprocess.run(
+                ["curl", "-L", "--fail", *extra, "-o", str(zip_path), UCF_URL],
+                check=True,
+            )
+            return zip_path
+        except subprocess.CalledProcessError as e:
+            # curl exit 60 = SSL cert problem. Retry. Other errors = fail fast.
+            if e.returncode != 60:
+                raise
+            last_err = e
+            if zip_path.exists():
+                zip_path.unlink()
+    # All attempts failed.
+    raise RuntimeError(
+        f"curl failed for {UCF_URL} after {len(attempts)} attempts; "
+        f"last exit {last_err.returncode if last_err else '?'}. "
+        "Check HPC network / proxy."
     )
-    return zip_path
 
 
 def _ucf_extract(zip_path: Path, raw_dir: Path) -> Path:
