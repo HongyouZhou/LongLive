@@ -95,12 +95,33 @@ def _build_ucf_rows(data_root: Path) -> list[dict]:
     return rows
 
 
-# LOVEU's CSV has 5 prompt columns. The 4 "edit" columns are the test
-# prompts; "Caption" describes the source video and is normally not used
-# as a generation target.
-LOVEU_EDIT_COLUMNS = ["Style Change", "Object Change", "Background Change", "Multiple Changes"]
+# LOVEU's official CSV columns (2026-05-12 confirmed against HPC's prompts.csv):
+#   Video name, Our GT caption, Style Change Caption, Object Change Caption,
+#   Background Change Caption, Multiple Changes Caption, Source
+# The CSV also interleaves section-header rows (e.g. "DAVIS Videos:,,,,,,")
+# and blank separator rows between DAVIS / Youtube / Videvo sub-groups.
+# Filter those out by requiring a non-empty video name AND at least one
+# non-empty prompt column.
+LOVEU_EDIT_COLUMNS = [
+    "Style Change Caption",
+    "Object Change Caption",
+    "Background Change Caption",
+    "Multiple Changes Caption",
+]
 LOVEU_VIDEO_COLUMN = "Video name"
-LOVEU_CAPTION_COLUMN = "Caption"
+LOVEU_CAPTION_COLUMN = "Our GT caption"
+
+
+def _is_loveu_data_row(r: dict) -> bool:
+    """True iff this CSV row is real per-video data (not header / separator)."""
+    name = (r.get(LOVEU_VIDEO_COLUMN) or "").strip()
+    if not name:
+        return False
+    # Section headers look like "DAVIS Videos:" / "Youtube Videos:" / "Videvo Videos:".
+    if name.endswith(":"):
+        return False
+    # Must have at least one of the four edit prompts populated.
+    return any((r.get(c) or "").strip() for c in LOVEU_EDIT_COLUMNS)
 
 
 def _build_loveu_rows(data_root: Path, include_caption: bool) -> list[dict]:
@@ -116,8 +137,10 @@ def _build_loveu_rows(data_root: Path, include_caption: bool) -> list[dict]:
     with open(prompts_csv, newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
+            if not _is_loveu_data_row(r):
+                continue
             video_id = r[LOVEU_VIDEO_COLUMN].strip()
-            # Match a video file by stem (LOVEU mp4s typically named <video_id>.mp4).
+            # Match a video file by stem (LOVEU mp4s are named <video_id>.mp4).
             candidates = list(videos_dir.glob(f"{video_id}.*"))
             if not candidates:
                 print(
