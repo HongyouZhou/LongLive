@@ -82,20 +82,21 @@ Reads `$LL_DATA` (= `~/dev/data/wm` on lab). Downloads UCF Sports
 (`gdown`, ~500 MB). The original zips are removed after layout
 unless ``--keep_zip`` is set.
 
-**On HPC** (use the wrapper — auto-detects HPC, defaults to rsync from lab):
+**On HPC** (use the wrapper):
 
 ```bash
 bash scripts/hpc/fetch_motion_eval.sh
 ```
 
-The wrapper activates the longlive env, sets `LL_DATA = $PROJECT_DATA/wm`,
-and rsyncs the already-prepared `ucf_sports/` and `loveu_tgve/` directories
-from `hongyou@lab` (the canonical HPC ← lab data pattern). No HF mirror
-exists for either dataset, and compute nodes have no outbound network, so
-rsync from lab is the only viable HPC path. Login-node only.
+Login-node only — compute nodes lack outbound network. The wrapper
+activates the longlive env, sets `LL_DATA = $PROJECT_DATA/wm`, and
+calls `prepare_motion_eval.py` in direct-download mode (curl for UCF,
+gdown for LOVEU). HPC ↔ lab has no direct SSH path so we don't rsync;
+direct download via login-node internet is the canonical HPC path.
 
 Override defaults via env vars (see header of `fetch_motion_eval.sh`):
-- `LL_REMOTE_HOST=""` force direct download even on HPC (rarely useful)
+- `LL_REMOTE_HOST=<user@host>` opt-in rsync from a reachable peer
+  (only useful if you've set up a side-channel)
 - `LL_MOTION_EVAL_DATASETS=loveu` subset
 
 ### 2. Run eval end-to-end

@@ -1,17 +1,16 @@
 #!/bin/bash
 # Stage UCF Sports Action + LOVEU-TGVE 2023 eval data INTO $LL_DATA on HPC.
 #
-# Pattern mirrors scripts/hpc/fetch_data.sh:
-#   - Login node only (compute nodes lack outbound network)
-#   - Default = rsync from lab (no HF mirror exists for either dataset)
-#   - Fallback = direct download (curl + gdown). Useful on lab itself.
+# Default = direct download (curl + gdown), since HPC ↔ lab has no direct
+# SSH channel (confirmed 2026-05-12) and neither dataset has an HF Hub
+# mirror. Run on a *login* node — compute nodes lack outbound network.
 #
 # Usage:
 #   bash scripts/hpc/fetch_motion_eval.sh
 #
 # Env-var overrides:
-#   LL_REMOTE_HOST=hongyou@lab        rsync from lab (default on HPC)
-#   LL_REMOTE_HOST=""                 force direct download mode
+#   LL_REMOTE_HOST=<user@host>        opt-in rsync from a reachable peer
+#                                     (not auto-set; default = direct DL)
 #   LL_MOTION_EVAL_DATASETS=ucf,loveu subset (default both)
 #   LL_DATA=<path>                    override data root
 #   LL_ENV_NAME=longlive              mamba env name
@@ -24,13 +23,9 @@ set -euo pipefail
 : "${LL_DATA:=$PROJECT_DATA/wm}"
 : "${LL_MOTION_EVAL_DATASETS:=ucf,loveu}"
 
-# On HPC, default LL_REMOTE_HOST=hongyou@lab (no HF mirror, no GDrive on HPC).
-# On lab itself, leave LL_REMOTE_HOST unset for direct download.
-# Detect HPC by presence of /sc-projects (Charite sc-projects cluster).
-if [ -z "${LL_REMOTE_HOST:-}" ] && [ -d "/sc-projects" ]; then
-    : "${LL_REMOTE_HOST:=hongyou@lab}"
-    echo "[motion_eval] detected HPC; defaulting LL_REMOTE_HOST=$LL_REMOTE_HOST"
-fi
+# LL_REMOTE_HOST is opt-in only. We don't auto-default to "hongyou@lab"
+# because HPC ↔ lab has no direct SSH path. If the user sets it manually,
+# we respect that (escape hatch for a side-channel they've configured).
 
 if [ ! -f "$LL_REPO/scripts/prepare_motion_eval.py" ]; then
     echo "[motion_eval][error] LL_REPO=$LL_REPO doesn't look like the LongLive repo" >&2
