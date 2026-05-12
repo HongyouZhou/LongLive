@@ -58,17 +58,64 @@ class CLIPMetrics:
         self._pick_proc = AutoProcessor.from_pretrained(PICK_PROCESSOR)
         self._pick = AutoModel.from_pretrained(PICK_MODEL).to(self.device, dtype=self.dtype).eval()
 
+    # ------ transformers v4 / v5 compat shims ------
+    @staticmethod
+    def _embed_image(model, **inputs) -> torch.Tensor:
+        """Return the projected CLIP image embedding as a tensor.
+
+        transformers ≤4.x: ``model.get_image_features(...)`` already returns
+            the projected tensor.
+        transformers 5.x:  returns a ``BaseModelOutputWithPooling`` from the
+            vision sub-model; we apply ``model.visual_projection`` to its
+            ``pooler_output`` ourselves.
+        """
+        out = model.get_image_features(**inputs)
+        if isinstance(out, torch.Tensor):
+            return out
+        pooled = getattr(out, "pooler_output", None)
+        if pooled is None:
+            pooled = getattr(out, "last_hidden_state")[:, 0, :]
+        if hasattr(model, "visual_projection"):
+            return model.visual_projection(pooled)
+        return pooled
+
+    @staticmethod
+    def _embed_text(model, **inputs) -> torch.Tensor:
+        out = model.get_text_features(**inputs)
+        if isinstance(out, torch.Tensor):
+            return out
+        pooled = getattr(out, "pooler_output", None)
+        if pooled is None:
+            pooled = getattr(out, "last_hidden_state")[:, 0, :]
+        if hasattr(model, "text_projection"):
+            return model.text_projection(pooled)
+        return pooled
+
     # ------ metrics ------
     @torch.no_grad()
     def clip_score_text(self, frames: list, prompt: str) -> float:
-        """LOVEU's ``clip_score_text``: mean per-frame CLIP image-text logit."""
+        """LOVEU's ``clip_score_text``: mean per-frame CLIP image-text logit.
+
+        Manual logit construction: ``logit_scale.exp() * image_emb @ text_emb.T``.
+        This avoids reading ``logits_per_image`` off the full ``model(**inputs)``
+        return value, which transformers v5 changed the shape of in some
+        configurations.
+        """
         self._ensure_clip()
-        inputs = self._clip_proc(text=[prompt], images=frames, return_tensors="pt", padding=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        # Cast image pixel values to model dtype; keep input_ids as int.
-        if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
-        logits = self._clip(**inputs).logits_per_image.detach().cpu().float().numpy()
+        img_in = self._clip_proc(images=frames, return_tensors="pt")
+        txt_in = self._clip_proc(text=[prompt], return_tensors="pt",
+                                 padding=True, truncation=True, max_length=77)
+        img_in = {k: v.to(self.device) for k, v in img_in.items()}
+        txt_in = {k: v.to(self.device) for k, v in txt_in.items()}
+        if "pixel_values" in img_in:
+            img_in["pixel_values"] = img_in["pixel_values"].to(self.dtype)
+
+        ie = self._embed_image(self._clip, **img_in)
+        te = self._embed_text(self._clip, **txt_in)
+        ie = ie / (ie.norm(dim=-1, keepdim=True) + 1e-12)
+        te = te / (te.norm(dim=-1, keepdim=True) + 1e-12)
+        scale = self._clip.logit_scale.exp()
+        logits = (scale * (ie @ te.T)).detach().cpu().float().numpy()  # (N_frames, 1)
         return float(logits.mean())
 
     @torch.no_grad()
@@ -79,7 +126,7 @@ class CLIPMetrics:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         if "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
-        feats = self._clip.get_image_features(**inputs).detach().cpu().float().numpy()
+        feats = self._embed_image(self._clip, **inputs).detach().cpu().float().numpy()
         # Pairwise cosine = (X / ||X||) @ (X / ||X||).T after L2-normalising rows.
         norms = np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12
         unit = feats / norms
@@ -105,10 +152,10 @@ class CLIPMetrics:
         if "pixel_values" in img_in:
             img_in["pixel_values"] = img_in["pixel_values"].to(self.dtype)
 
-        ie = self._pick.get_image_features(**img_in)
-        ie = ie / ie.norm(dim=-1, keepdim=True)
-        te = self._pick.get_text_features(**txt_in)
-        te = te / te.norm(dim=-1, keepdim=True)
+        ie = self._embed_image(self._pick, **img_in)
+        ie = ie / (ie.norm(dim=-1, keepdim=True) + 1e-12)
+        te = self._embed_text(self._pick, **txt_in)
+        te = te / (te.norm(dim=-1, keepdim=True) + 1e-12)
         scale = self._pick.logit_scale.exp()
         s = (scale * (te @ ie.T)[0]).detach().cpu().float().numpy()
         return float(s.mean())
