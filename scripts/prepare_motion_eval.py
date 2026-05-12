@@ -352,11 +352,13 @@ def _ucf_filter_and_layout(
                 continue
 
             dst = out_videos / category / f"{clip_id}.mp4"
-            if dst.exists():
-                # Same logical clip seen via a sibling .avi/.mov (rare); skip.
-                continue
-            if not _ffmpeg_normalize(src, dst):
-                continue
+            # If dst already exists (prior successful run), skip the ffmpeg
+            # remux but still register the row — otherwise re-running with
+            # a missing manifest would produce a manifest covering only the
+            # *new* clips added by relaxed filter thresholds.
+            if not dst.exists():
+                if not _ffmpeg_normalize(src, dst):
+                    continue
             rows.append({
                 "category": category,
                 "clip_id": clip_id,
