@@ -142,25 +142,64 @@ def main():
             input_ids=inputs["input_ids"],
             attention_mask=inputs.get("attention_mask"),
         )
-        ie_proj = model.visual_projection(vision_out[1])
-        te_proj = model.text_projection(text_out[1])
-        ie_proj_norm = ie_proj / ie_proj.norm(p=2, dim=-1, keepdim=True)
-        te_proj_norm = te_proj / te_proj.norm(p=2, dim=-1, keepdim=True)
-        gif_norm = gif / gif.norm(p=2, dim=-1, keepdim=True)
-        gtf_norm = gtf / gtf.norm(p=2, dim=-1, keepdim=True)
 
-    print(f"  (A) out.image_embeds[0, :5]                  : "
-          f"{[round(x, 4) for x in out_off.image_embeds[0, :5].tolist()]}")
-    print(f"  (B) norm(get_image_features)[0, :5]          : "
-          f"{[round(x, 4) for x in gif_norm[0, :5].tolist()]}")
-    print(f"  (C) norm(visual_projection(vision_model))[0,5]: "
-          f"{[round(x, 4) for x in ie_proj_norm[0, :5].tolist()]}")
-    diff_AB_ie = (out_off.image_embeds - gif_norm).abs().max().item()
-    diff_AC_ie = (out_off.image_embeds - ie_proj_norm).abs().max().item()
-    diff_AB_te = (out_off.text_embeds - gtf_norm).abs().max().item()
-    diff_AC_te = (out_off.text_embeds - te_proj_norm).abs().max().item()
-    print(f"  image: |A - B| max = {diff_AB_ie:.4e}   |A - C| max = {diff_AC_ie:.4e}")
-    print(f"  text : |A - B| max = {diff_AB_te:.4e}   |A - C| max = {diff_AC_te:.4e}")
+    def _describe(x, label):
+        print(f"  {label}: type={type(x).__name__}")
+        if isinstance(x, torch.Tensor):
+            print(f"          shape={tuple(x.shape)}  dtype={x.dtype}")
+            return
+        attrs = [a for a in dir(x) if not a.startswith("_") and not callable(getattr(x, a, None))]
+        for a in attrs:
+            v = getattr(x, a, None)
+            if isinstance(v, torch.Tensor):
+                print(f"          .{a}: shape={tuple(v.shape)}  dtype={v.dtype}")
+            elif v is not None:
+                print(f"          .{a}: {type(v).__name__}")
+
+    _describe(gif, "(gif)  model.get_image_features(...) returns")
+    _describe(gtf, "(gtf)  model.get_text_features(...) returns")
+    print()
+
+    def _candidate_tensors(obj):
+        """Yield (name, tensor) for every Tensor-valued slot of obj."""
+        if isinstance(obj, torch.Tensor):
+            yield ("<self>", obj)
+            return
+        for a in dir(obj):
+            if a.startswith("_"):
+                continue
+            v = getattr(obj, a, None)
+            if isinstance(v, torch.Tensor):
+                yield (a, v)
+
+    A_ie = out_off.image_embeds
+    A_te = out_off.text_embeds
+    ie_proj = model.visual_projection(vision_out[1])
+    te_proj = model.text_projection(text_out[1])
+    C_ie = ie_proj / ie_proj.norm(p=2, dim=-1, keepdim=True)
+    C_te = te_proj / te_proj.norm(p=2, dim=-1, keepdim=True)
+
+    print("  per-candidate |normalized - out.image_embeds| max:")
+    for name, t in _candidate_tensors(gif):
+        if t.shape != A_ie.shape:
+            print(f"    gif.{name:<25s} shape={tuple(t.shape)}  SKIP (shape mismatch)")
+            continue
+        tn = t / (t.norm(p=2, dim=-1, keepdim=True) + 1e-12)
+        d = (tn - A_ie).abs().max().item()
+        print(f"    gif.{name:<25s} delta_A = {d:.4e}")
+    d_AC = (C_ie - A_ie).abs().max().item()
+    print(f"    (C) visual_proj(vision)/norm  delta_A = {d_AC:.4e}")
+
+    print("  per-candidate |normalized - out.text_embeds | max:")
+    for name, t in _candidate_tensors(gtf):
+        if t.shape != A_te.shape:
+            print(f"    gtf.{name:<25s} shape={tuple(t.shape)}  SKIP (shape mismatch)")
+            continue
+        tn = t / (t.norm(p=2, dim=-1, keepdim=True) + 1e-12)
+        d = (tn - A_te).abs().max().item()
+        print(f"    gtf.{name:<25s} delta_A = {d:.4e}")
+    d_AC_te = (C_te - A_te).abs().max().item()
+    print(f"    (C) text_proj(text)/norm      delta_A = {d_AC_te:.4e}")
     print()
 
     # -------- Variant: manual embed code + COMBINED processor call --------
