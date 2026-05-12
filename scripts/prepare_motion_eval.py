@@ -132,7 +132,13 @@ def _ucf_download(raw_dir: Path) -> Path:
 
 
 def _ucf_extract(zip_path: Path, raw_dir: Path) -> Path:
-    """Unzip into raw_dir/ucf_action_sports/<Category>/<clip>/..."""
+    """Unzip and descend through single-child wrappers to find the
+    directory whose children are the per-category folders.
+
+    Observed layouts in the wild:
+      ucf_sports_actions/<Category>/<clip>/<file>.avi
+      ucf_sports_actions/ucf action/<Category>/<clip>/<file>.avi   (HPC zip)
+    """
     marker = raw_dir / ".extracted"
     if marker.exists():
         print(f"[ucf] already extracted (marker {marker})")
@@ -142,20 +148,43 @@ def _ucf_extract(zip_path: Path, raw_dir: Path) -> Path:
             zf.extractall(raw_dir)
         marker.touch()
 
-    # Locate the top-level directory. Common name is "ucf_action_sports" but
-    # be defensive — pick the only subdirectory if there's exactly one.
-    candidates = [p for p in raw_dir.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    def _subdirs(d: Path) -> list[Path]:
+        return [p for p in d.iterdir() if p.is_dir() and not p.name.startswith(".")]
+
+    candidates = _subdirs(raw_dir)
     if len(candidates) == 0:
         raise RuntimeError(f"No directory found in {raw_dir} after extraction")
     if len(candidates) == 1:
-        return candidates[0]
-    for name in ("ucf_action_sports", "ucf_sports_actions"):
-        for c in candidates:
-            if c.name == name:
-                return c
-    raise RuntimeError(
-        f"Multiple dirs in {raw_dir} after extract, none named expected: {[c.name for c in candidates]}"
-    )
+        tree_root = candidates[0]
+    else:
+        named = next((c for c in candidates
+                      if c.name in ("ucf_action_sports", "ucf_sports_actions")), None)
+        if named is None:
+            raise RuntimeError(
+                f"Multiple dirs in {raw_dir}, none named expected: "
+                f"{[c.name for c in candidates]}"
+            )
+        tree_root = named
+
+    # Descend through any remaining single-child wrappers (e.g. the
+    # "ucf action" intermediate dir in the official UCF Sports zip).
+    # Stops when we reach a directory whose children are either multiple
+    # subdirectories (the per-category folders we want) or contain video
+    # files directly.
+    VID_EXTS = (".avi", ".mp4", ".mov")
+    for _ in range(4):
+        children = _subdirs(tree_root)
+        has_video = any(
+            f.suffix.lower() in VID_EXTS
+            for f in tree_root.iterdir() if f.is_file()
+        )
+        if len(children) <= 1 and not has_video and children:
+            tree_root = children[0]
+            continue
+        break
+
+    print(f"[ucf] tree_root = {tree_root}")
+    return tree_root
 
 
 def _probe_video(path: Path):
@@ -407,8 +436,12 @@ def main():
                     help="Data root (default reads $LL_DATA env var)")
     ap.add_argument("--datasets", type=str, default="ucf,loveu",
                     help="Comma-separated subset of {ucf, loveu}")
-    ap.add_argument("--min_h", type=int, default=720)
-    ap.add_argument("--min_w", type=int, default=480)
+    # UCF Sports clips are mostly 720×* (NTSC/PAL broadcast; widths 720, heights
+    # 360/404/480/488/576 depending on aspect). We keep anything ≥640×360 (drops
+    # genuinely low-res 480×360 sub-class only), short of MotionDirector's
+    # unreleased exact filter list. Override per-run if needed.
+    ap.add_argument("--min_w", type=int, default=640)
+    ap.add_argument("--min_h", type=int, default=360)
     ap.add_argument("--min_frames", type=int, default=16)
     ap.add_argument("--keep_zip", action="store_true",
                     help="Keep downloaded zip and unzipped _raw/ after layout")
