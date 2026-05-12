@@ -116,6 +116,53 @@ def main():
           f"{manual_logits.max().item():.4f}")
     print()
 
+    # -------- Deep: get_image_features vs forward()'s internal image_embeds --------
+    # The diag confirmed (2026-05-12) that combined-call alone doesn't fix
+    # the divergence, so the bug isn't processor invocation — it must be in
+    # ``model.get_image_features`` / ``get_text_features`` themselves (which
+    # ``_embed_image`` / ``_embed_text`` call). Compare each level:
+    #   (A) forward()'s ``out.image_embeds`` — the ground-truth used to
+    #       compute logits_per_image.
+    #   (B) ``model.get_image_features`` + manual L2 norm — what ``_embed_*``
+    #       returns + what manual code normalizes.
+    #   (C) ``vision_model`` + ``visual_projection`` + L2 norm — bypass
+    #       ``get_image_features`` and mirror forward()'s internal recipe.
+    # If (A) == (C) ≠ (B), ``get_image_features`` is broken in transformers
+    # v5 and we should rewrite ``_embed_*`` to use the (C) path.
+    print("== Deep: get_image_features vs forward()'s internal image_embeds ==")
+    with torch.no_grad():
+        out_off = model(**inputs)
+        gif = model.get_image_features(pixel_values=inputs["pixel_values"])
+        gtf = model.get_text_features(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+        )
+        vision_out = model.vision_model(pixel_values=inputs["pixel_values"])
+        text_out = model.text_model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+        )
+        ie_proj = model.visual_projection(vision_out[1])
+        te_proj = model.text_projection(text_out[1])
+        ie_proj_norm = ie_proj / ie_proj.norm(p=2, dim=-1, keepdim=True)
+        te_proj_norm = te_proj / te_proj.norm(p=2, dim=-1, keepdim=True)
+        gif_norm = gif / gif.norm(p=2, dim=-1, keepdim=True)
+        gtf_norm = gtf / gtf.norm(p=2, dim=-1, keepdim=True)
+
+    print(f"  (A) out.image_embeds[0, :5]                  : "
+          f"{[round(x, 4) for x in out_off.image_embeds[0, :5].tolist()]}")
+    print(f"  (B) norm(get_image_features)[0, :5]          : "
+          f"{[round(x, 4) for x in gif_norm[0, :5].tolist()]}")
+    print(f"  (C) norm(visual_projection(vision_model))[0,5]: "
+          f"{[round(x, 4) for x in ie_proj_norm[0, :5].tolist()]}")
+    diff_AB_ie = (out_off.image_embeds - gif_norm).abs().max().item()
+    diff_AC_ie = (out_off.image_embeds - ie_proj_norm).abs().max().item()
+    diff_AB_te = (out_off.text_embeds - gtf_norm).abs().max().item()
+    diff_AC_te = (out_off.text_embeds - te_proj_norm).abs().max().item()
+    print(f"  image: |A - B| max = {diff_AB_ie:.4e}   |A - C| max = {diff_AC_ie:.4e}")
+    print(f"  text : |A - B| max = {diff_AB_te:.4e}   |A - C| max = {diff_AC_te:.4e}")
+    print()
+
     # -------- Variant: manual embed code + COMBINED processor call --------
     # Isolates the split-call vs combined-call hypothesis. If this variant
     # matches official, the bug is in how the split images-only / text-only
