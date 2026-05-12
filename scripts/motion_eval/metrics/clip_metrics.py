@@ -58,50 +58,41 @@ class CLIPMetrics:
         self._pick_proc = AutoProcessor.from_pretrained(PICK_PROCESSOR)
         self._pick = AutoModel.from_pretrained(PICK_MODEL).to(self.device, dtype=self.dtype).eval()
 
-    # ------ transformers v4 / v5 compat shims ------
+    # ------ embed helpers (un-normalized projected features) ------
     @staticmethod
     def _embed_image(model, **inputs) -> torch.Tensor:
-        """Return the projected CLIP image embedding as a tensor.
+        """Projected image embedding (un-normalized).
 
-        transformers ≤4.x: ``model.get_image_features(...)`` returns the
-            projected tensor directly.
-        transformers 5.x:  returns a ``BaseModelOutputWithPooling``. In
-            v5.6.2 the ``pooler_output`` slot is already the projected
-            embedding (dim == projection_dim, NOT hidden_dim), so we must
-            NOT apply ``visual_projection`` on top. Use ``image_embeds``
-            if present; else use ``pooler_output`` as-is when its last
-            dim matches the projection output dim; only project when the
-            tensor still has hidden_dim shape.
+        Mirrors ``CLIPModel.forward``'s internal ``image_embeds`` recipe
+        verbatim::
+
+            vision_out = model.vision_model(pixel_values=...)
+            image_embeds = model.visual_projection(vision_out.pooler_output)
+
+        Goes around ``model.get_image_features`` because in transformers
+        5.x its return type changed to ``BaseModelOutputWithPooling``
+        whose ``pooler_output`` is the projected feature (shape
+        ``projection_dim``, NOT ``hidden_dim``). diag_clip.py traced
+        2026-05-12: even though the slot's L2-normalized value matches
+        ``out.image_embeds`` (delta < 1e-7), going through
+        ``get_image_features`` somewhere else in the fallback chain
+        produced cosines 5× too small (0.04 vs 0.23 paper-typical).
+        Calling ``vision_model + visual_projection`` directly removes
+        all ambiguity.
         """
-        out = model.get_image_features(**inputs)
-        if isinstance(out, torch.Tensor):
-            return out
-        embeds = getattr(out, "image_embeds", None)
-        if embeds is not None:
-            return embeds
-        pooled = getattr(out, "pooler_output", None)
-        if pooled is None:
-            pooled = getattr(out, "last_hidden_state")[:, 0, :]
-        proj = getattr(model, "visual_projection", None)
-        if proj is not None and pooled.shape[-1] == proj.in_features:
-            return proj(pooled)
-        return pooled
+        pixel_values = inputs["pixel_values"]
+        vision_out = model.vision_model(pixel_values=pixel_values)
+        pooled = vision_out[1]  # pooler_output (raw, hidden_dim)
+        return model.visual_projection(pooled)
 
     @staticmethod
     def _embed_text(model, **inputs) -> torch.Tensor:
-        out = model.get_text_features(**inputs)
-        if isinstance(out, torch.Tensor):
-            return out
-        embeds = getattr(out, "text_embeds", None)
-        if embeds is not None:
-            return embeds
-        pooled = getattr(out, "pooler_output", None)
-        if pooled is None:
-            pooled = getattr(out, "last_hidden_state")[:, 0, :]
-        proj = getattr(model, "text_projection", None)
-        if proj is not None and pooled.shape[-1] == proj.in_features:
-            return proj(pooled)
-        return pooled
+        """Projected text embedding (un-normalized). Same rationale as
+        ``_embed_image``: bypasses ``get_text_features`` in favor of
+        ``text_model + text_projection`` directly."""
+        text_out = model.text_model(**inputs)
+        pooled = text_out[1]  # pooler_output (raw, hidden_dim)
+        return model.text_projection(pooled)
 
     # ------ metrics ------
     @torch.no_grad()
