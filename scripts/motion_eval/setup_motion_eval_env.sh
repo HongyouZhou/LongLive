@@ -17,6 +17,16 @@ echo "[motion_eval/setup] activating $LL_ENV_NAME"
 eval "$(conda shell.bash hook)"
 conda activate "$LL_ENV_NAME"
 
+# ffmpeg / ffprobe — used by prepare_motion_eval.py to remux UCF .avi
+# clips to .mp4. HPC nodes typically have no system ffmpeg, so install
+# it into the env (conda-forge build, ~50 MB). Idempotent.
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "[motion_eval/setup] installing ffmpeg from conda-forge"
+    mamba install -y -n "$LL_ENV_NAME" -c conda-forge ffmpeg
+else
+    echo "[motion_eval/setup] ffmpeg already on PATH ($(command -v ffmpeg))"
+fi
+
 # Core eval deps the longlive env doesn't ship.
 # - decord: fast video decoding (faster than torchvision for batch reads)
 # - Pillow: required by transformers' CLIPProcessor
@@ -45,10 +55,10 @@ else
     pip install "git+https://github.com/facebookresearch/co-tracker.git@main"
 fi
 
-# Smoke import check
-echo "[motion_eval/setup] verifying imports..."
+# Smoke import + ffmpeg check
+echo "[motion_eval/setup] verifying imports + ffmpeg..."
 python - <<'PY'
-import importlib, sys
+import importlib, sys, shutil
 problems = []
 for name in ("PIL", "decord", "cotracker", "transformers", "torch", "yaml", "gdown"):
     try:
@@ -58,6 +68,12 @@ for name in ("PIL", "decord", "cotracker", "transformers", "torch", "yaml", "gdo
     except Exception as e:
         problems.append(name)
         print(f"  MISSING  {name}: {e}")
+ff = shutil.which("ffmpeg")
+if ff:
+    print(f"  OK  ffmpeg         {ff}")
+else:
+    problems.append("ffmpeg")
+    print("  MISSING  ffmpeg (not on PATH)")
 if problems:
     sys.exit(f"missing: {problems}")
 PY

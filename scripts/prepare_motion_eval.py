@@ -220,10 +220,31 @@ def _probe_video(path: Path):
 
 
 def _normalize_ucf_category(raw_category: str, clip_id: str) -> tuple[str, str]:
-    """Collapse Golf-Swing-{Front,Back,Side} -> Golf-Swing with view-prefixed clip ID."""
+    """Collapse UCF Sports archive's 13 view-split directories into the 10
+    canonical base categories used by MotionDirector's public release and
+    our prompt YAML. View distinction is preserved as a clip_id prefix to
+    keep IDs unique within a collapsed category.
+
+    Archive (depth-2 under "ucf action/"):
+      Diving-Side, Golf-Swing-{Back,Front,Side}, Kicking-{Front,Side},
+      Lifting, Riding-Horse, Run-Side, SkateBoarding-Front,
+      Swing-Bench, Swing-SideAngle, Walk-Front
+    Canonical (scripts/motion_eval/prompts/ucf_sports.yaml):
+      Diving, Golf-Swing, Kicking, Lifting, Riding-Horse, Run-Side,
+      Skateboarding, Swing-Bench, Swing-SideAngle, Walk-Front
+    """
     if raw_category.startswith("Golf-Swing-"):
         view = raw_category.split("-")[-1].lower()
         return "Golf-Swing", f"{view}_{clip_id}"
+    if raw_category.startswith("Kicking-"):
+        view = raw_category.split("-")[-1].lower()
+        return "Kicking", f"{view}_{clip_id}"
+    if raw_category == "Diving-Side":
+        return "Diving", clip_id
+    if raw_category == "SkateBoarding-Front":
+        return "Skateboarding", clip_id
+    # Run-Side, Walk-Front, Swing-Bench, Swing-SideAngle, Lifting, Riding-Horse
+    # already match the canonical YAML names — pass through.
     return raw_category, clip_id
 
 
