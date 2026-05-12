@@ -120,7 +120,7 @@ class EvalWorker:
             self.pipeline.generator.model = configure_lora_for_model(
                 self.pipeline.generator.model,
                 model_name="generator",
-                lora_config=self.config.adapter,
+                adapter_config=self.config.adapter,
                 is_main_process=True,
             )
             lora_path = getattr(self.config, "lora_ckpt", None)

@@ -114,7 +114,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
     pipeline.generator.model = configure_lora_for_model(
         pipeline.generator.model,
         model_name="generator",
-        lora_config=config.adapter,
+        adapter_config=config.adapter,
         is_main_process=(local_rank == 0),
     )
 
