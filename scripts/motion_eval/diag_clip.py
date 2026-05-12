@@ -116,6 +116,35 @@ def main():
           f"{manual_logits.max().item():.4f}")
     print()
 
+    # -------- Variant: manual embed code + COMBINED processor call --------
+    # Isolates the split-call vs combined-call hypothesis. If this variant
+    # matches official, the bug is in how the split images-only / text-only
+    # CLIPProcessor calls route kwargs in transformers 5.x (not in
+    # _embed_image / _embed_text themselves).
+    inputs_combined = m._clip_proc(
+        text=[args.prompt], images=pil, return_tensors="pt",
+        padding=True, truncation=True, max_length=77,
+    )
+    inputs_combined = {k: v.to(args.device) for k, v in inputs_combined.items()}
+    with torch.no_grad():
+        ie_c = m._embed_image(m._clip, pixel_values=inputs_combined["pixel_values"])
+        te_c = m._embed_text(
+            m._clip,
+            input_ids=inputs_combined["input_ids"],
+            attention_mask=inputs_combined.get("attention_mask"),
+        )
+        ie_c_norm = ie_c / (ie_c.norm(dim=-1, keepdim=True) + 1e-12)
+        te_c_norm = te_c / (te_c.norm(dim=-1, keepdim=True) + 1e-12)
+        cos_c = ie_c_norm @ te_c_norm.T
+        logits_c = m._clip.logit_scale.exp() * cos_c
+
+    print("== Manual embed code + COMBINED processor call (LOVEU style) ==")
+    print(f"   cos mean / min / max: {cos_c.mean().item():.4f} / "
+          f"{cos_c.min().item():.4f} / {cos_c.max().item():.4f}")
+    print(f"   logit mean          : {logits_c.mean().item():.6f}")
+    print(f"   delta vs official   : {abs(logits_c.mean().item() - official_mean):.6f}")
+    print()
+
     # -------- High-level API call (what run_eval.py actually invokes) --------
     api_score = m.clip_score_text(pil, args.prompt)
     print(f"== CLIPMetrics.clip_score_text(pil, prompt)  →  {api_score:.6f}")
@@ -123,13 +152,18 @@ def main():
 
     # -------- Verdict --------
     delta = abs(official_mean - api_score)
-    print(f"[delta] official - api  = {delta:.6f}")
+    print(f"[delta] official vs api  = {delta:.6f}")
     if delta < 1e-3:
         print("[verdict] IDENTICAL → clip_score_text is faithful to LOVEU's official path.")
-        print("          Low app_div values reflect genuine LongLive output↔prompt alignment.")
     else:
-        print("[verdict] DIVERGENT → bug in _embed_image / _embed_text path.")
-        print("          Investigate clip_metrics.py compat shims.")
+        print("[verdict] DIVERGENT → CLIPMetrics.clip_score_text doesn't match LOVEU official.")
+        delta_split = abs(manual_logits.mean().item() - official_mean)
+        delta_combined = abs(logits_c.mean().item() - official_mean)
+        print(f"          split-call manual    delta = {delta_split:.4f}")
+        print(f"          combined-call manual delta = {delta_combined:.4f}")
+        if delta_combined < 1e-3 and delta_split >= 1e-3:
+            print("          ROOT CAUSE confirmed: split processor call.")
+            print("          Use combined processor call in clip_score_text.")
 
 
 if __name__ == "__main__":

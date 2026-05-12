@@ -108,27 +108,26 @@ class CLIPMetrics:
     def clip_score_text(self, frames: list, prompt: str) -> float:
         """LOVEU's ``clip_score_text``: mean per-frame CLIP image-text logit.
 
-        Manual logit construction: ``logit_scale.exp() * image_emb @ text_emb.T``.
-        This avoids reading ``logits_per_image`` off the full ``model(**inputs)``
-        return value, which transformers v5 changed the shape of in some
-        configurations.
+        Mirrors LOVEU-TGVE 2023 ``scripts/run_eval.py`` verbatim — combined
+        processor call + ``model(**inputs).logits_per_image.mean()``. An
+        earlier manual reconstruction (split images-only / text-only
+        processor calls + ``get_image_features``/``get_text_features`` +
+        hand-built ``scale * ie @ te.T``) diverged 5× from this path on
+        transformers 5.x (confirmed 2026-05-12 via diag_clip.py: 4.14 vs
+        official 22.75 on a basketball clip). The split-call path likely
+        triggers different kwarg routing inside CLIPProcessor in v5 that
+        we don't fully model.
         """
         self._ensure_clip()
-        img_in = self._clip_proc(images=frames, return_tensors="pt")
-        txt_in = self._clip_proc(text=[prompt], return_tensors="pt",
-                                 padding=True, truncation=True, max_length=77)
-        img_in = {k: v.to(self.device) for k, v in img_in.items()}
-        txt_in = {k: v.to(self.device) for k, v in txt_in.items()}
-        if "pixel_values" in img_in:
-            img_in["pixel_values"] = img_in["pixel_values"].to(self.dtype)
-
-        ie = self._embed_image(self._clip, **img_in)
-        te = self._embed_text(self._clip, **txt_in)
-        ie = ie / (ie.norm(dim=-1, keepdim=True) + 1e-12)
-        te = te / (te.norm(dim=-1, keepdim=True) + 1e-12)
-        scale = self._clip.logit_scale.exp()
-        logits = (scale * (ie @ te.T)).detach().cpu().float().numpy()  # (N_frames, 1)
-        return float(logits.mean())
+        inputs = self._clip_proc(
+            text=[prompt], images=frames, return_tensors="pt",
+            padding=True, truncation=True, max_length=77,
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
+        out = self._clip(**inputs)
+        return float(out.logits_per_image.detach().cpu().float().mean().item())
 
     @torch.no_grad()
     def clip_score_frame(self, frames: list) -> float:
