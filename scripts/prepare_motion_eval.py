@@ -457,11 +457,13 @@ def main():
                     help="Data root (default reads $LL_DATA env var)")
     ap.add_argument("--datasets", type=str, default="ucf,loveu",
                     help="Comma-separated subset of {ucf, loveu}")
-    # UCF Sports clips are mostly 720×* (NTSC/PAL broadcast; widths 720, heights
-    # 360/404/480/488/576 depending on aspect). We keep anything ≥640×360 (drops
-    # genuinely low-res 480×360 sub-class only), short of MotionDirector's
-    # unreleased exact filter list. Override per-run if needed.
-    ap.add_argument("--min_w", type=int, default=640)
+    # UCF Sports clips are mostly 720×* (broadcast; heights 360/404/480/488/576)
+    # plus a 480×360 sub-class. SkateBoarding-Front is ENTIRELY 480×360, so
+    # dropping it would leave Skateboarding category empty — and that category
+    # is the only one MotionDirector paper-verbatim quotes all 7 prompts for.
+    # min_w=480 keeps every UCF clip; frame-count threshold catches the
+    # short (≤16f) corrupted .avi sub-clips that show up as duplicates.
+    ap.add_argument("--min_w", type=int, default=480)
     ap.add_argument("--min_h", type=int, default=360)
     ap.add_argument("--min_frames", type=int, default=16)
     ap.add_argument("--keep_zip", action="store_true",
