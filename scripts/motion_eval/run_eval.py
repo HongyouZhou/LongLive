@@ -285,7 +285,6 @@ def _maybe_log_to_wandb(args, sums, output, gen_dir, ref_root, common):
             name=run_name,
             config=config,
             job_type="motion_eval",
-            reinit=True,
         )
 
         scalars: dict = {}
