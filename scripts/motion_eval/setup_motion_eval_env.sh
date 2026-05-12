@@ -31,7 +31,11 @@ PIP_PKGS=(
 )
 
 echo "[motion_eval/setup] pip install: ${PIP_PKGS[*]}"
-pip install --upgrade "${PIP_PKGS[@]}"
+# No --upgrade: respect existing versions. HPC longlive ships pillow 11.3.0
+# which is fine; --upgrade would push it to 12.x and surface a spurious
+# moviepy<12.0 metadata warning. moviepy 2.1.2 is runtime-compatible with
+# pillow 12 anyway but the cleaner state is "don't churn what works".
+pip install "${PIP_PKGS[@]}"
 
 # CoTracker3 — install from upstream repo. Skip if already importable.
 if python -c "import cotracker" 2>/dev/null; then
