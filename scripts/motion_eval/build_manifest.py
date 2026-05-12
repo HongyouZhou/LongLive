@@ -49,12 +49,24 @@ def _prompt_id(dataset: str, key_str: str, prompt: str) -> str:
 
 
 def _load_ucf_video_manifest(manifest_csv: Path) -> dict[str, list[str]]:
-    """Return {category: [relative_video_path, ...]} from prepare_motion_eval.py output."""
+    """Return {category: [$LL_DATA-relative path, ...]} from prepare_motion_eval.py output.
+
+    prepare_motion_eval.py writes ``manifest.csv`` with the ``path`` column
+    relative to ``ucf_sports/`` (e.g. ``videos/Kicking/front_001.mp4``),
+    matching where the CSV itself lives. Downstream the universal manifest
+    requires $LL_DATA-relative paths to stay symmetric with LOVEU
+    (whose ``ref_videos`` already include ``loveu_tgve/``). Prepend the
+    missing ``ucf_sports/`` prefix here so the convention is uniform once
+    the rows reach ``run_eval.py``.
+    """
     by_cat: dict[str, list[str]] = {}
     with open(manifest_csv, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            by_cat.setdefault(row["category"], []).append(row["path"])
+            rel = row["path"]
+            if not rel.startswith("ucf_sports/"):
+                rel = f"ucf_sports/{rel}"
+            by_cat.setdefault(row["category"], []).append(rel)
     for cat in by_cat:
         by_cat[cat].sort()
     return by_cat
