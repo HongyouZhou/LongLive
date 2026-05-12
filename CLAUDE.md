@@ -93,6 +93,7 @@ Pre-set in HPC `~/.bashrc`:
 | `HF_TOKEN`, `WANDB_API_KEY` | exported at login |
 | `myq` / `wmyq` | one-shot / `watch` of own SLURM queue |
 | `compute` | `srun -p compute -c 16 --mem=32G --time=10:00:00 --pty bash` — CPU debug shell |
+| `gpu` | `srun -p pgpu --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=01:00:00 --pty bash` — single-GPU debug shell (diag / smoke). pgpu queue can be long; for CPU-friendly work (`diag_clip.py --device cpu --stride 5`) just use `compute`. |
 | `jid [N|jobid|name]` | pick a job and export `$JID`; bare `jid` lists running jobs |
 | `gpus [-L] [jid]` | run `nvidia-smi` on the job's compute node via `srun --overlap` |
 | `wgpus [-L] [-n SEC] [jid]` | `watch` wrapper around `gpus` |
