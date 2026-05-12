@@ -20,11 +20,14 @@ conda activate "$LL_ENV_NAME"
 # Core eval deps the longlive env doesn't ship.
 # - decord: fast video decoding (faster than torchvision for batch reads)
 # - Pillow: required by transformers' CLIPProcessor
-# - scikit-learn: not strictly needed (we use numpy), kept for any future helper
+# - gdown: needed by prepare_motion_eval.py on lab for the LOVEU-TGVE GDrive
+#   download. Not used on HPC (rsync-from-lab path), installed here anyway
+#   so lab/HPC envs stay symmetric.
 # - cotracker: Yatim's motion-fidelity metric. Repo install (no PyPI package).
 PIP_PKGS=(
     "Pillow"
     "decord"
+    "gdown"
 )
 
 echo "[motion_eval/setup] pip install: ${PIP_PKGS[*]}"
