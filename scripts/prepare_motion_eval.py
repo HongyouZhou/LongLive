@@ -240,8 +240,18 @@ def _ucf_filter_and_layout(
     at the category root).
     """
     if manifest_csv.exists():
-        print(f"[ucf] manifest already present at {manifest_csv}, skipping filter")
-        return
+        # Count rows. A 0-row stub from a prior failed run must not
+        # short-circuit — otherwise we lose the chance to re-filter even
+        # after fixing the walker.
+        with open(manifest_csv) as f:
+            n_existing = sum(1 for _ in csv.DictReader(f))
+        if n_existing > 0:
+            print(f"[ucf] manifest already present at {manifest_csv} "
+                  f"({n_existing} clips), skipping filter")
+            return
+        print(f"[ucf] manifest at {manifest_csv} is empty (stale); "
+              "re-running filter")
+        manifest_csv.unlink()
 
     out_videos.mkdir(parents=True, exist_ok=True)
     rows = []

@@ -77,6 +77,12 @@ EXTRA_ARGS=()
 if [ -n "${LL_REMOTE_HOST:-}" ]; then
     EXTRA_ARGS+=(--remote_host "$LL_REMOTE_HOST")
 fi
+# LL_MOTION_EVAL_KEEP_ZIP=1 preserves the downloaded zips + extracted _raw/
+# trees after layout. Useful during a debug iteration so a filter retry
+# doesn't trigger a 1.66 GiB re-download.
+if [ "${LL_MOTION_EVAL_KEEP_ZIP:-0}" = "1" ]; then
+    EXTRA_ARGS+=(--keep_zip)
+fi
 
 python scripts/prepare_motion_eval.py \
     --data_root "$LL_DATA" \
