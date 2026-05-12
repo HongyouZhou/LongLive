@@ -1,0 +1,45 @@
+# MotionDirector teacher-finetune config — UCF Skateboarding, first version.
+# Path B Phase 2 (docs/04.md): train a LoRA on top of frozen Wan-14B teacher
+# using paper L_temporal_MSE + L_AD (alpha=sqrt(2), beta=1), in epsilon space
+# via B1 close-form reverse `eps_pred = flow_pred + pred_x0`. Output ckpt
+# becomes real_score adapter for Phase 3 DMD distillation.
+
+# data
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81           # Wan-14B native
+resolution: 480           # Wan-14B native (480x480 center crop)
+
+# teacher model
+teacher_name: Wan2.1-T2V-14B
+timestep_shift: 8.0       # Wan-14B default
+
+# adapter (LoRA on real_score)
+adapter:
+  type: lora
+  rank: 64                # motion-only finetune; smaller than student LoRA (256)
+  alpha: 64               # scaling = alpha / rank = 1.0
+  dropout: 0.0            # Wan-14B already large
+  verbose: true
+
+# training
+train_steps: 500
+lr: 5.0e-5                # paper is 5e-4 on UNet3D 384^2; Wan-14B much larger -> drop one decade
+weight_decay: 0.0
+warmup_steps: 50
+null_prompt_p: 0.1        # null-prompt dropout (covers DMD uncond CFG branch)
+t_min: 20                 # uniform t sampling lower bound (matches DMD min_step)
+t_max: 980                # upper bound (matches DMD max_step)
+
+# loss
+ad_alpha: 1.4142135623730951   # sqrt(2), per paper
+ad_beta: 1.0
+
+# logging / ckpt
+out_dir: ${oc.env:LL_DATA}/motiondirector_runs/skateboarding_v1
+ckpt_interval: 100
+ckpt_keep_last: 5
+
+# misc
+seed: 0
+device: cuda

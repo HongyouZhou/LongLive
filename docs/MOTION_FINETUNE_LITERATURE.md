@@ -33,7 +33,7 @@
 | Tag | 论文 | 角色 | 会议/年份 | 链接 | 创新点 (2-3 句) |
 |---|---|---|---|---|---|
 | ★ | **FastVMT** | 1st | ICLR 2026, arXiv 2602.05551 | [project](https://fastvmt.github.io/) | 识别 DiT motion transfer 中两类冗余:motion redundancy(用 local attention masking 削)+ gradient redundancy(跨 diffusion step 复用 + skip)。**training-free 3.43× 加速**,正面回应"motion finetune 怎么变快"问题。 |
-| ★ | **Follow-Your-Motion** | 1st | arXiv 2506.05207 | [arXiv](https://arxiv.org/abs/2506.05207) | Spatial-temporal decoupled LoRA(在 3D attention 中拆 spatial appearance vs temporal motion)+ sparse motion sampling + adaptive RoPE 加速。引入 MotionBench 评测。**架构上最贴近我们 motion-LoRA v1 的工作**。 |
+| ★ | **Follow-Your-Motion** | 1st | arXiv 2506.05207 | [arXiv](https://arxiv.org/abs/2506.05207) | Spatial-temporal decoupled LoRA(在 3D attention 中拆 spatial appearance vs temporal motion)+ sparse motion sampling + adaptive RoPE 加速。引入 MotionBench 评测。**架构上最贴近我们 v1 路线的工作**。 |
 | ✦ | **Follow-Your-Pose** | 1st | AAAI 2024, arXiv 2304.01186 | [project](https://follow-your-pose.github.io/) | 两阶段训练利用 pose-free videos,把骨架 motion transfer 到 T2V。Follow-Your-* 系列起点。 |
 | | **Follow-Your-Click** | 1st | AAAI 2025, arXiv 2403.08268 | [project](https://follow-your-click.github.io/) | 一次点击 + 短 prompt 驱动静态图局部区域动画。one-shot 区域 motion control 的代表。 |
 | | **Follow-Your-Emoji** | 1st | SIGGRAPH Asia 2024 / IJCV 2025, arXiv 2406.01900 | [project](https://follow-your-emoji.github.io/) | 表情 landmark 驱动 freestyle 人像动画,保身份。Pose-driven motion transfer 在人脸的极致版。 |
@@ -74,7 +74,7 @@
 |---|---|---|---|---|---|
 | | **EPD-Solver** | Beier Zhu / Chi Zhang corr. | ICCV 2025, arXiv 2507.14797 | [project](https://epd-solver.github.io/) | 在每个 ODE step 上加并行梯度评估,用蒸馏学这些可学权重,5 NFE 在 CIFAR-10 上 FID 4.47。**"freeze 模型 + 学 sampler 参数"的代表**——和我们"freeze sampler + 蒸馏模型"正好对偶。 |
 | | **AdaSDE** | Ruoyu Wang / Chi Zhang corr. | NeurIPS 2025, arXiv 2510.23285 | [code](https://github.com/Westlake-AGI-Lab/AdaSDE) | 单步 SDE solver,每步一个轻量蒸馏估计的可学 coefficient,融合 ODE 效率与 SDE 误差容忍。可解释 LongLive teacher SDE 与 student ODE 间的 motion gap。 |
-| | **EPD-Solver V2 / RDPO** | Beier Zhu / Chi Zhang corr. | arXiv 2512.22796 | [arXiv](https://arxiv.org/abs/2512.22796) | 用 Residual Dirichlet Policy Optimization(RL)代替纯蒸馏来优化 parallel-gradient 权重。RL-on-sampler 思路与 rCM / Motion-LoRA RL finetune 同源。 |
+| | **EPD-Solver V2 / RDPO** | Beier Zhu / Chi Zhang corr. | arXiv 2512.22796 | [arXiv](https://arxiv.org/abs/2512.22796) | 用 Residual Dirichlet Policy Optimization(RL)代替纯蒸馏来优化 parallel-gradient 权重。RL-on-sampler 思路与 rCM / v1 LoRA RL finetune 同源。 |
 | ★ | **DyWeight** | Tong Zhao / Chi Zhang corr. | arXiv 2603.11607 | [code](https://github.com/Westlake-AGI-Lab/DyWeight) | 学一个动态聚合历史梯度的权重,等价于隐式调整有效步长;NFE=3 在 CIFAR-10 FID 8.16(EPD 10.40,−21.5%),SD/FLUX-dev 上同样有效。**完全不动 model**,可作为 Wan student 上的 sampler 升级,符合 `dmd_architecture_frozen`。 |
 
 > 这条线整体是**"freeze model + learn lightweight solver via distillation/RL"**,与我们 motion-DMD 正交,可叠加使用。
@@ -120,12 +120,12 @@
 
 | Tag | 论文 | 类别 | 会议/年份 | 链接 | 创新点 (2-3 句) |
 |---|---|---|---|---|---|
-| | **DoRA** | generic | ICML 2024 Oral, arXiv 2402.09353 | [arXiv](https://arxiv.org/abs/2402.09353) | 把预训练权重分解为 magnitude × direction,LoRA 只更新 direction。无推理开销,几乎闭合 LoRA–full FT 差距,可作所有 motion-LoRA 的 init drop-in。 |
+| | **DoRA** | generic | ICML 2024 Oral, arXiv 2402.09353 | [arXiv](https://arxiv.org/abs/2402.09353) | 把预训练权重分解为 magnitude × direction,LoRA 只更新 direction。无推理开销,几乎闭合 LoRA–full FT 差距,可作所有 LoRA 的 init drop-in。 |
 | | **AdaLoRA** | generic / structure-aware | ICLR 2023, arXiv 2303.10512 | [arXiv](https://arxiv.org/abs/2303.10512) | 把 LoRA 写成 SVD 形式,根据 importance 修剪不重要的 singular triplet,从而把 rank 预算重新分配到关键 matrix 上。 |
 | | **VeRA** | generic | ICLR 2024, arXiv 2310.11454 | [arXiv](https://arxiv.org/abs/2310.11454) | 所有层共享一对 frozen random A、B,只学每层小 scaling 向量,参数量再降 ~10×。 |
 | | **LoRA-FA** | generic | arXiv 2308.03303 | [arXiv](https://arxiv.org/abs/2308.03303) | 冻 A 只训 B,激活内存 1.4× 下降而精度不降。 |
 | | **LoRA+** | generic | ICML 2024, arXiv 2402.12354 | [arXiv](https://arxiv.org/abs/2402.12354) | 理论证明 A、B 应该使用不同学习率(B 远高于 A),只调 LR 配比就能 1–2% 提升、~2× 收敛加速,零额外算力。 |
-| | **PiSSA** | generic | NeurIPS 2024 Spotlight, arXiv 2404.02948 | [arXiv](https://arxiv.org/abs/2404.02948) | 用 W 的 top SVD 成分初始化 A、B(剩余冻结),收敛更快、终点更优。motion-LoRA 起点的现成升级。 |
+| | **PiSSA** | generic | NeurIPS 2024 Spotlight, arXiv 2404.02948 | [arXiv](https://arxiv.org/abs/2404.02948) | 用 W 的 top SVD 成分初始化 A、B(剩余冻结),收敛更快、终点更优。LoRA 起点的现成升级。 |
 | | **Tied-LoRA** | generic | arXiv 2311.09578 | [arXiv](https://arxiv.org/abs/2311.09578) | 跨层共享 A、B 并选择性训练,以一小部分 LoRA 参数维持相近性能。 |
 | | **HydraLoRA** | generic / MoE-like | NeurIPS 2024 Oral, arXiv 2404.19245 | [arXiv](https://arxiv.org/abs/2404.19245) | 1 个共享 A + 多个任务专属 B 头 + 学习路由,把通用结构与任务特异结构分开。 |
 | | **MoLE (Mixture of LoRA Experts)** | generic / diffusion | ICLR 2024, arXiv 2404.13628 | [arXiv](https://arxiv.org/abs/2404.13628) | 多 LoRA 当 expert,层级 gating 融合,解决"算术合并 LoRA 会掉性能"的问题。 |
@@ -165,7 +165,7 @@
 |---|---|---|---|---|---|
 | ★ | **MotionDirector** | reference-tune | ECCV 2024 Oral | (见 §8/§9) | 双路 LoRA 解耦 appearance/motion + appearance-debiased temporal loss。开源完整,**最贴近用户任务的可复现 baseline**。 |
 | ★ | **VMC** | reference-tune | CVPR 2024, arXiv 2312.00845 | (见 §9) | 用相邻 latent 帧 noise residual 作 motion 信号,只 fine-tune temporal attention。residual-based motion 表达的代表作。 |
-| ★ | **MotionMatcher** | reference-tune | arXiv 2502.13234 | [arXiv](https://arxiv.org/abs/2502.13234) | 不在像素而是在高层 spatio-temporal motion features 上做 matching。**与我们 Motion-LoRA v1 的 attn-output L2 思路同源**——是 MotionDirector 的 feature-level 替代。 |
+| ★ | **MotionMatcher** | reference-tune | arXiv 2502.13234 | [arXiv](https://arxiv.org/abs/2502.13234) | 不在像素而是在高层 spatio-temporal motion features 上做 matching。**与我们 v1 路线 attn-output L2 思路同源**——是 MotionDirector 的 feature-level 替代。 |
 | | **MotionInversion** | reference-tune | SIGGRAPH 2025 | (见 §8) | 把 motion 反演成 1D embedding 注入 temporal self-attention,backbone 完全冻结。 |
 | | **DreamVideo-2** | reference-tune | arXiv 2410.13830 | (见 §8) | Zero-shot subject-driven + bbox 引导 motion control,一次 inference 同时定 subject + motion。 |
 | ★ | **Customize-A-Video** | one-shot / reference-tune | ECCV 2024 | (见 §9) | One-shot 单参考视频学 motion,Appearance Absorber LoRA 解耦外观。 |
@@ -199,7 +199,7 @@
 - 风险:边界要重新确认。
 
 **C. Motion-locus + structural LoRA + 几何/feature loss 升级**(MotionDirector / VMC / MotionMatcher / Geometry Forcing)
-- 共识:motion 住在 temporal attention,LoRA 加那一层 + dual-LoRA 解耦 appearance,我们 motion-LoRA v1 已采用。
+- 共识:motion 住在 temporal attention,LoRA 加那一层 + dual-LoRA 解耦 appearance,我们 v1 路线已采用。
 - 下一步:把 attn-output L2 换成 MotionMatcher 的 feature-level loss,再叠加 Geometry Forcing 的 VGGT REPA loss。
 - 风险:VGGT forward 的显存,可能要 offline 抽特征。
 - **个人最看好,符合所有硬约束(DMD 不动、不加 encoder)**。
@@ -208,4 +208,4 @@
 - 三条不动权重的捷径,zero-shot 出"猫扣篮"。
 - 风险:跟 LongLive 主线偏离,只能作为 baseline 对照,不构成研究故事。
 
-**推荐**:**A**(诊断驱动)+ **C**(loss 升级)的组合,贴在 `dmd_architecture_frozen` 硬约束内,工作量可控,与 motion-LoRA v1 已有进度连贯。
+**推荐**:**A**(诊断驱动)+ **C**(loss 升级)的组合,贴在 `dmd_architecture_frozen` 硬约束内,工作量可控,与 v1 路线进度连贯。
