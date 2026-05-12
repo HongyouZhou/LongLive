@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -113,6 +114,19 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--skip_motion_fidelity", action="store_true",
                     help="Drop the Yatim metric (e.g., for cotracker-less envs)")
+    # wandb logging (independent eval run, project=longlive-motion-eval).
+    # Aggregates 8 scalars + a per-prompt wandb.Table. Disable via --no_wandb
+    # or WANDB_MODE=disabled. wandb.init failure is non-fatal — scores.csv
+    # remains the ground-truth artifact.
+    ap.add_argument("--wandb_project",
+                    default=os.environ.get("WANDB_PROJECT", "longlive-motion-eval"),
+                    help="wandb project name (env WANDB_PROJECT, default longlive-motion-eval)")
+    ap.add_argument("--wandb_run_name", default=None,
+                    help="wandb run name (default = output dir basename)")
+    ap.add_argument("--ckpt_tag", default=None,
+                    help="Ckpt path / identifier to record in wandb config")
+    ap.add_argument("--no_wandb", action="store_true",
+                    help="Skip wandb logging entirely")
     args = ap.parse_args()
 
     prompts_path = Path(args.prompts_manifest)
@@ -233,6 +247,75 @@ def main():
         print("  " + "  ".join(parts))
     print()
     print(f"[eval] wrote {output}")
+
+    _maybe_log_to_wandb(args, sums, output, gen_dir, ref_root, common)
+
+
+def _maybe_log_to_wandb(args, sums, output, gen_dir, ref_root, common):
+    """Log aggregates + per-prompt table to wandb. Non-fatal on failure.
+
+    Scalars land in Charts as ``<dataset>/<metric>_mean``. The full per-prompt
+    table is logged as ``per_prompt`` so outliers can be sorted/filtered in the
+    wandb UI without grepping the CSV.
+    """
+    if args.no_wandb or os.environ.get("WANDB_MODE", "") == "disabled":
+        return
+    try:
+        import wandb
+    except ImportError:
+        print("[eval] wandb not installed; skipping wandb logging", file=sys.stderr)
+        return
+
+    run_name = args.wandb_run_name or output.parent.name
+    config = {
+        "ckpt": args.ckpt_tag or "",
+        "run_dir": str(gen_dir),
+        "ref_root": str(ref_root),
+        "n_prompts_scored": len(common),
+        "skip_motion_fidelity": args.skip_motion_fidelity,
+        "limit": args.limit,
+        "n_frames_mf": args.n_frames_mf,
+        "grid_size_mf": args.grid_size_mf,
+    }
+
+    run = None
+    try:
+        run = wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config=config,
+            job_type="motion_eval",
+            reinit=True,
+        )
+
+        scalars: dict = {}
+        for ds in sorted(sums):
+            scalars[f"{ds}/n"] = len(sums[ds]["app_div"])
+            for k in ("app_div", "temp_consist", "pick_score", "motion_fidelity"):
+                vals = sums[ds][k]
+                if vals:
+                    scalars[f"{ds}/{k}_mean"] = sum(vals) / len(vals)
+        wandb.log(scalars)
+
+        table_cols = [c for c in CSV_COLUMNS if c != "gen_path"]
+        table = wandb.Table(columns=table_cols)
+        with open(output) as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                table.add_data(*[r.get(c, "") for c in table_cols])
+        wandb.log({"per_prompt": table})
+
+        url = getattr(run, "url", None)
+        if url:
+            print(f"[eval] wandb run: {url}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[eval] wandb logging failed: {type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        if run is not None:
+            try:
+                wandb.finish()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":

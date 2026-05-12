@@ -123,6 +123,8 @@ python "$REPO_ROOT/scripts/motion_eval/run_eval.py" \
     --prompts_manifest "$PROMPTS_JSONL" \
     --gen_dir "$RUN_DIR" \
     --ref_root "$LL_DATA" \
-    --output "$SCORES_CSV"
+    --output "$SCORES_CSV" \
+    --wandb_run_name "$RUN_ID" \
+    --ckpt_tag "$CKPT"
 
 echo "[motion_eval] DONE  ->  $SCORES_CSV"
