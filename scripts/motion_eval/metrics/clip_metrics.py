@@ -63,20 +63,28 @@ class CLIPMetrics:
     def _embed_image(model, **inputs) -> torch.Tensor:
         """Return the projected CLIP image embedding as a tensor.
 
-        transformers ≤4.x: ``model.get_image_features(...)`` already returns
-            the projected tensor.
-        transformers 5.x:  returns a ``BaseModelOutputWithPooling`` from the
-            vision sub-model; we apply ``model.visual_projection`` to its
-            ``pooler_output`` ourselves.
+        transformers ≤4.x: ``model.get_image_features(...)`` returns the
+            projected tensor directly.
+        transformers 5.x:  returns a ``BaseModelOutputWithPooling``. In
+            v5.6.2 the ``pooler_output`` slot is already the projected
+            embedding (dim == projection_dim, NOT hidden_dim), so we must
+            NOT apply ``visual_projection`` on top. Use ``image_embeds``
+            if present; else use ``pooler_output`` as-is when its last
+            dim matches the projection output dim; only project when the
+            tensor still has hidden_dim shape.
         """
         out = model.get_image_features(**inputs)
         if isinstance(out, torch.Tensor):
             return out
+        embeds = getattr(out, "image_embeds", None)
+        if embeds is not None:
+            return embeds
         pooled = getattr(out, "pooler_output", None)
         if pooled is None:
             pooled = getattr(out, "last_hidden_state")[:, 0, :]
-        if hasattr(model, "visual_projection"):
-            return model.visual_projection(pooled)
+        proj = getattr(model, "visual_projection", None)
+        if proj is not None and pooled.shape[-1] == proj.in_features:
+            return proj(pooled)
         return pooled
 
     @staticmethod
@@ -84,11 +92,15 @@ class CLIPMetrics:
         out = model.get_text_features(**inputs)
         if isinstance(out, torch.Tensor):
             return out
+        embeds = getattr(out, "text_embeds", None)
+        if embeds is not None:
+            return embeds
         pooled = getattr(out, "pooler_output", None)
         if pooled is None:
             pooled = getattr(out, "last_hidden_state")[:, 0, :]
-        if hasattr(model, "text_projection"):
-            return model.text_projection(pooled)
+        proj = getattr(model, "text_projection", None)
+        if proj is not None and pooled.shape[-1] == proj.in_features:
+            return proj(pooled)
         return pooled
 
     # ------ metrics ------
