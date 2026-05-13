@@ -47,6 +47,10 @@ set -e
 echo "[SLURM] Job ID: $SLURM_JOB_ID"
 echo "[SLURM] Node:   $(hostname)"
 echo "[SLURM] GPU:    ${SLURM_GPUS_ON_NODE:-1}"
+# Print the actual GPU name + memory so we don't have to back-derive from
+# OOM error capacity numbers. Charité's GRES strings have been confirmed
+# ambiguous (asked for h200 / a100-80gb and still got 40 GB).
+echo "[SLURM] GPU info: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'nvidia-smi unavailable')"
 if [ -r /sys/fs/cgroup/memory.max ]; then
     echo "[SLURM] cgroup memory.max: $(cat /sys/fs/cgroup/memory.max)"
 fi

@@ -101,8 +101,42 @@ def main():
     torch.manual_seed(int(cfg.seed))
 
     device = torch.device(cfg.device)
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(device)
+        gpu_total_gib = torch.cuda.get_device_properties(device).total_memory / 1024 ** 3
+        print(f"[motiondirector] device: {gpu_name} ({gpu_total_gib:.1f} GiB total)", flush=True)
 
-    # ---------- Models ----------
+    # ---------- VAE (small) ----------
+    print("[motiondirector] loading VAE ...", flush=True)
+    vae = WanVAEWrapper()
+    vae.to(device).eval()
+
+    # ---------- Data ----------
+    dataset = SkateboardingLatentDataset(
+        data_root=cfg.data_root,
+        vae=vae,
+        frame_count=int(cfg.frame_count),
+        resolution=int(cfg.resolution),
+        category=str(cfg.category),
+        device=device,
+    )
+
+    # ---------- Text encoder: load → encode → free ----------
+    # Pre-cache null + train_caption embeddings, then drop the ~20 GB fp32
+    # umt5 before loading the 28 GB Wan-14B teacher so peak GPU usage stays
+    # well clear of (text_encoder + teacher) ≈ 48 GB. Valid for the
+    # single-caption Phase 2 first version; multi-caption training (paper
+    # Table 1, 12 motions) will need to keep the encoder online instead.
+    print("[motiondirector] loading text encoder (cache embeddings then free) ...", flush=True)
+    text_encoder = WanTextEncoder()
+    text_encoder.to(device).eval()
+    with torch.no_grad():
+        null_cond = {k: v.detach().clone() for k, v in text_encoder([""]).items()}
+        train_cond = {k: v.detach().clone() for k, v in text_encoder([dataset.train_caption]).items()}
+    del text_encoder
+    torch.cuda.empty_cache()
+
+    # ---------- Teacher ----------
     print(f"[motiondirector] loading teacher {cfg.teacher_name} ...", flush=True)
     teacher = WanDiffusionWrapper(
         model_name=cfg.teacher_name,
@@ -120,28 +154,6 @@ def main():
         is_main_process=True,
     )
     teacher.model.train()  # LoRA-only training mode (base frozen by PEFT)
-
-    print("[motiondirector] loading text encoder ...", flush=True)
-    text_encoder = WanTextEncoder()
-    text_encoder.to(device).eval()
-
-    print("[motiondirector] loading VAE ...", flush=True)
-    vae = WanVAEWrapper()
-    vae.to(device).eval()
-
-    # ---------- Data ----------
-    dataset = SkateboardingLatentDataset(
-        data_root=cfg.data_root,
-        vae=vae,
-        frame_count=int(cfg.frame_count),
-        resolution=int(cfg.resolution),
-        category=str(cfg.category),
-        device=device,
-    )
-
-    # Cache null prompt embedding once — text_encoder forward is not cheap.
-    with torch.no_grad():
-        null_cond = {k: v.detach().clone() for k, v in text_encoder([""]).items()}
 
     # ---------- Optimizer ----------
     trainable = [p for p in teacher.model.parameters() if p.requires_grad]
@@ -166,16 +178,12 @@ def main():
     for step in range(int(cfg.train_steps)):
         t0 = time.time()
 
-        latent, prompt_text = dataset.sample()
+        latent, _ = dataset.sample()
         # latent: (1, F, 16, H_l, W_l) bf16 on cuda
 
-        # Text embed with null-prompt dropout.
-        if random.random() < float(cfg.null_prompt_p):
-            cond_dict = {k: v for k, v in null_cond.items()}
-        else:
-            with torch.no_grad():
-                cond_dict = text_encoder([prompt_text])
-                cond_dict = {k: v.detach() for k, v in cond_dict.items()}
+        # Pre-cached cond_dict: null vs train_caption (single-motion Phase 2 —
+        # text encoder was freed at init, no per-step forward).
+        cond_dict = null_cond if random.random() < float(cfg.null_prompt_p) else train_cond
 
         # Add noise (uniform t across frames for non-causal teacher).
         noise = torch.randn_like(latent)
