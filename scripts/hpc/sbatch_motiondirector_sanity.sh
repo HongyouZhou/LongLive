@@ -3,30 +3,34 @@
 #SBATCH --partition=pgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:nvidia_h200:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=900G
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/%x-%j.out
+# Wan-14B does not fit on 40 GB GPUs. Charité's single-GPU GRES type pin
+# (`--gres=gpu:nvidia_h200:1`) has been observed to bind to a 40 GB A100
+# anyway, so go with full-node integer GRES (`gpu:8`) which reliably lands
+# on a 80 GB+ pgpu node (s-sc-pgpu08 H100-80GB, etc.) — same trick as
+# sbatch_motiondirector_train.sh.
 #SBATCH --exclude=s-sc-dgx[01-02]
 #
 # Phase 2 sanity inference: load a teacher LoRA ckpt onto Wan-14B and
-# generate a couple of Skateboarding videos for visual inspection.
-# Confirms ckpt is loadable + the LoRA-augmented model output isn't
-# corrupted before investing in Phase 3 DMD distillation.
+# generate 6 Skateboarding videos (paper verbatim prompts) for visual
+# inspection. Each torchrun rank handles its share of prompts × seeds via
+# the same data-parallel pattern as scripts/local/teacher_boundary.py.
 #
 # Usage (always via submit.sh):
 #
 #   source scripts/hpc/submit.sh sbatch_motiondirector_sanity.sh \\
 #       motiondirector_runs/skateboarding_v1/teacher_lora_final.pt
 #
-# <ckpt> resolution order: absolute path > $LL_DATA-relative > repo-relative.
+# <ckpt> resolution: absolute path > $LL_DATA-relative > repo-relative.
 #
 # Optional env-var overrides:
-#   LL_MD_PROMPTS="prompt 1|prompt 2"    pipe-separated prompt list (default = paper 2-pick)
-#   LL_MD_SEEDS=2                         seeds per prompt (default 1)
-#   LL_MD_OUT_DIR=<path>                  explicit output dir
-#                                         (default $LL_DATA/motiondirector_runs/sanity_<jobid>)
+#   LL_MD_PROMPTS="prompt 1|prompt 2"  pipe-separated prompts (default = paper 6)
+#   LL_MD_SEEDS=2                       seeds per prompt (default 1 → 6 jobs total)
+#   LL_MD_OUT_DIR=<path>                explicit output dir
 
 set -e
 
@@ -39,7 +43,7 @@ CKPT_ARG="$1"
 
 echo "[SLURM] Job ID: $SLURM_JOB_ID"
 echo "[SLURM] Node:   $(hostname)"
-echo "[SLURM] GPU:    ${SLURM_GPUS_ON_NODE:-1}"
+echo "[SLURM] GPUs:   ${SLURM_GPUS_ON_NODE:-8}"
 echo "[SLURM] GPU info: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'nvidia-smi unavailable')"
 
 ##############################
@@ -103,11 +107,17 @@ mkdir -p "$LL_MD_OUT_DIR"
 echo "[SLURM] out_dir:   $LL_MD_OUT_DIR"
 
 ##############################
+# Distributed env
+##############################
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
+GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-8}
+
+##############################
 # Optional CLI overrides
 ##############################
 EXTRA_ARGS=()
 if [ -n "${LL_MD_PROMPTS:-}" ]; then
-    # Split LL_MD_PROMPTS on the literal '|' separator.
     IFS='|' read -ra _prompts <<< "$LL_MD_PROMPTS"
     EXTRA_ARGS+=(--prompts "${_prompts[@]}")
 fi
@@ -118,8 +128,11 @@ fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONNOUSERSITE=1
 
-echo "[SLURM] starting python ..."
-python scripts/local/motiondirector_sanity_inference.py \
+echo "[SLURM] launching torchrun on $GPUS_PER_NODE GPU(s), master=$MASTER_ADDR:$MASTER_PORT"
+torchrun \
+    --nproc_per_node="$GPUS_PER_NODE" \
+    --master_port="$MASTER_PORT" \
+    scripts/local/motiondirector_sanity_inference.py \
     --lora-ckpt "$CKPT" \
     --ckpt-dir "$WAN_MODELS_ROOT/Wan2.1-T2V-14B" \
     --output-dir "$LL_MD_OUT_DIR" \
