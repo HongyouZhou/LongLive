@@ -41,7 +41,12 @@ if [ -n "${LL_PHASE3_EXISTING_TRAIN_JID:-}" ]; then
     TRAIN_JID="$LL_PHASE3_EXISTING_TRAIN_JID"
     echo "[submit_phase3] attaching to existing TRAIN_JID=$TRAIN_JID (skip train submit)"
 else
-    __sp3_train_out="$(LL_CONFIG="$LL_CONFIG" sbatch --parsable "$__sp3_hpc_dir/sbatch_train.sh")" || {
+    # Override sbatch_train.sh's default --job-name=longlive so Phase 3 train
+    # log doesn't collide with Phase 1 baseline / OFT runs visually. Log file
+    # then becomes logs/motiondirector_train-<jobid>.out (per %x-%j.out).
+    __sp3_train_out="$(LL_CONFIG="$LL_CONFIG" sbatch --parsable \
+        --job-name=motiondirector_train \
+        "$__sp3_hpc_dir/sbatch_train.sh")" || {
         echo "[submit_phase3][error] train submit failed" >&2
         unset __sp3_hpc_dir __sp3_train_out
         return 1 2>/dev/null || exit 1
@@ -69,7 +74,14 @@ EVAL_JID="$__sp3_eval_out"
 export EVAL_JID
 echo "[submit_phase3] EVAL_JID=$EVAL_JID (afterok:$TRAIN_JID)"
 
-echo "[submit_phase3] monitor train: tail -f logs/motion_dmd_skateboarding_v1_*-\$TRAIN_JID.out"
+if [ -n "${LL_PHASE3_EXISTING_TRAIN_JID:-}" ]; then
+    # Existing train submitted via plain sbatch_train.sh has --job-name=longlive
+    # (default header); its log file is logs/longlive-<jid>.out, not the
+    # motiondirector_train-<jid>.out the fresh path uses.
+    echo "[submit_phase3] monitor train: tail -f logs/longlive-\$TRAIN_JID.out"
+else
+    echo "[submit_phase3] monitor train: tail -f logs/motiondirector_train-\$TRAIN_JID.out"
+fi
 echo "[submit_phase3] monitor eval:  tail -f logs/motiondirector_eval-\$EVAL_JID.out"
 echo "[submit_phase3] cancel both:   scancel \$TRAIN_JID \$EVAL_JID"
 
