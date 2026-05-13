@@ -84,7 +84,13 @@ class SkateboardingLatentDataset:
         )
 
     def _load_clip_pixels(self, path: Path) -> torch.Tensor:
-        """Returns (1, C, T, H, W) in [-1, 1] bf16 on device."""
+        """Returns (1, C, T, H, W) in [-1, 1] fp32 on device.
+
+        Fp32 to match the Wan VAE encoder dtype (it's loaded in default fp32
+        for numerical stability — bf16 input → conv3d type mismatch with
+        fp32 weight/bias). The latent output is cast to bf16 in `sample()`
+        for training compatibility with the bf16 Wan-14B teacher.
+        """
         import decord  # lazy — only required at training time on HPC, not on orchestration boxes
         vr = decord.VideoReader(str(path), num_threads=1)
         n = len(vr)
@@ -109,14 +115,18 @@ class SkateboardingLatentDataset:
         x0 = (new_w - self.resolution) // 2
         x = x[:, :, y0:y0 + self.resolution, x0:x0 + self.resolution]
 
-        # to (1, 3, T, H, W) in [-1, 1] bf16 on device
+        # to (1, 3, T, H, W) in [-1, 1] fp32 on device
         x = x.permute(1, 0, 2, 3).unsqueeze(0) * 2.0 - 1.0
-        return x.to(self.device, dtype=torch.bfloat16)
+        return x.to(self.device, dtype=torch.float32)
 
     @torch.no_grad()
     def sample(self) -> tuple[torch.Tensor, str]:
-        """Returns (latent (1, F_latent, 16, H/8, W/8), caption)."""
+        """Returns (latent (1, F_latent, 16, H/8, W/8) bf16, caption).
+
+        VAE runs in fp32; latent cast to bf16 here to align with the Wan-14B
+        teacher dtype for `add_noise` / forward.
+        """
         clip_path = random.choice(self.clips)
-        pixels = self._load_clip_pixels(clip_path)  # (1, C, T, H, W)
-        latent = self.vae.encode_to_latent(pixels)
-        return latent, self.train_caption
+        pixels = self._load_clip_pixels(clip_path)  # fp32 (1, C, T, H, W)
+        latent = self.vae.encode_to_latent(pixels)   # fp32 in → fp32 out
+        return latent.to(torch.bfloat16), self.train_caption
