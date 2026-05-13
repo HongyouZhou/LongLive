@@ -7,17 +7,18 @@ B1 close-form reverse from Wan's native (flow_pred, pred_x0) outputs.
 Output: teacher_lora.pt — to be loaded as `real_score` adapter for the
 existing DMD trainer in Phase 3.
 
+Distributed via FSDP + torchrun (8 GPU default, single-rank also supported).
 Usage:
-    python -m longlive.methods.motiondirector.train \\
+
+    torchrun --nproc_per_node=8 -m longlive.methods.motiondirector.train \\
         --config longlive/methods/motiondirector/configs/skateboarding_v1.yaml
 
-    # short smoke (5 steps, no mid sample):
-    python -m longlive.methods.motiondirector.train \\
-        --config longlive/methods/motiondirector/configs/skateboarding_v1.yaml \\
-        --smoke
+    # 5-step smoke:
+    torchrun --nproc_per_node=8 -m longlive.methods.motiondirector.train \\
+        --config ... --smoke
 
-Single-GPU only for first version (docs/04.md §3 K1). Wan-14B + LoRA
-backward at 81 frame x 480^2 needs gradient checkpointing on bf16.
+The sbatch wrapper (scripts/hpc/sbatch_motiondirector_train.sh) handles
+SLURM env + torchrun launch.
 """
 from __future__ import annotations
 
@@ -28,14 +29,17 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from peft import get_peft_model_state_dict
+from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, StateDictType
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from longlive.methods.motiondirector.data import SkateboardingLatentDataset
 from longlive.methods.motiondirector.losses import appearance_debias_loss
+from longlive.utils.distributed import fsdp_wrap, launch_distributed_job
 from longlive.utils.lora_utils import configure_adapter_for_model
 from longlive.utils.wan_wrapper import (
     WanDiffusionWrapper,
@@ -54,14 +58,23 @@ def _linear_warmup_schedule(optimizer, warmup_steps: int) -> LambdaLR:
     return LambdaLR(optimizer, lr_lambda)
 
 
-def _save_lora_ckpt(peft_model, out_dir: Path, tag: str) -> Path:
-    """Save only LoRA params (PEFT extracts them via get_peft_model_state_dict)."""
+def _save_lora_ckpt(fsdp_peft_model, out_dir: Path, tag: str, rank0: bool) -> Path | None:
+    """Gather LoRA state from sharded PEFT model → save on rank 0.
+
+    `FSDP.state_dict_type` is a collective: every rank must enter the context
+    or the all-gather deadlocks. Rank-0 then extracts the LoRA sub-dict via
+    PEFT's helper and writes to disk; non-rank-0 ranks return None.
+    """
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(fsdp_peft_model, StateDictType.FULL_STATE_DICT, save_policy):
+        full = fsdp_peft_model.state_dict()
+    if not rank0:
+        return None
+    lora_state = get_peft_model_state_dict(fsdp_peft_model, state_dict=full)
+    lora_state = {k: v.detach().cpu() for k, v in lora_state.items()}
     out_dir.mkdir(parents=True, exist_ok=True)
-    state = get_peft_model_state_dict(peft_model)
-    # Move to CPU before save to avoid CUDA tensors in the ckpt.
-    state = {k: v.detach().cpu() for k, v in state.items()}
     path = out_dir / f"teacher_lora_{tag}.pt"
-    torch.save(state, path)
+    torch.save(lora_state, path)
     return path
 
 
@@ -85,6 +98,14 @@ def main():
     )
     args = ap.parse_args()
 
+    # ---------- Distributed init (torchrun-managed env) ----------
+    launch_distributed_job(backend="nccl")
+    rank = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
+    rank0 = rank == 0
+
     cfg = OmegaConf.load(args.config)
     OmegaConf.resolve(cfg)
 
@@ -93,21 +114,26 @@ def main():
         cfg.ckpt_interval = 5
         cfg.warmup_steps = 0
 
-    # Print resolved config — per CLAUDE.md "Confirm experiment config before launch".
-    print("[motiondirector] resolved config:")
-    print(OmegaConf.to_yaml(cfg))
-
-    random.seed(int(cfg.seed))
-    torch.manual_seed(int(cfg.seed))
-
-    device = torch.device(cfg.device)
-    if device.type == "cuda":
+    if rank0:
+        print("[motiondirector] resolved config:")
+        print(OmegaConf.to_yaml(cfg))
         gpu_name = torch.cuda.get_device_name(device)
         gpu_total_gib = torch.cuda.get_device_properties(device).total_memory / 1024 ** 3
-        print(f"[motiondirector] device: {gpu_name} ({gpu_total_gib:.1f} GiB total)", flush=True)
+        print(
+            f"[motiondirector] device: {gpu_name} ({gpu_total_gib:.1f} GiB total) "
+            f"× world_size={world_size}",
+            flush=True,
+        )
 
-    # ---------- VAE (small) ----------
-    print("[motiondirector] loading VAE ...", flush=True)
+    # Seed: same across ranks for model init (PEFT LoRA must initialize
+    # identically before FSDP wrap). Re-seeded per-rank after setup for data
+    # sampling variety (different clip / noise / timestep per rank).
+    torch.manual_seed(int(cfg.seed))
+    random.seed(int(cfg.seed))
+
+    # ---------- VAE (small, per rank) ----------
+    if rank0:
+        print("[motiondirector] loading VAE ...", flush=True)
     vae = WanVAEWrapper()
     vae.to(device).eval()
 
@@ -123,11 +149,12 @@ def main():
 
     # ---------- Text encoder: load → encode → free ----------
     # Pre-cache null + train_caption embeddings, then drop the ~20 GB fp32
-    # umt5 before loading the 28 GB Wan-14B teacher so peak GPU usage stays
-    # well clear of (text_encoder + teacher) ≈ 48 GB. Valid for the
-    # single-caption Phase 2 first version; multi-caption training (paper
-    # Table 1, 12 motions) will need to keep the encoder online instead.
-    print("[motiondirector] loading text encoder (cache embeddings then free) ...", flush=True)
+    # umt5 before loading the 28 GB Wan-14B teacher so peak GPU per rank
+    # stays well clear of (text_encoder + teacher). Valid for the single-
+    # caption Phase 2 first version; multi-caption training (paper Table 1,
+    # 12 motions) will need to keep the encoder online instead.
+    if rank0:
+        print("[motiondirector] loading text encoder (cache embeddings then free) ...", flush=True)
     text_encoder = WanTextEncoder()
     text_encoder.to(device).eval()
     with torch.no_grad():
@@ -137,28 +164,50 @@ def main():
     torch.cuda.empty_cache()
 
     # ---------- Teacher ----------
-    print(f"[motiondirector] loading teacher {cfg.teacher_name} ...", flush=True)
+    if rank0:
+        print(f"[motiondirector] loading teacher {cfg.teacher_name} ...", flush=True)
     teacher = WanDiffusionWrapper(
         model_name=cfg.teacher_name,
         timestep_shift=float(cfg.timestep_shift),
         is_causal=False,
     )
-    teacher.to(device)
-    # Enable gradient checkpointing on the base Wan model BEFORE PEFT wrap;
-    # the flag persists on the underlying nn.Module after wrapping.
+    # Move base weights to GPU before PEFT wrap; gradient checkpointing flag
+    # is set on the underlying nn.Module and persists across PEFT / FSDP.
     teacher.enable_gradient_checkpointing()
     teacher.model = configure_adapter_for_model(
         teacher.model,
         model_name="real_score",
         adapter_config=cfg.adapter,
-        is_main_process=True,
+        is_main_process=rank0,
+    )
+
+    # ---------- FSDP wrap ----------
+    # Shards the 14B teacher across ranks; LoRA params (~300 M) also sharded.
+    # mixed_precision=True → bf16 compute, fp32 grad reduce + fp32 buffers.
+    # `use_orig_params=True` (set inside fsdp_wrap) is required for PEFT.
+    teacher.model = fsdp_wrap(
+        teacher.model,
+        sharding_strategy="full",
+        mixed_precision=True,
+        wrap_strategy="size",
     )
     teacher.model.train()  # LoRA-only training mode (base frozen by PEFT)
 
+    # Re-seed per rank for data-sampling variety after model init is done.
+    random.seed(int(cfg.seed) + rank)
+    torch.manual_seed(int(cfg.seed) + rank)
+
     # ---------- Optimizer ----------
     trainable = [p for p in teacher.model.parameters() if p.requires_grad]
-    n_trainable = sum(p.numel() for p in trainable)
-    print(f"[motiondirector] trainable params: {n_trainable:,}", flush=True)
+    n_trainable_local = sum(p.numel() for p in trainable)
+    n_trainable_global = torch.tensor(n_trainable_local, device=device)
+    dist.all_reduce(n_trainable_global)
+    if rank0:
+        print(
+            f"[motiondirector] trainable params (FSDP-sharded total across "
+            f"{world_size} ranks): {int(n_trainable_global.item()):,}",
+            flush=True,
+        )
 
     optimizer = AdamW(
         trainable,
@@ -168,12 +217,19 @@ def main():
     lr_sched = _linear_warmup_schedule(optimizer, int(cfg.warmup_steps))
 
     out_dir = Path(cfg.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if rank0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    dist.barrier()  # wait for rank-0 to create dir before any rank tries to write
 
     sched = teacher.scheduler  # FlowMatchScheduler (already set_timesteps in wrapper init)
 
     # ---------- Training loop ----------
-    print(f"[motiondirector] starting training, {cfg.train_steps} steps", flush=True)
+    if rank0:
+        print(
+            f"[motiondirector] starting training, {cfg.train_steps} steps "
+            f"× effective batch {world_size} (1 clip / rank / step)",
+            flush=True,
+        )
 
     for step in range(int(cfg.train_steps)):
         t0 = time.time()
@@ -221,7 +277,7 @@ def main():
         lr_sched.step()
 
         dt = time.time() - t0
-        if step % 10 == 0 or step == int(cfg.train_steps) - 1:
+        if rank0 and (step % 10 == 0 or step == int(cfg.train_steps) - 1):
             cur_lr = lr_sched.get_last_lr()[0]
             print(
                 f"[motiondirector] step {step:4d}/{cfg.train_steps}  "
@@ -237,12 +293,17 @@ def main():
             and (step + 1) % int(cfg.ckpt_interval) == 0
             and (step + 1) < int(cfg.train_steps)
         ):
-            ckpt_path = _save_lora_ckpt(teacher.model, out_dir, str(step + 1))
-            _prune_old_ckpts(out_dir, int(cfg.ckpt_keep_last))
-            print(f"[motiondirector] saved ckpt: {ckpt_path}", flush=True)
+            ckpt_path = _save_lora_ckpt(teacher.model, out_dir, str(step + 1), rank0)
+            if rank0:
+                _prune_old_ckpts(out_dir, int(cfg.ckpt_keep_last))
+                print(f"[motiondirector] saved ckpt: {ckpt_path}", flush=True)
 
-    final_path = _save_lora_ckpt(teacher.model, out_dir, "final")
-    print(f"[motiondirector] DONE. final ckpt: {final_path}", flush=True)
+    final_path = _save_lora_ckpt(teacher.model, out_dir, "final", rank0)
+    if rank0:
+        print(f"[motiondirector] DONE. final ckpt: {final_path}", flush=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

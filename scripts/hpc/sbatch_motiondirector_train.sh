@@ -3,28 +3,21 @@
 #SBATCH --partition=pgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:nvidia_h200:1
-#SBATCH --cpus-per-task=8
-# Wan-14B teacher load peaks ~50 GB CPU (28 GB bf16 weights + ~20 GB fp32 umt5
-# text encoder), then drops once .to(device) runs. 256 GB gives comfortable
-# headroom and avoids cgroup memory-pressure NFS stalls (sbatch_train.sh §11
-# postmortem).
-#SBATCH --mem=256G
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
+# 8 ranks × Wan-14B ≈ 8 × 28 GB CPU peak during loading = ~240 GB. 900 GB gives
+# generous headroom and avoids cgroup memory-pressure NFS stalls (sbatch_train.sh
+# §11 postmortem).
+#SBATCH --mem=900G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/%x-%j.out
-# GPU sizing — Wan-14B + umt5 fp32 + LoRA + activations needs ~70 GB GPU peak.
-# 40 GB A100s (DGX s-sc-dgx01/02 + other A100-40GB nodes) cannot fit it;
-# even with --exclude they may still bind via plain `--gres=gpu:1`. So pin the
-# GRES type. Default = H200 (141 GB Hopper, fastest, generous headroom).
-# CLI override examples when H200 queue is too long:
-#   sbatch --gres=gpu:nvidia_a100-sxm4:1   scripts/hpc/sbatch_motiondirector_train.sh   # 80 GB A100
-#   sbatch --gres=gpu:nvidia_h100_80gb:1   scripts/hpc/sbatch_motiondirector_train.sh   # only on s-sc-pgpu08
+# 40 GB A100s can't fit even with FSDP at this batch size.
 #SBATCH --exclude=s-sc-dgx[01-02]
 #
-# Phase 2 (docs/04.md) — MotionDirector teacher-finetune on Wan-14B.
-# Trains a LoRA on top of frozen Wan-14B teacher (single-GPU, K1) using
-# paper L_temporal_MSE + L_AD recipe in epsilon space via B1 close-form
-# reverse. Output ckpt is consumed by Phase 3 DMD as `real_score` adapter.
+# Phase 2 (docs/04.md) — MotionDirector teacher-finetune on Wan-14B via FSDP.
+#
+# Default = 8 GPU on a single pgpu node (any type, scheduler-friendlier than
+# single-GPU jobs which sit in queue while full-node jobs go through).
 #
 # Usage (always via submit.sh wrapper — captures $JID):
 #
@@ -37,19 +30,18 @@
 #   # 5-step smoke instead of full 500:
 #   LL_MD_SMOKE=1 source scripts/hpc/submit.sh sbatch_motiondirector_train.sh
 #
-# Pin GPU type via the sbatch CLI when queue allows (Wan-14B fits comfortably
-# on H200 80 GB; tight on A100 80 GB):
-#   sbatch --gres=gpu:nvidia_h200:1        scripts/hpc/sbatch_motiondirector_train.sh
-#   sbatch --gres=gpu:nvidia_a100-sxm4:1   scripts/hpc/sbatch_motiondirector_train.sh
+# Pin GPU type via sbatch CLI when queue allows:
+#   sbatch --gres=gpu:nvidia_h200:8        scripts/hpc/sbatch_motiondirector_train.sh
+#   sbatch --gres=gpu:nvidia_a100-sxm4:8   scripts/hpc/sbatch_motiondirector_train.sh
 
 set -e
 
 echo "[SLURM] Job ID: $SLURM_JOB_ID"
 echo "[SLURM] Node:   $(hostname)"
-echo "[SLURM] GPU:    ${SLURM_GPUS_ON_NODE:-1}"
+echo "[SLURM] GPUs:   ${SLURM_GPUS_ON_NODE:-8}"
 # Print the actual GPU name + memory so we don't have to back-derive from
 # OOM error capacity numbers. Charité's GRES strings have been confirmed
-# ambiguous (asked for h200 / a100-80gb and still got 40 GB).
+# ambiguous (asked for h200 and still got 40 GB A100).
 echo "[SLURM] GPU info: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'nvidia-smi unavailable')"
 if [ -r /sys/fs/cgroup/memory.max ]; then
     echo "[SLURM] cgroup memory.max: $(cat /sys/fs/cgroup/memory.max)"
@@ -88,14 +80,25 @@ export LL_DATA
 export WAN_MODELS_ROOT="$LL_DATA/wan_models"
 export HF_HOME="$LL_DATA/hf_cache"
 export TRANSFORMERS_CACHE="$LL_DATA/hf_cache"
-# WANDB_API_KEY + HF_TOKEN come from ~/.bashrc (not used by Phase 2 v1, but exported for consistency)
 export WANDB_DIR="$PROJECT_DIR/wandb"
 
 echo "[SLURM] Data root:       $LL_DATA"
 echo "[SLURM] WAN_MODELS_ROOT:  $WAN_MODELS_ROOT"
-echo "[SLURM] HF_HOME:          $HF_HOME"
 
 mkdir -p "$PROJECT_DIR/logs" "$LL_DATA/motiondirector_runs"
+
+##############################
+# Distributed env
+##############################
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
+GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-8}
+
+export NCCL_DEBUG=WARN
+export NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONNOUSERSITE=1
+export TORCH_NCCL_BLOCKING_WAIT=1
 
 ##############################
 # Run
@@ -109,12 +112,11 @@ if [ -n "${LL_MD_SMOKE:-}" ]; then
     echo "[SLURM] SMOKE mode — 5 steps only"
 fi
 
-# Allocator fragmentation tolerance for the large per-step activation.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export PYTHONNOUSERSITE=1
-
-echo "[SLURM] Starting python ..."
-python -m longlive.methods.motiondirector.train \
+echo "[SLURM] Launching torchrun on $GPUS_PER_NODE GPU(s), master=$MASTER_ADDR:$MASTER_PORT"
+torchrun \
+    --nproc_per_node="$GPUS_PER_NODE" \
+    --master_port="$MASTER_PORT" \
+    -m longlive.methods.motiondirector.train \
     --config "$LL_MD_CONFIG" \
     "${EXTRA_ARGS[@]}"
 
