@@ -181,6 +181,18 @@ def main():
         is_main_process=rank0,
     )
 
+    # PEFT creates LoRA adapters in float32; FSDP's size-based auto-wrap groups
+    # them with the bfloat16 base params and fails "uniform dtype" validation.
+    # Cast every fp32 param down to bfloat16 to match base — same fix as
+    # longlive/trainer/distillation.py:262-276.
+    n_cast = 0
+    for p in teacher.model.parameters():
+        if p.dtype == torch.float32:
+            p.data = p.data.to(torch.bfloat16)
+            n_cast += 1
+    if rank0:
+        print(f"[motiondirector] cast {n_cast} fp32 params to bfloat16 (post-LoRA, pre-FSDP)", flush=True)
+
     # ---------- FSDP wrap ----------
     # Shards the 14B teacher across ranks; LoRA params (~300 M) also sharded.
     # mixed_precision=True → bf16 compute, fp32 grad reduce + fp32 buffers.
