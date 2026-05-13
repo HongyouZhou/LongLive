@@ -55,7 +55,7 @@ Do not invent path variants for disambiguation.
 # On arp: mount once
 ssh lab "sshfs arp:/home/hongyou ~/mnt/arp -o reconnect"
 
-# On lab (interactive SSH, ideally inside a long-lived tmux session):
+# On lab (interactive SSH, ideally inside a long-lived tmux session — `tat <name>` alias defined in lab bashrc for `tmux attach -t <name>`):
 ssh -t lab
 source ~/mnt/arp/miniforge3/etc/profile.d/conda.sh
 mamba activate ~/mnt/arp/miniforge3/envs/longlive
@@ -74,7 +74,7 @@ alias charitefront='sudo ip netns exec vpnns sshpass -p "$(cat ~/ovpn/.vpn_fixed
 charitefront            # interactive front-node shell
 ```
 
-Direct `ssh hpc …` from outside the VPN namespace will not work. Long-running work must live in tmux on the front node, not on arp.
+Direct `ssh hpc …` from outside the VPN namespace will not work. Training is submitted via `sbatch` — the job lives on a compute node independently of the front-node ssh, so disconnecting / reconnecting is free. No tmux on the front node; reconnect and `tail logs/<job-name>-$JID.out` / `myq` whenever you want to check progress.
 
 #### Front-node environment (`hozh10@s-sc-frontend1`)
 
@@ -97,7 +97,6 @@ Pre-set in HPC `~/.bashrc`:
 | `jid [N|jobid|name]` | pick a job and export `$JID`; bare `jid` lists running jobs |
 | `gpus [-L] [jid]` | run `nvidia-smi` on the job's compute node via `srun --overlap` |
 | `wgpus [-L] [-n SEC] [jid]` | `watch` wrapper around `gpus` |
-| `tat <name>` | `tmux attach -t <name>` |
 
 mamba is initialised by default; `mamba activate longlive` is the project env. Conda `(base)` is also auto-activated — do not assume a clean shell.
 

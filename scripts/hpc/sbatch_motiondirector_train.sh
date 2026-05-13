@@ -3,7 +3,7 @@
 #SBATCH --partition=pgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:nvidia_a100-sxm4:1
 #SBATCH --cpus-per-task=8
 # Wan-14B teacher load peaks ~50 GB CPU (28 GB bf16 weights + ~20 GB fp32 umt5
 # text encoder), then drops once .to(device) runs. 256 GB gives comfortable
@@ -12,7 +12,13 @@
 #SBATCH --mem=256G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/%x-%j.out
-# Wan-14B + umt5 fp32 + LoRA backward + activations does not fit on 40 GB A100s.
+# GPU sizing — Wan-14B + umt5 fp32 + LoRA + activations needs ~70 GB GPU peak.
+# 40 GB A100s (DGX s-sc-dgx01/02 + other A100-40GB nodes) cannot fit it;
+# even with --exclude they may still bind via plain `--gres=gpu:1`. So pin the
+# GRES type to a known 80 GB variant. Override on the sbatch CLI when needed:
+#   sbatch --gres=gpu:nvidia_h200:1        scripts/hpc/sbatch_motiondirector_train.sh   # 141 GB Hopper, fastest
+#   sbatch --gres=gpu:nvidia_h100_80gb:1   scripts/hpc/sbatch_motiondirector_train.sh   # only on s-sc-pgpu08
+# Default (this header) = nvidia_a100-sxm4:1 — 80 GB A100, least contested.
 #SBATCH --exclude=s-sc-dgx[01-02]
 #
 # Phase 2 (docs/04.md) — MotionDirector teacher-finetune on Wan-14B.
