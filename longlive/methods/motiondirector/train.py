@@ -31,6 +31,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import wandb
 from omegaconf import OmegaConf
 from peft import get_peft_model_state_dict
 from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, StateDictType
@@ -96,6 +97,10 @@ def main():
         "--smoke", action="store_true",
         help="5-step smoke run (overrides train_steps / ckpt_interval).",
     )
+    ap.add_argument(
+        "--disable-wandb", action="store_true",
+        help="Skip wandb.init — useful for local debug.",
+    )
     args = ap.parse_args()
 
     # ---------- Distributed init (torchrun-managed env) ----------
@@ -124,6 +129,22 @@ def main():
             f"× world_size={world_size}",
             flush=True,
         )
+
+    # ---------- wandb (rank 0 only) ----------
+    wandb_enabled = rank0 and not args.disable_wandb
+    if wandb_enabled:
+        config_basename = Path(args.config).stem
+        run_name = f"{config_basename}_{time.strftime('%y%m%d_%H%M')}"
+        if args.smoke:
+            run_name += "_smoke"
+        wandb.init(
+            project=getattr(cfg, "wandb_project", "longlive_motiondirector"),
+            entity=getattr(cfg, "wandb_entity", "hongyou"),
+            name=run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            dir=os.environ.get("WANDB_DIR", "wandb"),
+        )
+        print(f"[motiondirector] wandb run: {wandb.run.url}", flush=True)
 
     # Seed: same across ranks for model init (PEFT LoRA must initialize
     # identically before FSDP wrap). Re-seeded per-rank after setup for data
@@ -289,16 +310,40 @@ def main():
         lr_sched.step()
 
         dt = time.time() - t0
+        cur_lr = lr_sched.get_last_lr()[0]
+        t_val = int(t_scalar.item())
         if rank0 and (step % 10 == 0 or step == int(cfg.train_steps) - 1):
-            cur_lr = lr_sched.get_last_lr()[0]
             print(
                 f"[motiondirector] step {step:4d}/{cfg.train_steps}  "
-                f"t={int(t_scalar.item()):4d}  "
+                f"t={t_val:4d}  "
                 f"loss={loss.item():.4f} "
                 f"(mse={loss_mse.item():.4f}, ad={loss_ad.item():.4f})  "
                 f"lr={cur_lr:.2e}  dt={dt:.1f}s",
                 flush=True,
             )
+        if wandb_enabled:
+            # Bucket loss by t — high t (≥600) has near-zero loss by B1
+            # close-form structural identity, low/mid t carry the actual
+            # learning signal (see docs/04.md §2.1). Bucketed series let
+            # the dashboard show real trend instead of t-variance noise.
+            log_dict = {
+                "loss/total": loss.item(),
+                "loss/mse": loss_mse.item(),
+                "loss/ad": loss_ad.item(),
+                "lr": cur_lr,
+                "step_t": t_val,
+                "step_dt_s": dt,
+            }
+            if t_val < 200:
+                log_dict["loss/mse_low_t"] = loss_mse.item()
+                log_dict["loss/ad_low_t"] = loss_ad.item()
+            elif t_val < 600:
+                log_dict["loss/mse_mid_t"] = loss_mse.item()
+                log_dict["loss/ad_mid_t"] = loss_ad.item()
+            else:
+                log_dict["loss/mse_high_t"] = loss_mse.item()
+                log_dict["loss/ad_high_t"] = loss_ad.item()
+            wandb.log(log_dict, step=step)
 
         if (
             int(cfg.ckpt_interval) > 0
@@ -313,6 +358,8 @@ def main():
     final_path = _save_lora_ckpt(teacher.model, out_dir, "final", rank0)
     if rank0:
         print(f"[motiondirector] DONE. final ckpt: {final_path}", flush=True)
+    if wandb_enabled:
+        wandb.finish()
 
     dist.barrier()
     dist.destroy_process_group()
