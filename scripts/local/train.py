@@ -13,7 +13,7 @@ if str(REPO_ROOT) not in sys.path:
 from omegaconf import OmegaConf  # noqa: E402
 import wandb  # noqa: E402
 
-from longlive.trainer import ScoreDistillationTrainer  # noqa: E402
+from longlive.trainer import get_trainer_class  # noqa: E402
 
 
 def main():
@@ -48,8 +48,8 @@ def main():
     config.auto_resume = args.auto_resume  # Default to False; pass --auto-resume to continue from logdir
     config.use_one_logger = not args.no_one_logger
 
-    if config.trainer == "score_distillation":
-        trainer = ScoreDistillationTrainer(config)
+    trainer_cls = get_trainer_class(config.trainer)
+    trainer = trainer_cls(config)
     trainer.train()
 
     wandb.finish()

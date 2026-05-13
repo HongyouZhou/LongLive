@@ -355,53 +355,13 @@ class Trainer:
                 if self.is_main_process:
                     print("No LoRA checkpoint to load, starting from scratch")
 
-        # ============================= Phase 3: real_score LoRA =============================
-        # Phase 2 (docs/04.md) MotionDirector teacher-finetune produces a LoRA
-        # that augments the Wan-14B real_score with motion-aware capability.
-        # If the config specifies real_score_adapter + real_score_lora_ckpt,
-        # attach the LoRA to real_score here (after the student/critic LoRA
-        # setup above, before FSDP wraps below). real_score stays frozen —
-        # the LoRA only shifts the teacher distribution that DMD pulls
-        # student toward; the LoRA itself isn't trained in Phase 3.
-        real_score_adapter_cfg = getattr(config, "real_score_adapter", None)
-        real_score_lora_ckpt = getattr(config, "real_score_lora_ckpt", None)
-        if real_score_adapter_cfg is not None and real_score_lora_ckpt is not None:
-            from longlive.utils.lora_utils import configure_adapter_for_model
-            if self.is_main_process:
-                print(f"Phase 3: attaching LoRA to real_score: {real_score_adapter_cfg}")
-            self.model.real_score.model = configure_adapter_for_model(
-                self.model.real_score.model,
-                "real_score",
-                real_score_adapter_cfg,
-                self.is_main_process,
-            )
-            # Cast fp32 → bf16 (matches generator/critic LoRA cast above; FSDP
-            # size-based auto-wrap refuses mixed-dtype groups).
-            if config.mixed_precision:
-                n_real = 0
-                for p in self.model.real_score.parameters():
-                    if p.dtype == torch.float32:
-                        p.data = p.data.to(torch.bfloat16)
-                        n_real += 1
-                if self.is_main_process:
-                    print(f"Cast {n_real} real_score fp32 params to bfloat16 (post-LoRA)")
-            # Load Phase 2 LoRA weights.
-            ckpt_path = os.path.expandvars(os.path.expanduser(real_score_lora_ckpt))
-            if self.is_main_process:
-                print(f"Phase 3: loading real_score LoRA from {ckpt_path}")
-            lora_state = torch.load(ckpt_path, map_location="cpu")
-            peft.set_peft_model_state_dict(self.model.real_score.model, lora_state)
-            # Re-freeze: PEFT marks LoRA params requires_grad=True by default,
-            # but real_score is the frozen teacher in DMD — we never train it.
-            self.model.real_score.requires_grad_(False)
-            if self.is_main_process:
-                print("Phase 3: real_score LoRA loaded and frozen")
-        elif real_score_adapter_cfg is not None or real_score_lora_ckpt is not None:
-            raise ValueError(
-                "real_score_adapter and real_score_lora_ckpt must be set together "
-                f"(or both unset). adapter={real_score_adapter_cfg!r}, "
-                f"ckpt={real_score_lora_ckpt!r}"
-            )
+        # Extension hook for trainer subclasses (L5 seam, see docs/01.md and
+        # CLAUDE.md "L5 trainer phase: subclass ScoreDistillationTrainer; LoRA
+        # attach point ≈ line 350"). Default = no-op; subclasses can attach
+        # additional adapters / LoRAs to self.model.real_score before it gets
+        # FSDP-wrapped just below. Used by
+        # longlive/methods/motiondirector/trainer.py for Phase 3 teacher LoRA.
+        self._attach_real_score_lora()
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -1524,6 +1484,19 @@ class Trainer:
         return configure_adapter_for_model(
             transformer, model_name, self.lora_config, self.is_main_process
         )
+
+    def _attach_real_score_lora(self):
+        """L5 extension hook (CLAUDE.md "L5 trainer phase: subclass
+        ScoreDistillationTrainer; LoRA attach point ≈ line 350").
+
+        Called from __init__ AFTER student/critic LoRA setup and BEFORE FSDP
+        wrap of real_score. Default = no-op. Subclasses override to attach
+        adapters to ``self.model.real_score.model`` (e.g.
+        longlive.methods.motiondirector.trainer attaches a Phase 2 teacher
+        LoRA here). Subclasses are responsible for the full attach lifecycle
+        (configure_adapter_for_model + fp32→bf16 cast + ckpt load + re-freeze).
+        """
+        pass
 
 
     def _gather_lora_state_dict(self, lora_model):

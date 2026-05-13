@@ -59,7 +59,7 @@ image_or_video_shape:
 - 104
 distribution_loss: dmd_switch
 global_sink: false
-trainer: score_distillation
+trainer: score_distillation_motiondirector
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false
