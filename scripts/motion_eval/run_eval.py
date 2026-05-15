@@ -37,6 +37,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from metrics.clip_metrics import CLIPMetrics  # noqa: E402
+from metrics.dynamic_degree import DynamicDegree  # noqa: E402
 from metrics.motion_fidelity import MotionFidelity  # noqa: E402
 from metrics.video_io import frames_to_pil, read_video_frames  # noqa: E402
 
@@ -44,8 +45,12 @@ from metrics.video_io import frames_to_pil, read_video_frames  # noqa: E402
 CSV_COLUMNS = [
     "prompt_id", "dataset", "key", "prompt", "gen_path",
     "app_div", "temp_consist", "pick_score", "motion_fidelity",
+    "dynamic_score", "is_dynamic",
     "ok", "error",
 ]
+
+# Metric keys for aggregation passes (continuous-valued only).
+_AGG_METRICS = ("app_div", "temp_consist", "pick_score", "motion_fidelity", "dynamic_score")
 
 
 def _load_prompts_manifest(path: Path) -> dict[str, dict]:
@@ -114,6 +119,11 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--skip_motion_fidelity", action="store_true",
                     help="Drop the Yatim metric (e.g., for cotracker-less envs)")
+    ap.add_argument("--skip_dynamic_degree", action="store_true",
+                    help="Drop the VBench Dynamic Degree metric")
+    ap.add_argument("--dynamic_degree_cache", default=None,
+                    help="Directory for cached RAFT per-video max_rad arrays. "
+                         "Defaults to <gen_dir>/cache/dynamic_degree")
     # wandb logging (independent eval run, project=longlive-motion-eval).
     # Aggregates 8 scalars + a per-prompt wandb.Table. Disable via --no_wandb
     # or WANDB_MODE=disabled. wandb.init failure is non-fatal — scores.csv
@@ -163,6 +173,13 @@ def main():
                 n_frames=args.n_frames_mf, grid_size=args.grid_size_mf,
             )
             print(f"[eval] motion fidelity cache: {cache}")
+        dd = None
+        if not args.skip_dynamic_degree:
+            dd_cache = (Path(args.dynamic_degree_cache)
+                        if args.dynamic_degree_cache
+                        else gen_dir / "cache" / "dynamic_degree")
+            dd = DynamicDegree(device=args.device, cache_dir=dd_cache)
+            print(f"[eval] dynamic degree cache: {dd_cache}")
 
         writer, fh = _open_csv_for_append(output)
         try:
@@ -183,6 +200,8 @@ def main():
                     "temp_consist": "",
                     "pick_score": "",
                     "motion_fidelity": "",
+                    "dynamic_score": "",
+                    "is_dynamic": "",
                     "ok": "False",
                     "error": "",
                 }
@@ -200,6 +219,11 @@ def main():
                     if mf is not None:
                         score = mf.score(gen_path, ref_paths)
                         result["motion_fidelity"] = f"{score:.6f}"
+
+                    if dd is not None:
+                        dd_out = dd.score(gen_path)
+                        result["dynamic_score"] = f"{dd_out['dynamic_score']:.6f}"
+                        result["is_dynamic"] = str(dd_out["is_dynamic"])
 
                     result["ok"] = "True"
                 except Exception as e:  # noqa: BLE001
@@ -225,25 +249,27 @@ def main():
             if r.get("ok") != "True":
                 continue
             ds = r.get("dataset", "unknown")
-            d = sums.setdefault(ds, {
-                "app_div": [], "temp_consist": [], "pick_score": [], "motion_fidelity": [],
-            })
-            for k in d:
+            d = sums.setdefault(ds, {k: [] for k in _AGG_METRICS})
+            d.setdefault("is_dynamic", [])  # bool fraction, computed separately
+            for k in _AGG_METRICS:
                 v = r.get(k, "")
                 if v != "":
                     try:
                         d[k].append(float(v))
                     except ValueError:
                         pass
+            iv = r.get("is_dynamic", "")
+            if iv in ("True", "False"):
+                d["is_dynamic"].append(1.0 if iv == "True" else 0.0)
 
     for ds in sorted(sums):
         parts = [f"{ds}: n={len(sums[ds]['app_div'])}"]
-        for k in ("app_div", "temp_consist", "pick_score", "motion_fidelity"):
+        for k in _AGG_METRICS:
             vals = sums[ds][k]
-            if vals:
-                parts.append(f"{k}={sum(vals)/len(vals):.4f}")
-            else:
-                parts.append(f"{k}=NA")
+            parts.append(f"{k}={sum(vals)/len(vals):.4f}" if vals else f"{k}=NA")
+        iv = sums[ds]["is_dynamic"]
+        if iv:
+            parts.append(f"dynamic_frac={sum(iv)/len(iv):.3f}")
         print("  " + "  ".join(parts))
     print()
     print(f"[eval] wrote {output}")
@@ -273,6 +299,7 @@ def _maybe_log_to_wandb(args, sums, output, gen_dir, ref_root, common):
         "ref_root": str(ref_root),
         "n_prompts_scored": len(common),
         "skip_motion_fidelity": args.skip_motion_fidelity,
+        "skip_dynamic_degree": args.skip_dynamic_degree,
         "limit": args.limit,
         "n_frames_mf": args.n_frames_mf,
         "grid_size_mf": args.grid_size_mf,
@@ -290,10 +317,13 @@ def _maybe_log_to_wandb(args, sums, output, gen_dir, ref_root, common):
         scalars: dict = {}
         for ds in sorted(sums):
             scalars[f"{ds}/n"] = len(sums[ds]["app_div"])
-            for k in ("app_div", "temp_consist", "pick_score", "motion_fidelity"):
+            for k in _AGG_METRICS:
                 vals = sums[ds][k]
                 if vals:
                     scalars[f"{ds}/{k}_mean"] = sum(vals) / len(vals)
+            iv = sums[ds].get("is_dynamic", [])
+            if iv:
+                scalars[f"{ds}/dynamic_frac"] = sum(iv) / len(iv)
         wandb.log(scalars)
 
         table_cols = [c for c in CSV_COLUMNS if c != "gen_path"]
