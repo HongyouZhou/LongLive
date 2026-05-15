@@ -22,11 +22,13 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 
-# CoTrackerWrapper lives in motion_eval/metrics; that dir is not a package,
-# so add it to sys.path explicitly.
-METRICS_DIR = REPO_ROOT / "scripts" / "motion_eval" / "metrics"
-sys.path.insert(0, str(METRICS_DIR))
-from motion_fidelity import CoTrackerWrapper  # noqa: E402
+# CoTrackerWrapper lives in motion_eval/metrics; metrics/ IS a package
+# (`__init__.py` exists), so add motion_eval/ to sys.path and import as
+# `metrics.motion_fidelity` — same pattern run_eval.py uses (it lives inside
+# motion_eval/ so it already has the right cwd).
+MOTION_EVAL_DIR = REPO_ROOT / "scripts" / "motion_eval"
+sys.path.insert(0, str(MOTION_EVAL_DIR))
+from metrics.motion_fidelity import CoTrackerWrapper  # noqa: E402
 
 
 def amplitude(tracks: np.ndarray, vis: np.ndarray) -> tuple[float, float, float]:
