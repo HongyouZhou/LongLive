@@ -5,16 +5,19 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
-# 8 ranks × Wan-14B ≈ 8 × 28 GB CPU peak during loading = ~240 GB. 900 GB gives
-# generous headroom and avoids cgroup memory-pressure NFS stalls (sbatch_train.sh
-# §11 postmortem).
+# 8 ranks × Wan-1.3B ≈ 8 × 5 GB CPU peak — 1.3B is small, but keep 900 GB to
+# match sbatch_train.sh policy of headroom against cgroup memory-pressure
+# NFS stalls (see sbatch_train.sh §11 postmortem).
 #SBATCH --mem=900G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/%x-%j.out
-# 40 GB A100s can't fit even with FSDP at this batch size.
+# 40 GB A100s — overkill exclude for 1.3B but kept for consistency with
+# sbatch_train.sh; remove via sbatch CLI if you want them.
 #SBATCH --exclude=s-sc-dgx[01-02]
 #
-# Phase 2 (docs/04.md) — MotionDirector teacher-finetune on Wan-14B via FSDP.
+# MotionDirector LoRA finetune on the few-step LongLive 1.3B model.
+# See docs/00.md §1.1 (research anchor, route 1) and docs/01.md (two-LoRA
+# layering + load flow).
 #
 # Default = 8 GPU on a single pgpu node (any type, scheduler-friendlier than
 # single-GPU jobs which sit in queue while full-node jobs go through).
@@ -24,7 +27,7 @@
 #   source scripts/hpc/submit.sh sbatch_motiondirector_train.sh
 #
 #   # Override config:
-#   LL_MD_CONFIG=longlive/methods/motiondirector/configs/skateboarding_v1.yaml \
+#   LL_MD_CONFIG=longlive/methods/motiondirector/configs/skateboarding_fewstep.yaml \
 #     source scripts/hpc/submit.sh sbatch_motiondirector_train.sh
 #
 #   # 5-step smoke instead of full 500:
@@ -103,7 +106,7 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 ##############################
 # Run
 ##############################
-: "${LL_MD_CONFIG:=longlive/methods/motiondirector/configs/skateboarding_v1.yaml}"
+: "${LL_MD_CONFIG:=longlive/methods/motiondirector/configs/skateboarding_fewstep.yaml}"
 echo "[SLURM] config:  $LL_MD_CONFIG"
 
 EXTRA_ARGS=()
