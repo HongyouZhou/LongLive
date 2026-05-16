@@ -73,6 +73,7 @@ for r in "${RUNS[@]}"; do
         --input  "$p" \
         --output "$p" \
         --device cuda \
+        ${LL_DD_FORCE:+--force} \
         > "logs/add_dynamic_degree-${SLURM_JOB_ID}-${r}.out" 2>&1 &
     pids+=($!)
     i=$((i+1))

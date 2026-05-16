@@ -37,8 +37,17 @@ import torch
 
 
 def _video_to_tensor(path: str | Path, n_frames: int | None = None) -> torch.Tensor:
-    """Read mp4 → (T, 3, H, W) float tensor in [0, 255]. Native frame rate; if
-    n_frames is given, uniformly subsample to that many frames."""
+    """Read mp4 → (T, 3, H, W) **uint8** tensor. Native frame rate; if
+    n_frames is given, uniformly subsample to that many frames.
+
+    Returns uint8 deliberately: torchvision's RAFT transform
+    (Raft_Large_Weights.DEFAULT.transforms()) calls
+    `convert_image_dtype(img, float32)` which only rescales [0, 255] → [0, 1]
+    when the source dtype is uint8. Passing a pre-converted float tensor
+    skips the rescale, leaving values in [0, 255], which after RAFT's
+    normalize step lands inputs in roughly [-1, 509] — wildly out of
+    distribution for the trained weights and produces garbage flow.
+    """
     from torchvision.io import read_video
     frames, _, _ = read_video(str(path), pts_unit="sec", output_format="THWC")
     t_native = frames.shape[0]
@@ -47,7 +56,7 @@ def _video_to_tensor(path: str | Path, n_frames: int | None = None) -> torch.Ten
     if n_frames is not None and t_native > n_frames:
         idxs = np.linspace(0, t_native - 1, n_frames).astype(int)
         frames = frames[idxs]
-    return frames.permute(0, 3, 1, 2).contiguous().float()  # (T, 3, H, W)
+    return frames.permute(0, 3, 1, 2).contiguous()  # uint8, (T, 3, H, W)
 
 
 class DynamicDegree:
@@ -79,10 +88,16 @@ class DynamicDegree:
         self._model = raft_large(weights=weights, progress=False).to(self.device).eval()
         self._transform = weights.transforms()
 
+    # Bump CACHE_VERSION whenever the compute changes in a way that
+    # invalidates prior cached arrays (e.g., input-scale fix, model swap,
+    # different aggregator). The version is mixed into the cache key so
+    # stale caches are bypassed automatically without manual rm.
+    CACHE_VERSION = "v2"  # v1 had wrong float input scale; v2 fixes via uint8
+
     def _cache_path(self, video_path: str | Path) -> Optional[Path]:
         if self.cache_dir is None:
             return None
-        key = f"{Path(video_path).resolve()}|T={self.n_frames}"
+        key = f"{Path(video_path).resolve()}|T={self.n_frames}|{self.CACHE_VERSION}"
         h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
         return self.cache_dir / f"{h}.npz"
 

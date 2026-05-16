@@ -46,6 +46,9 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=None,
                     help="Only compute the first N missing rows (smoke test)")
+    ap.add_argument("--force", action="store_true",
+                    help="Recompute all rows, even those with dynamic_score already set "
+                         "(use after fixing a metric bug to invalidate stale values)")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -67,7 +70,7 @@ def main():
     for i, r in enumerate(rows):
         if r.get("ok") != "True":
             continue
-        if r.get("dynamic_score", "") != "":
+        if not args.force and r.get("dynamic_score", "") != "":
             continue
         if not r.get("gen_path"):
             continue
