@@ -1,0 +1,53 @@
+# Motion-customization eval inference config — baseline-merged variant.
+#
+# Same shape as motion_eval_inference.yaml plus baseline_lora_ckpt +
+# baseline_adapter fields. Use this config when evaluating an idea-layer
+# LoRA (e.g. a MotionDirector finetune) that was trained on top of the merged
+# longlive_base.pt + lora.pt few-step product. See companion file
+# vbench_short_with_baseline.yaml for the VBench analog.
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+
+# inference defaults; dispatcher overrides per-run paths
+data_path: longlive_models/prompts/vidprom_filtered_extended.txt
+output_folder: motion_eval_runs/_unset
+inference_iter: -1
+num_output_frames: 21          # 81 pixel frames @ 16 fps = 5.06s
+use_ema: false
+seed: 0
+num_samples: 1
+save_with_index: true
+global_sink: true
+context_noise: 0
+
+generator_ckpt: longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA (few-step capability) — merged into base before our LoRA.
+baseline_lora_ckpt: longlive_models/models/lora.pt
+baseline_adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+# Idea-layer LoRA. dispatcher sets lora_ckpt from the sbatch CLI arg.
+lora_ckpt: ""
+adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false

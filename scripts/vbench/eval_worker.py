@@ -113,6 +113,31 @@ class EvalWorker:
             else:
                 self.pipeline.generator.load_state_dict(gen_sd)
 
+        # Optional: overlay NVlabs baseline LoRA (the few-step capability LoRA
+        # released alongside longlive_base.pt) and merge it into the base
+        # weights before attaching any "idea-layer" LoRA on top. Required when
+        # evaluating an adapter trained on top of merged base + baseline (e.g.
+        # MotionDirector finetune). Skipped when fields absent — preserves the
+        # single-LoRA path used for NVlabs paper-baseline reproduction.
+        # Mirrors longlive/methods/motiondirector/train.py Step 2-4.
+        baseline_lora_ckpt = getattr(self.config, "baseline_lora_ckpt", None)
+        baseline_adapter = getattr(self.config, "baseline_adapter", None)
+        if baseline_lora_ckpt and baseline_adapter:
+            _log(f"overlaying NVlabs baseline LoRA: {baseline_lora_ckpt}")
+            self.pipeline.generator.model = configure_lora_for_model(
+                self.pipeline.generator.model,
+                model_name="generator",
+                adapter_config=baseline_adapter,
+                is_main_process=True,
+            )
+            baseline_state = torch.load(baseline_lora_ckpt, map_location="cpu")
+            if isinstance(baseline_state, dict) and "generator_lora" in baseline_state:
+                baseline_state = baseline_state["generator_lora"]
+            peft.set_peft_model_state_dict(self.pipeline.generator.model, baseline_state)
+            self.pipeline.generator.model = self.pipeline.generator.model.merge_and_unload()
+            _log("baseline LoRA merged into base weights")
+            del baseline_state
+
         # Apply LoRA + load LoRA weights (mirrors scripts/local/inference.py:97-131).
         self.pipeline.is_lora_enabled = False
         if getattr(self.config, "adapter", None):
