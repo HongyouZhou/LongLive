@@ -69,4 +69,3 @@ ckpt_keep_last: 5
 
 # misc
 seed: 0
-device: cuda
