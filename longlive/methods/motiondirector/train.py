@@ -1,17 +1,16 @@
-"""Phase 2: MotionDirector teacher-finetune on Wan-14B (docs/04.md).
+"""MotionDirector LoRA finetune on the few-step LongLive model.
 
-Trains a LoRA on top of frozen Wan-14B teacher using paper recipe
-(L_temporal_MSE + L_AD with alpha=sqrt(2), beta=1), in epsilon space via
-B1 close-form reverse from Wan's native (flow_pred, pred_x0) outputs.
-
-Output: teacher_lora.pt — to be loaded as `real_score` adapter for the
-existing DMD trainer in Phase 3.
+Frozen starting point = NVlabs LongLive complete inference product
+(longlive_base.pt + lora.pt merged), matching configs/longlive_inference.yaml.
+On top of that we attach a new LoRA trained with MotionDirector loss
+(L_temporal_MSE + L_AD, alpha=sqrt(2), beta=1) to push motion back toward
+mode-covering — see docs/00.md §1 candidate idea 1.
 
 Distributed via FSDP + torchrun (8 GPU default, single-rank also supported).
 Usage:
 
     torchrun --nproc_per_node=8 -m longlive.methods.motiondirector.train \\
-        --config longlive/methods/motiondirector/configs/skateboarding_v1.yaml
+        --config longlive/methods/motiondirector/configs/skateboarding_fewstep.yaml
 
     # 5-step smoke:
     torchrun --nproc_per_node=8 -m longlive.methods.motiondirector.train \\
@@ -33,7 +32,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 from omegaconf import OmegaConf
-from peft import get_peft_model_state_dict
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, StateDictType
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -47,6 +46,10 @@ from longlive.utils.wan_wrapper import (
     WanTextEncoder,
     WanVAEWrapper,
 )
+
+
+def _clean_fsdp_key(name: str) -> str:
+    return name.replace("_fsdp_wrapped_module.", "")
 
 
 def _linear_warmup_schedule(optimizer, warmup_steps: int) -> LambdaLR:
@@ -74,7 +77,7 @@ def _save_lora_ckpt(fsdp_peft_model, out_dir: Path, tag: str, rank0: bool) -> Pa
     lora_state = get_peft_model_state_dict(fsdp_peft_model, state_dict=full)
     lora_state = {k: v.detach().cpu() for k, v in lora_state.items()}
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"teacher_lora_{tag}.pt"
+    path = out_dir / f"lora_{tag}.pt"
     torch.save(lora_state, path)
     return path
 
@@ -82,7 +85,7 @@ def _save_lora_ckpt(fsdp_peft_model, out_dir: Path, tag: str, rank0: bool) -> Pa
 def _prune_old_ckpts(out_dir: Path, keep_last: int) -> None:
     """Keep only the keep_last most recent ckpts (excluding 'final')."""
     ckpts = sorted(
-        (p for p in out_dir.glob("teacher_lora_*.pt") if "final" not in p.name),
+        (p for p in out_dir.glob("lora_*.pt") if "final" not in p.name),
         key=lambda p: p.stat().st_mtime,
     )
     while len(ckpts) > keep_last:
@@ -170,10 +173,10 @@ def main():
 
     # ---------- Text encoder: load → encode → free ----------
     # Pre-cache null + train_caption embeddings, then drop the ~20 GB fp32
-    # umt5 before loading the 28 GB Wan-14B teacher so peak GPU per rank
-    # stays well clear of (text_encoder + teacher). Valid for the single-
-    # caption Phase 2 first version; multi-caption training (paper Table 1,
-    # 12 motions) will need to keep the encoder online instead.
+    # umt5 before loading the backbone so peak GPU per rank stays well clear
+    # of (text_encoder + backbone). Valid for single-caption training only;
+    # multi-caption training (paper Table 1, 12 motions) needs the encoder
+    # to stay online instead.
     if rank0:
         print("[motiondirector] loading text encoder (cache embeddings then free) ...", flush=True)
     text_encoder = WanTextEncoder()
@@ -184,30 +187,104 @@ def main():
     del text_encoder
     torch.cuda.empty_cache()
 
-    # ---------- Teacher ----------
+    # ---------- Build wrapper + load NVlabs frozen starting point ----------
+    # Mirrors configs/longlive_inference.yaml verbatim so the frozen starting
+    # point equals NVlabs's complete few-step inference product:
+    #   1. WanDiffusionWrapper with model_kwargs (local_attn_size, sink_size,
+    #      timestep_shift) matching upstream
+    #   2. load_state_dict from longlive_base.pt at the wrapper level —
+    #      state-dict keys carry `model.` prefix (wrapper.model = CausalWanModel)
+    #   3. attach NVlabs lora.pt as a transient PEFT adapter, load its
+    #      weights, merge into base via merge_and_unload()
+    is_causal = bool(getattr(cfg, "is_causal", True))
     if rank0:
-        print(f"[motiondirector] loading teacher {cfg.teacher_name} ...", flush=True)
-    teacher = WanDiffusionWrapper(
-        model_name=cfg.teacher_name,
+        arch = "CausalWanModel" if is_causal else "WanModel"
+        print(f"[motiondirector] building {cfg.model_name} ({arch}) ...", flush=True)
+    model_kwargs = dict(
+        model_name=cfg.model_name,
         timestep_shift=float(cfg.timestep_shift),
-        is_causal=False,
+        is_causal=is_causal,
     )
-    # Move base weights to GPU before PEFT wrap; gradient checkpointing flag
-    # is set on the underlying nn.Module and persists across PEFT / FSDP.
-    teacher.enable_gradient_checkpointing()
-    teacher.model = configure_adapter_for_model(
-        teacher.model,
-        model_name="real_score",
+    if is_causal:
+        model_kwargs["local_attn_size"] = int(getattr(cfg, "local_attn_size", -1))
+        model_kwargs["sink_size"] = int(getattr(cfg, "sink_size", 0))
+    generator = WanDiffusionWrapper(**model_kwargs)
+
+    # Step 2: load longlive_base.pt → wrapper level (state-dict keys carry
+    # `model.` prefix because the wrapper holds self.model = CausalWanModel).
+    base_ckpt_path = os.path.expandvars(os.path.expanduser(cfg.base_ckpt))
+    if rank0:
+        print(f"[motiondirector] loading base ckpt: {base_ckpt_path}", flush=True)
+    sd = torch.load(base_ckpt_path, map_location="cpu")
+    if "generator" in sd:
+        state = sd["generator"]
+    elif "model" in sd:
+        state = sd["model"]
+    else:
+        state = sd
+    state = {_clean_fsdp_key(k): v for k, v in state.items()}
+    missing, unexpected = generator.load_state_dict(state, strict=False)
+    if rank0:
+        print(
+            f"[motiondirector] base ckpt load: missing={len(missing)} unexpected={len(unexpected)}",
+            flush=True,
+        )
+        if missing and len(missing) <= 10:
+            print(f"  missing keys: {missing}", flush=True)
+        if unexpected and len(unexpected) <= 10:
+            print(f"  unexpected keys: {unexpected}", flush=True)
+    del sd, state
+
+    # Step 3: overlay NVlabs lora.pt — the LoRA-side of NVlabs's released
+    # LongLive few-step product. Attach as a transient PEFT adapter, load
+    # weights, merge into base. After merge_and_unload() the wrapper holds
+    # a plain CausalWanModel again, ready for our own LoRA.
+    baseline_lora_ckpt = getattr(cfg, "baseline_lora_ckpt", None)
+    if baseline_lora_ckpt:
+        baseline_lora_ckpt = os.path.expandvars(os.path.expanduser(baseline_lora_ckpt))
+        if rank0:
+            print(
+                f"[motiondirector] overlaying NVlabs baseline LoRA: {baseline_lora_ckpt}",
+                flush=True,
+            )
+        generator.model = configure_adapter_for_model(
+            generator.model,
+            model_name="generator",
+            adapter_config=cfg.baseline_adapter,
+            is_main_process=rank0,
+        )
+        baseline_state = torch.load(baseline_lora_ckpt, map_location="cpu")
+        if isinstance(baseline_state, dict) and "generator_lora" in baseline_state:
+            baseline_state = baseline_state["generator_lora"]
+        set_peft_model_state_dict(generator.model, baseline_state)
+        generator.model = generator.model.merge_and_unload()
+        if rank0:
+            print("[motiondirector] baseline LoRA merged into base weights", flush=True)
+        del baseline_state
+
+    # Attach the LoRA we will train (MotionDirector loss).
+    # `model_name='generator'` targets CausalWanAttentionBlock to match the
+    # backbone we just loaded (longlive_base.pt = CausalWanModel). Calling
+    # with a non-matching dispatch key produces zero LoRA layers attached
+    # (silent — PEFT accepts empty target_modules) and the training loop
+    # runs as a no-op.
+    generator.model = configure_adapter_for_model(
+        generator.model,
+        model_name="generator",
         adapter_config=cfg.adapter,
         is_main_process=rank0,
     )
+    # Enable gradient checkpointing AFTER LoRA attach — upstream
+    # trainer/distillation.py order. PEFT re-wraps modules; setting gc on
+    # the pre-wrap model risks losing the flag on wrapped layers.
+    generator.enable_gradient_checkpointing()
 
     # PEFT creates LoRA adapters in float32; FSDP's size-based auto-wrap groups
     # them with the bfloat16 base params and fails "uniform dtype" validation.
     # Cast every fp32 param down to bfloat16 to match base — same fix as
-    # longlive/trainer/distillation.py:262-276.
+    # longlive/trainer/distillation.py.
     n_cast = 0
-    for p in teacher.model.parameters():
+    for p in generator.model.parameters():
         if p.dtype == torch.float32:
             p.data = p.data.to(torch.bfloat16)
             n_cast += 1
@@ -215,23 +292,23 @@ def main():
         print(f"[motiondirector] cast {n_cast} fp32 params to bfloat16 (post-LoRA, pre-FSDP)", flush=True)
 
     # ---------- FSDP wrap ----------
-    # Shards the 14B teacher across ranks; LoRA params (~300 M) also sharded.
+    # Shards the backbone across ranks; LoRA params also sharded.
     # mixed_precision=True → bf16 compute, fp32 grad reduce + fp32 buffers.
     # `use_orig_params=True` (set inside fsdp_wrap) is required for PEFT.
-    teacher.model = fsdp_wrap(
-        teacher.model,
+    generator.model = fsdp_wrap(
+        generator.model,
         sharding_strategy="full",
         mixed_precision=True,
         wrap_strategy="size",
     )
-    teacher.model.train()  # LoRA-only training mode (base frozen by PEFT)
+    generator.model.train()  # LoRA-only training mode (base frozen by PEFT)
 
     # Re-seed per rank for data-sampling variety after model init is done.
     random.seed(int(cfg.seed) + rank)
     torch.manual_seed(int(cfg.seed) + rank)
 
     # ---------- Optimizer ----------
-    trainable = [p for p in teacher.model.parameters() if p.requires_grad]
+    trainable = [p for p in generator.model.parameters() if p.requires_grad]
     n_trainable_local = sum(p.numel() for p in trainable)
     n_trainable_global = torch.tensor(n_trainable_local, device=device)
     dist.all_reduce(n_trainable_global)
@@ -254,7 +331,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
     dist.barrier()  # wait for rank-0 to create dir before any rank tries to write
 
-    sched = teacher.scheduler  # FlowMatchScheduler (already set_timesteps in wrapper init)
+    sched = generator.scheduler  # FlowMatchScheduler (already set_timesteps in wrapper init)
 
     # ---------- Training loop ----------
     if rank0:
@@ -270,16 +347,30 @@ def main():
         latent, _ = dataset.sample()
         # latent: (1, F, 16, H_l, W_l) bf16 on cuda
 
-        # Pre-cached cond_dict: null vs train_caption (single-motion Phase 2 —
+        # Pre-cached cond_dict: null vs train_caption (single-caption training;
         # text encoder was freed at init, no per-step forward).
         cond_dict = null_cond if random.random() < float(cfg.null_prompt_p) else train_cond
 
-        # Add noise (uniform t across frames for non-causal teacher).
+        # Add noise (uniform t across frames — single scalar per step).
+        # t_sampling_mode controls where t comes from:
+        #   "uniform" (default):   t ~ Uniform[t_min, t_max]
+        #   "anchor_only":         t sampled from cfg.t_anchors (e.g. the
+        #                          4 few-step denoising indices [1000, 750,
+        #                          500, 250]) — keeps training on the
+        #                          few-step model's well-defined timesteps only.
         noise = torch.randn_like(latent)
         n_frames = latent.shape[1]
-        t_scalar = torch.randint(
-            int(cfg.t_min), int(cfg.t_max), (1,), device=device
-        )
+        t_mode = str(getattr(cfg, "t_sampling_mode", "uniform"))
+        if t_mode == "anchor_only":
+            anchors = list(getattr(cfg, "t_anchors", [1000, 750, 500, 250]))
+            t_scalar = torch.tensor(
+                [anchors[torch.randint(0, len(anchors), (1,)).item()]],
+                device=device, dtype=torch.long,
+            )
+        else:
+            t_scalar = torch.randint(
+                int(cfg.t_min), int(cfg.t_max), (1,), device=device
+            )
         timestep = t_scalar.expand(1, n_frames).contiguous()  # (B=1, F)
         noisy = sched.add_noise(
             latent.flatten(0, 1),
@@ -288,7 +379,7 @@ def main():
         ).unflatten(0, latent.shape[:2])
 
         # Forward (B1 close-form reverse: eps_pred = flow_pred + pred_x0).
-        flow_pred, pred_x0 = teacher(
+        flow_pred, pred_x0 = generator(
             noisy,
             cond_dict,
             timestep,
@@ -322,10 +413,11 @@ def main():
                 flush=True,
             )
         if wandb_enabled:
-            # Bucket loss by t — high t (≥600) has near-zero loss by B1
-            # close-form structural identity, low/mid t carry the actual
-            # learning signal (see docs/04.md §2.1). Bucketed series let
-            # the dashboard show real trend instead of t-variance noise.
+            # Bucket loss by t — high t (≥600) has near-zero loss because
+            # the B1 close-form identity `eps = flow_pred + pred_x0` collapses
+            # to eps ≈ eps_gt as sigma → 1; low/mid t carry the actual
+            # learning signal. Bucketed series let the dashboard show real
+            # trend instead of t-variance noise.
             log_dict = {
                 "loss/total": loss.item(),
                 "loss/mse": loss_mse.item(),
@@ -350,12 +442,12 @@ def main():
             and (step + 1) % int(cfg.ckpt_interval) == 0
             and (step + 1) < int(cfg.train_steps)
         ):
-            ckpt_path = _save_lora_ckpt(teacher.model, out_dir, str(step + 1), rank0)
+            ckpt_path = _save_lora_ckpt(generator.model, out_dir, str(step + 1), rank0)
             if rank0:
                 _prune_old_ckpts(out_dir, int(cfg.ckpt_keep_last))
                 print(f"[motiondirector] saved ckpt: {ckpt_path}", flush=True)
 
-    final_path = _save_lora_ckpt(teacher.model, out_dir, "final", rank0)
+    final_path = _save_lora_ckpt(generator.model, out_dir, "final", rank0)
     if rank0:
         print(f"[motiondirector] DONE. final ckpt: {final_path}", flush=True)
     if wandb_enabled:

@@ -64,12 +64,6 @@ def configure_adapter_for_model(transformer, model_name, adapter_config, is_main
         adapter_target_modules = ['CausalWanAttentionBlock']
     elif model_name == 'fake_score':
         adapter_target_modules = ['WanAttentionBlock']
-    elif model_name == 'real_score':
-        # Wan-14B teacher: same WanAttentionBlock structure as fake_score
-        # (non-causal). MotionDirector teacher-finetune (docs/04.md Phase 2)
-        # attaches LoRA here; Phase 3 DMD trainer reuses this branch to load
-        # the same LoRA ckpt as `real_score` adapter.
-        adapter_target_modules = ['WanAttentionBlock']
     else:
         raise ValueError(f"Invalid model name: {model_name}")
 

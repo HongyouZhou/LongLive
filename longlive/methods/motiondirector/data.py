@@ -1,12 +1,12 @@
-"""Reference clip loader for MotionDirector teacher-finetune.
+"""Reference clip loader for MotionDirector LoRA finetune.
 
 Reads UCF Sports Action clips of a chosen category (default Skateboarding),
-normalizes to Wan-14B native input shape (81 frame x 480^2), runs them
+normalizes to the Wan native input shape (81 frame x 480^2), runs them
 through the Wan VAE encoder to produce latents. Train caption comes from
 ``scripts/motion_eval/prompts/ucf_sports.yaml`` (uniform per category).
 
-Per docs/04.md §4.3 — on-the-fly encode for first version; if found to be
-the training bottleneck, switch to offline pre-encode.
+On-the-fly encode for the first version; if found to be the training
+bottleneck, switch to offline pre-encode.
 """
 from __future__ import annotations
 
@@ -31,8 +31,7 @@ class SkateboardingLatentDataset:
 
     Default category is ``Skateboarding`` because UCF Sports Action is the
     only one where MotionDirector paper releases all 7 prompts verbatim
-    (Fig 8a + Fig 10) — gives paper-anchorable comparison after Phase 3
-    distillation.
+    (Fig 8a + Fig 10) — gives paper-anchorable comparison after eval.
     """
 
     def __init__(
@@ -86,10 +85,10 @@ class SkateboardingLatentDataset:
     def _load_clip_pixels(self, path: Path) -> torch.Tensor:
         """Returns (1, C, T, H, W) in [-1, 1] fp32 on device.
 
-        Fp32 to match the Wan VAE encoder dtype (it's loaded in default fp32
-        for numerical stability — bf16 input → conv3d type mismatch with
-        fp32 weight/bias). The latent output is cast to bf16 in `sample()`
-        for training compatibility with the bf16 Wan-14B teacher.
+        Fp32 to match the Wan VAE encoder dtype (loaded in default fp32 for
+        numerical stability — bf16 input → conv3d type mismatch with fp32
+        weight/bias). The latent output is cast to bf16 in `sample()` for
+        training compatibility with the bf16 backbone.
         """
         import decord  # lazy — only required at training time on HPC, not on orchestration boxes
         vr = decord.VideoReader(str(path), num_threads=1)
@@ -123,8 +122,8 @@ class SkateboardingLatentDataset:
     def sample(self) -> tuple[torch.Tensor, str]:
         """Returns (latent (1, F_latent, 16, H/8, W/8) bf16, caption).
 
-        VAE runs in fp32; latent cast to bf16 here to align with the Wan-14B
-        teacher dtype for `add_noise` / forward.
+        VAE runs in fp32; latent cast to bf16 here to align with the bf16
+        backbone dtype for `add_noise` / forward.
         """
         clip_path = random.choice(self.clips)
         pixels = self._load_clip_pixels(clip_path)  # fp32 (1, C, T, H, W)

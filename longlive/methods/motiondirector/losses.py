@@ -7,9 +7,9 @@ Two terms (paper §3.2, eq 3 / 5):
     before MSE so that signal shared across frames (appearance) cancels,
     leaving only frame-to-frame residual (motion).
 
-Per docs/04.md Phase 2:
-  * paper alpha = sqrt(2), beta = 1 — verbatim, applicable because B1
-    close-form reverse `eps_pred = flow_pred + pred_x0` puts the model
+Notes:
+  * paper alpha = sqrt(2), beta = 1 — verbatim, applicable because the
+    B1 close-form reverse `eps_pred = flow_pred + pred_x0` puts the Wan
     output back in epsilon space, where the paper's debias derivation holds.
   * L_spatial is dropped — Wan DiT has no Transformer2D / Temporal split
     to anchor a separate spatial LoRA on.
