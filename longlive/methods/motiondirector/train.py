@@ -387,13 +387,16 @@ def main():
         eps_pred = flow_pred + pred_x0
         eps_gt = noise
 
-        # Loss = paper L_temporal_MSE + L_AD (alpha=sqrt(2), beta=1).
+        # Loss = paper L_temporal_MSE + ad_weight * L_AD (alpha=sqrt(2), beta=1).
+        # ad_weight defaults to 1.0 (paper recipe); set 0.0 in yaml to ablate
+        # L_AD and isolate L_MSE-only contribution.
         loss_mse = F.mse_loss(eps_pred, eps_gt)
         loss_ad = appearance_debias_loss(
             eps_pred, eps_gt,
             alpha=float(cfg.ad_alpha), beta=float(cfg.ad_beta),
         )
-        loss = loss_mse + loss_ad
+        ad_weight = float(getattr(cfg, "ad_weight", 1.0))
+        loss = loss_mse + ad_weight * loss_ad
 
         optimizer.zero_grad()
         loss.backward()

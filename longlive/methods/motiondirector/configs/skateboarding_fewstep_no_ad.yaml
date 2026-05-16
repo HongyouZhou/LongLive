@@ -1,0 +1,68 @@
+# MotionDirector LoRA finetune — L_AD-only ablation variant.
+#
+# Same setup as skateboarding_fewstep.yaml except ad_weight: 0.0 — drops the
+# appearance-debias term from the loss, isolating L_temporal_MSE contribution.
+# Motivation: paper's L_AD assumes dual-LoRA (spatial frozen + temporal
+# trained) so that the anchor-frame subtraction signal only updates temporal
+# weights; on Wan unified 3D attention with single LoRA, that decomposition
+# breaks. This ablation tests whether L_AD specifically is the harmful term
+# (motion_fidelity -28% in-domain on skateboarding_fewstep run 8919469).
+#
+# Out_dir is separate so the original ckpt isn't overwritten.
+
+# data
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+
+# backbone — same as skateboarding_fewstep.yaml
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA (merged into base before our LoRA attach)
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# Our LoRA (trained with MotionDirector loss — minus L_AD this time)
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: true
+
+# training
+train_steps: 500
+lr: 5.0e-5
+weight_decay: 0.0
+warmup_steps: 50
+null_prompt_p: 0.1
+
+# Timestep sampling
+t_sampling_mode: anchor_only
+t_anchors: [1000, 750, 500, 250]
+t_min: 20
+t_max: 980
+
+# loss — KEY DIFFERENCE: ad_weight=0.0 drops L_AD term
+ad_alpha: 1.4142135623730951
+ad_beta: 1.0
+ad_weight: 0.0
+
+# logging / ckpt — separate out_dir so we don't clobber the full-loss ckpt
+out_dir: ${oc.env:LL_DATA}/motiondirector_runs/skateboarding_fewstep_no_ad
+ckpt_interval: 100
+ckpt_keep_last: 5
+
+# misc
+seed: 0
