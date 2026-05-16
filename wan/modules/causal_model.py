@@ -1059,6 +1059,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        sink_recache_after_switch=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1080,10 +1081,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         Returns:
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+
+        Note: ``sink_recache_after_switch`` is accepted to match the unconditional
+        forwarding by ``WanDiffusionWrapper.forward``; training has no KV cache,
+        so the flag is ignored here.
         """
-        pass
-        raise NotImplementedError()
-    
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
         # params
