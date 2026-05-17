@@ -1,0 +1,80 @@
+# MotionDirector LoRA finetune — x0-space loss variant.
+#
+# Identical to skateboarding_fewstep.yaml (the +AD baseline that produced
+# 8919469) EXCEPT the loss is computed in x0 space instead of eps space.
+#
+# Why: train.py's eps-space loss reduces algebraically to
+#   MSE(eps_pred, eps_gt) = (1−σ_t)² · MSE(flow_pred, ε − x0)
+# which weights low t (pixel detail regime) heavily and high t (motion /
+# coarse structure) near zero. For a DMD few-step student that operates
+# at {1000, 750, 500, 250}, this leaves t=1000 with ~0 gradient.
+#
+# Switching to x0 supervision gives
+#   MSE(pred_x0, x0_gt) = σ_t² · MSE(flow_pred, ε − x0)
+# which inverts the weighting: high t carries most signal (motion regime),
+# and the loss directly matches what DMD-distillation trained the student
+# to output (x0 at the 4 anchors).
+#
+# Single-variable swap from skateboarding_fewstep.yaml: only `loss_space`
+# changes. Everything else stays identical so we can attribute any delta
+# to loss space alone.
+
+# data — same as fewstep
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+
+# backbone — same as fewstep
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA — same as fewstep
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# Our LoRA — same hyperparams as fewstep (rank 256, no dropout, no wd)
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# training — same as fewstep
+train_steps: 500
+lr: 5.0e-5
+weight_decay: 0.0
+warmup_steps: 50
+null_prompt_p: 0.1
+
+# Timestep sampling — anchor_only matches the 4 DMD few-step anchors,
+# pairing with the loss-space change.
+t_sampling_mode: anchor_only
+t_anchors: [1000, 750, 500, 250]
+t_min: 20
+t_max: 980
+
+# loss — paper L_MSE + L_AD with alpha=sqrt(2), beta=1
+# THE ONE VARIABLE THAT CHANGES vs fewstep yaml:
+loss_space: x0                 # NEW: supervise pred_x0 directly (σ_t² weighting)
+ad_alpha: 1.4142135623730951
+ad_beta: 1.0
+ad_weight: 1.0
+
+# logging / ckpt
+out_dir: ${oc.env:LL_DATA}/motiondirector_runs/skateboarding_x0space
+ckpt_interval: 100
+ckpt_keep_last: 5
+
+# misc
+seed: 0

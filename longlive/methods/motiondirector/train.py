@@ -379,21 +379,38 @@ def main():
             timestep.flatten(0, 1),
         ).unflatten(0, latent.shape[:2])
 
-        # Forward (B1 close-form reverse: eps_pred = flow_pred + pred_x0).
+        # Forward — wrapper returns flow velocity + derived x0.
+        #   flow_pred = velocity prediction (ε − x0 in flow matching)
+        #   pred_x0   = x_t − σ_t · flow_pred  (deterministic algebra)
         flow_pred, pred_x0 = generator(
             noisy,
             cond_dict,
             timestep,
         )
-        eps_pred = flow_pred + pred_x0
-        eps_gt = noise
 
-        # Loss = paper L_temporal_MSE + ad_weight * L_AD (alpha=sqrt(2), beta=1).
-        # ad_weight defaults to 1.0 (paper recipe); set 0.0 in yaml to ablate
-        # L_AD and isolate L_MSE-only contribution.
-        loss_mse = F.mse_loss(eps_pred, eps_gt)
+        # Loss space selection:
+        #   "eps" (paper recipe): supervises (flow_pred + pred_x0) toward ε_gt.
+        #     Algebraically = (1−σ_t)² · MSE(flow_pred, ε−x0). Weight peaks at
+        #     low t (≈ pixel detail regime), near zero at high t (motion regime).
+        #     Mismatched for DMD few-step student: weight at t=1000 ≈ 0.
+        #   "x0": supervises pred_x0 toward clean latent x0_gt directly.
+        #     Algebraically = σ_t² · MSE(flow_pred, ε−x0). Weight peaks at
+        #     high t (motion / coarse-structure regime), matches what DMD
+        #     distillation actually trained the student to output (x0 at the
+        #     4 few-step anchors).
+        loss_space = str(getattr(cfg, "loss_space", "eps"))
+        if loss_space == "x0":
+            target_pred, target_gt = pred_x0, latent
+        elif loss_space == "eps":
+            target_pred, target_gt = flow_pred + pred_x0, noise
+        else:
+            raise ValueError(f"unknown loss_space: {loss_space}")
+
+        # Loss = L_MSE + ad_weight * L_AD (alpha=sqrt(2), beta=1 by paper).
+        # ad_weight defaults to 1.0 (paper recipe); 0.0 ablates L_AD.
+        loss_mse = F.mse_loss(target_pred, target_gt)
         loss_ad = appearance_debias_loss(
-            eps_pred, eps_gt,
+            target_pred, target_gt,
             alpha=float(cfg.ad_alpha), beta=float(cfg.ad_beta),
         )
         ad_weight = float(getattr(cfg, "ad_weight", 1.0))
