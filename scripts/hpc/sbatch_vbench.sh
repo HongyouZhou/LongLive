@@ -8,8 +8,9 @@
 # 8 workers each load Wan-1.3B + T5-XXL + LoRA → ~18 GB CPU each at boot,
 # ~150 GB total before VBench scoring loads detectron2/CLIP/DOVER on top.
 # Empirical 200 G triggered cgroup pressure → NFS IO stalled during boot.
-# 800 G matches sbatch_train.sh's headroom.
-#SBATCH --mem=800G
+# 400 G is the safe lower bound — fits on A100 pgpu0X (256-384G RAM) idle
+# nodes when pgpu1X H200 queue is congested. Was 800G for max headroom.
+#SBATCH --mem=400G
 #SBATCH --time=06:00:00
 #SBATCH --output=logs/%x-%j.out
 # Same exclusions as training — DGX A100s lack VRAM headroom for the
