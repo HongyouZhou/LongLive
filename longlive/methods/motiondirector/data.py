@@ -42,6 +42,7 @@ class SkateboardingLatentDataset:
         resolution: int = 480,
         category: str = "Skateboarding",
         device: torch.device | str = "cuda",
+        single_video: bool = False,
     ):
         self.data_root = Path(data_root)
         self.vae = vae
@@ -71,6 +72,18 @@ class SkateboardingLatentDataset:
             raise RuntimeError(
                 f"No clips found for category {category!r} in {manifest}"
             )
+        # Sort for reproducibility — single_video mode picks clips[0] which
+        # must be deterministic across runs.
+        self.clips.sort()
+
+        # MotionDirector single-video setup: train on the first clip only.
+        # Mirrors paper's `config_single_video.yaml` which trains on one
+        # reference video. The chosen clip's path is exposed via
+        # `self.train_clip_path` so downstream inversion (noise_prior) can
+        # use the same reference at eval.
+        if single_video:
+            self.clips = self.clips[:1]
+        self.train_clip_path = self.clips[0]
 
         # Train caption from ucf_sports.yaml (same for all clips in a category).
         with open(UCF_PROMPTS_YAML) as f:
@@ -79,7 +92,9 @@ class SkateboardingLatentDataset:
 
         print(
             f"[SkateboardingLatentDataset] category={category!r} "
-            f"{len(self.clips)} clips, caption={self.train_caption!r}"
+            f"{len(self.clips)} clip{'s' if len(self.clips) > 1 else ''}"
+            f"{' (single-video mode)' if single_video else ''}, "
+            f"ref={self.train_clip_path.name}, caption={self.train_caption!r}"
         )
 
     def _load_clip_pixels(self, path: Path) -> torch.Tensor:

@@ -1,0 +1,73 @@
+# MotionDirector single-video paper-style ablation.
+#
+# Re-frames our previous +AD / no_AD runs (which used over-spec hyperparams)
+# back to paper recipe — single LoRA on Wan unified attention (no dual-LoRA
+# split since Wan has no Transformer2D/Temporal class boundary), but with
+# paper's exact hyperparams (rank 32 / lr 5e-4 / dropout 0.1 / wd 1e-2 /
+# 150 step / uniform t / single ref clip).
+#
+# Hypothesis: previous regression was overcapacity overfit (rank 256 + dropout 0
+# + wd 0 + 12 clips × 500 steps), not architectural incompatibility. Paper
+# hyperparams + single-video should isolate this — if motion_fidelity returns
+# toward baseline ≥0.35, hyperparams were the culprit.
+#
+# Out_dir is separate so previous ckpts aren't overwritten.
+
+# data
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+single_video: true            # NEW: train on clips[0] only (paper single-video setup)
+frame_count: 81               # Wan inference default — NOT paper's 16
+resolution: 480               # Wan inference default — NOT paper's 384
+
+# backbone — same as skateboarding_fewstep.yaml
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA (merged into base before our LoRA)
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# Our LoRA — paper-style hyperparams
+adapter:
+  type: lora
+  rank: 32                    # paper: 32 (was 256)
+  alpha: 32                   # paper: 32 (was 256)
+  dropout: 0.1                # paper: 0.1 (was 0.0)
+  verbose: false              # rank-32 + 360-block * 6 linear = ~2160 layers, mute
+
+# training
+train_steps: 150              # paper single-video: 150 (was 500)
+lr: 5.0e-4                    # paper: 5e-4 (was 5e-5)
+weight_decay: 1.0e-2          # paper AdamW wd: 1e-2 (was 0)
+warmup_steps: 20              # smaller warmup for shorter run
+null_prompt_p: 0.1
+
+# Timestep sampling — paper style: uniform across schedule
+t_sampling_mode: uniform
+t_min: 20
+t_max: 980
+# anchor list kept for backwards compat; ignored when mode=uniform
+t_anchors: [1000, 750, 500, 250]
+
+# loss — L_MSE + L_AD with paper alpha=sqrt(2), beta=1
+ad_alpha: 1.4142135623730951
+ad_beta: 1.0
+ad_weight: 1.0                # paper recipe
+
+# logging / ckpt
+out_dir: ${oc.env:LL_DATA}/motiondirector_runs/skateboarding_paperstyle
+ckpt_interval: 50
+ckpt_keep_last: 3
+
+# misc
+seed: 0

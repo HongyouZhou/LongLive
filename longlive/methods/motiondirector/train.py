@@ -169,6 +169,7 @@ def main():
         resolution=int(cfg.resolution),
         category=str(cfg.category),
         device=device,
+        single_video=bool(getattr(cfg, "single_video", False)),
     )
 
     # ---------- Text encoder: load → encode → free ----------
