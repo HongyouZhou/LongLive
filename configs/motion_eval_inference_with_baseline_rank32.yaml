@@ -1,0 +1,52 @@
+# Motion-customization eval inference — baseline-merged + idea-layer rank 32.
+#
+# Same as motion_eval_inference_with_baseline.yaml except `adapter.rank/alpha`
+# = 32 to match paper-style ckpts trained via
+# longlive/methods/motiondirector/configs/skateboarding_paperstyle.yaml.
+# `baseline_adapter` stays at 256 (matches NVlabs lora.pt shape).
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+
+# inference defaults; dispatcher overrides per-run paths
+data_path: longlive_models/prompts/vidprom_filtered_extended.txt
+output_folder: motion_eval_runs/_unset
+inference_iter: -1
+num_output_frames: 21
+use_ema: false
+seed: 0
+num_samples: 1
+save_with_index: true
+global_sink: true
+context_noise: 0
+
+generator_ckpt: longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA (rank 256, merged into base)
+baseline_lora_ckpt: longlive_models/models/lora.pt
+baseline_adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+# Idea-layer LoRA — rank 32 (paperstyle)
+lora_ckpt: ""
+adapter:
+  type: "lora"
+  rank: 32
+  alpha: 32
+  dropout: 0.1
+  dtype: "bfloat16"
+  verbose: false
