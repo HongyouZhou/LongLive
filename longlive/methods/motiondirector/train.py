@@ -37,8 +37,12 @@ from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from longlive.methods.motiondirector.data import SkateboardingLatentDataset
-from longlive.methods.motiondirector.losses import appearance_debias_loss
+from longlive.methods.motiondirector.data import GeneralPromptDataset, SkateboardingLatentDataset
+from longlive.methods.motiondirector.losses import (
+    appearance_debias_loss,
+    prior_consistency_loss,
+    trajectory_cosine_loss,
+)
 from longlive.utils.distributed import fsdp_wrap, launch_distributed_job
 from longlive.utils.lora_utils import configure_adapter_for_model
 from longlive.utils.wan_wrapper import (
@@ -172,12 +176,32 @@ def main():
         single_video=bool(getattr(cfg, "single_video", False)),
     )
 
+    # General-prompt dataset (anti-drift anchor in trajectory_cosine mode only).
+    # docs/02.md §5.2 — reuses scripts/prepare_openvid.py output, no extra prep.
+    loss_space = str(getattr(cfg, "loss_space", "eps"))
+    general_dataset = None
+    if loss_space == "trajectory_cosine":
+        general_dataset = GeneralPromptDataset(
+            data_root=cfg.data_root,
+            vae=vae,
+            frame_count=int(cfg.frame_count),
+            resolution=int(cfg.resolution),
+            device=device,
+            manifest_rel=str(getattr(cfg, "general_manifest_rel", "prompts/motion_pairs_train.jsonl")),
+            max_clips=int(getattr(cfg, "general_max_clips", 50)),
+            seed=int(getattr(cfg, "general_seed", 0)),
+        )
+
     # ---------- Text encoder: load → encode → free ----------
     # Pre-cache null + train_caption embeddings, then drop the ~20 GB fp32
     # umt5 before loading the backbone so peak GPU per rank stays well clear
     # of (text_encoder + backbone). Valid for single-caption training only;
     # multi-caption training (paper Table 1, 12 motions) needs the encoder
     # to stay online instead.
+    #
+    # In trajectory_cosine mode we ALSO pre-encode the general subset's
+    # captions here so the encoder can still be freed afterwards. Memory cost:
+    # ~50 cond_dicts × ~1 MB each = trivial.
     if rank0:
         print("[motiondirector] loading text encoder (cache embeddings then free) ...", flush=True)
     text_encoder = WanTextEncoder()
@@ -185,6 +209,26 @@ def main():
     with torch.no_grad():
         null_cond = {k: v.detach().clone() for k, v in text_encoder([""]).items()}
         train_cond = {k: v.detach().clone() for k, v in text_encoder([dataset.train_caption]).items()}
+
+        # caption (str) → cond_dict mapping; deduplicates if any captions
+        # happen to repeat across entries (they may in OpenVid). Sample-time
+        # lookup is then a single dict access.
+        general_caption_to_cond: dict[str, dict] | None = None
+        if general_dataset is not None:
+            general_caption_to_cond = {}
+            for _, caption in general_dataset.entries:
+                if caption in general_caption_to_cond:
+                    continue
+                cond = text_encoder([caption])
+                general_caption_to_cond[caption] = {
+                    k: v.detach().clone() for k, v in cond.items()
+                }
+            if rank0:
+                print(
+                    f"[motiondirector] pre-encoded {len(general_caption_to_cond)} "
+                    f"unique captions from {len(general_dataset.entries)} entries",
+                    flush=True,
+                )
     del text_encoder
     torch.cuda.empty_cache()
 
@@ -398,23 +442,78 @@ def main():
         #     high t (motion / coarse-structure regime), matches what DMD
         #     distillation actually trained the student to output (x0 at the
         #     4 few-step anchors).
+        #   "trajectory_cosine": no L_MSE on eps/x0 at all. Supervision is
+        #     inter-frame delta cosine on pred_x0 vs reference latent
+        #     (L_motion) plus prior-consistency MSE between LoRA-on and
+        #     LoRA-off student on a general (non-reference) clip (L_anchor).
+        #     See docs/02.md.
         loss_space = str(getattr(cfg, "loss_space", "eps"))
-        if loss_space == "x0":
-            target_pred, target_gt = pred_x0, latent
-        elif loss_space == "eps":
-            target_pred, target_gt = flow_pred + pred_x0, noise
+        if loss_space == "trajectory_cosine":
+            # ---- L_motion (reference batch) ----
+            loss_motion = trajectory_cosine_loss(pred_x0, latent)
+
+            # ---- L_anchor (general batch) ----
+            # Sample a generic clip + look up its pre-encoded cond.
+            z_gen, caption_g = general_dataset.sample()
+            cond_gen = general_caption_to_cond[caption_g]
+
+            # Independent noise + anchor timestep for the general batch
+            # (decoupled from the reference batch's t to maximize anchor
+            # coverage across the 4 anchors per step).
+            noise_g = torch.randn_like(z_gen)
+            n_frames_g = z_gen.shape[1]
+            if t_mode == "anchor_only":
+                anchors_g = list(getattr(cfg, "t_anchors", [1000, 750, 500, 250]))
+                t_scalar_g = torch.tensor(
+                    [anchors_g[torch.randint(0, len(anchors_g), (1,)).item()]],
+                    device=device, dtype=torch.long,
+                )
+            else:
+                t_scalar_g = torch.randint(
+                    int(cfg.t_min), int(cfg.t_max), (1,), device=device,
+                )
+            timestep_g = t_scalar_g.expand(1, n_frames_g).contiguous()
+            noisy_g = sched.add_noise(
+                z_gen.flatten(0, 1),
+                noise_g.flatten(0, 1),
+                timestep_g.flatten(0, 1),
+            ).unflatten(0, z_gen.shape[:2])
+
+            # LoRA-on prediction (carries grad through LoRA params)
+            _, pred_x0_lora = generator(noisy_g, cond_gen, timestep_g)
+            # LoRA-off prediction (frozen base; PEFT disable_adapter context)
+            with generator.model.disable_adapter():
+                with torch.no_grad():
+                    _, pred_x0_base = generator(noisy_g, cond_gen, timestep_g)
+
+            loss_anchor = prior_consistency_loss(pred_x0_lora, pred_x0_base)
+
+            lambda_motion = float(getattr(cfg, "lambda_motion", 1.0))
+            lambda_anchor = float(getattr(cfg, "lambda_anchor", 1.0))
+            loss = lambda_motion * loss_motion + lambda_anchor * loss_anchor
+
+            # Logging slots — reuse mse / ad keys so existing wandb
+            # bucketing infra still produces meaningful series; the
+            # semantics differ but the dashboard columns line up.
+            loss_mse = loss_motion
+            loss_ad = loss_anchor
+        elif loss_space in ("eps", "x0"):
+            if loss_space == "x0":
+                target_pred, target_gt = pred_x0, latent
+            else:
+                target_pred, target_gt = flow_pred + pred_x0, noise
+
+            # Loss = L_MSE + ad_weight * L_AD (alpha=sqrt(2), beta=1 by paper).
+            # ad_weight defaults to 1.0 (paper recipe); 0.0 ablates L_AD.
+            loss_mse = F.mse_loss(target_pred, target_gt)
+            loss_ad = appearance_debias_loss(
+                target_pred, target_gt,
+                alpha=float(cfg.ad_alpha), beta=float(cfg.ad_beta),
+            )
+            ad_weight = float(getattr(cfg, "ad_weight", 1.0))
+            loss = loss_mse + ad_weight * loss_ad
         else:
             raise ValueError(f"unknown loss_space: {loss_space}")
-
-        # Loss = L_MSE + ad_weight * L_AD (alpha=sqrt(2), beta=1 by paper).
-        # ad_weight defaults to 1.0 (paper recipe); 0.0 ablates L_AD.
-        loss_mse = F.mse_loss(target_pred, target_gt)
-        loss_ad = appearance_debias_loss(
-            target_pred, target_gt,
-            alpha=float(cfg.ad_alpha), beta=float(cfg.ad_beta),
-        )
-        ad_weight = float(getattr(cfg, "ad_weight", 1.0))
-        loss = loss_mse + ad_weight * loss_ad
 
         optimizer.zero_grad()
         loss.backward()

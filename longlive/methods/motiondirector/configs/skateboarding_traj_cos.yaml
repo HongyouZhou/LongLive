@@ -1,0 +1,80 @@
+# MotionDirector LoRA finetune — latent inter-frame delta cosine variant.
+#
+# Drops L_MSE + L_AD entirely. Supervision is:
+#   L_motion = trajectory_cosine_loss(pred_x0, z_ref)
+#             — cosine on student-vs-reference inter-frame deltas in latent
+#               x0 space. Scale-invariant + appearance-cancelling.
+#   L_anchor = prior_consistency_loss(pred_x0_lora, pred_x0_base)
+#             — anti-drift MSE between LoRA-on and LoRA-off student on a
+#               general (non-reference) OpenVid clip.
+#   L = lambda_motion * L_motion + lambda_anchor * L_anchor
+#
+# Design rationale + ablation plan: docs/02.md.
+#
+# Baseline-comparison setup matches skateboarding_fewstep.yaml (the +AD run
+# 8919469) on all other axes — rank 256, 12 clips, anchor_only, 500 steps,
+# lr 5e-5 — so any motion_fidelity / VBench delta is attributable to the
+# loss form change alone.
+
+# data — same as skateboarding_fewstep.yaml
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+
+# backbone — same as skateboarding_fewstep.yaml
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA — same as skateboarding_fewstep.yaml
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# Our LoRA — same hyperparams as skateboarding_fewstep.yaml
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# training — same as skateboarding_fewstep.yaml
+train_steps: 500
+lr: 5.0e-5
+weight_decay: 0.0
+warmup_steps: 50
+null_prompt_p: 0.1
+
+# Timestep sampling — anchor_only on the 4 DMD anchors (same as +AD baseline).
+t_sampling_mode: anchor_only
+t_anchors: [1000, 750, 500, 250]
+t_min: 20
+t_max: 980
+
+# === Loss form — the key change ===
+loss_space: trajectory_cosine
+lambda_motion: 1.0
+lambda_anchor: 1.0
+
+# General prompt dataset (anti-drift anchor source). Reuses
+# scripts/prepare_openvid.py output — no separate prep step.
+general_manifest_rel: prompts/motion_pairs_train.jsonl
+general_max_clips: 50
+general_seed: 0
+
+# logging / ckpt
+out_dir: ${oc.env:LL_DATA}/motiondirector_runs/skateboarding_traj_cos
+ckpt_interval: 100
+ckpt_keep_last: 5
+
+# misc
+seed: 0
