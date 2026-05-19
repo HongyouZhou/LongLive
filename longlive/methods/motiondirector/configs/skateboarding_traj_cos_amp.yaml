@@ -1,0 +1,81 @@
+# MotionDirector LoRA finetune — trajectory cosine + amplitude penalty.
+#
+# Single-variable change vs skateboarding_traj_cos.yaml (run 8943757, the
+# cosine-only baseline that beat BASE on motion_fidelity but collapsed
+# dynamic_degree 50 → 29). Adds L_amp to close the magnitude hole:
+#
+#   L_dir = mean(1 - cos(Δs[f,k], Δr[f]))                   direction
+#   L_amp = mean(relu(1 - ||Δs[f,k]|| / ||Δr[f]||)^2)       magnitude (asymmetric)
+#   L     = lambda_dir * L_dir + lambda_amp * L_amp
+#
+# L_anchor still off — disable_adapter × FSDP × checkpoint incompat not
+# yet resolved; gating L_anchor by lambda_anchor > 0 (train.py) routes
+# around it.
+#
+# Expectation: dynamic_degree returns toward BASE (~50) while preserving
+# the motion_fidelity +0.082 gain. If both → complete supervision-form
+# story; if dynamic_degree recovers but motion_fidelity regresses → L_amp
+# weighting too aggressive, sweep down lambda_amp.
+
+# data — same as cosine-only baseline
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+
+# backbone — same as cosine-only baseline
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA — same as cosine-only baseline
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# Our LoRA — same hyperparams as cosine-only baseline
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# training — same as cosine-only baseline
+train_steps: 500
+lr: 5.0e-5
+weight_decay: 0.0
+warmup_steps: 50
+null_prompt_p: 0.1
+
+# Timestep sampling — anchor_only on the 4 DMD anchors
+t_sampling_mode: anchor_only
+t_anchors: [1000, 750, 500, 250]
+t_min: 20
+t_max: 980
+
+# === Loss form ===
+loss_space: trajectory_cosine
+lambda_dir: 1.0
+lambda_amp: 1.0     # <-- the only change vs skateboarding_traj_cos.yaml
+lambda_anchor: 0.0
+
+# General prompt dataset (only used when lambda_anchor > 0).
+general_manifest_rel: prompts/motion_pairs_train.jsonl
+general_max_clips: 50
+general_seed: 0
+
+# logging / ckpt — separate out_dir so eval doesn't overwrite cosine-only run
+out_dir: ${oc.env:LL_DATA}/motiondirector_runs/skateboarding_traj_cos_amp
+ckpt_interval: 100
+ckpt_keep_last: 5
+
+# misc
+seed: 0

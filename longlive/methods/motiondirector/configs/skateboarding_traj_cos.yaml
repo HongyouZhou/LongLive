@@ -61,14 +61,18 @@ t_min: 20
 t_max: 980
 
 # === Loss form — the key change ===
+# Loss = lambda_dir * L_dir   (cosine on inter-frame deltas — direction)
+#      + lambda_amp * L_amp   (relu(1 - ||Δs||/||Δr||)^2 — magnitude; off here)
+#      + lambda_anchor * L_anchor   (LoRA-on/off MSE — anti-drift; off here)
 loss_space: trajectory_cosine
-lambda_motion: 1.0
+lambda_dir: 1.0
+lambda_amp: 0.0
 # lambda_anchor = 0.0 — anchor term disabled in this run.
 # Reason: the LoRA-off forward inside PEFT disable_adapter() interacts badly
 # with FSDP + torch.utils.checkpoint (CheckpointError on recompute, run 8939766).
-# Validating L_motion in isolation first; once the cosine-only signal is
+# Validating L_dir in isolation first; once the cosine-only signal is
 # confirmed we'll add the anchor back via a second frozen-base-model copy
-# instead of disable_adapter (option C in design discussion).
+# instead of disable_adapter.
 lambda_anchor: 0.0
 
 # General prompt dataset (only used when lambda_anchor > 0; kept here for

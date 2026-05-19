@@ -10,16 +10,23 @@ Two families used in this project:
     frame residual (motion). Paper alpha=sqrt(2), beta=1.
   L_spatial is dropped — Wan DiT has no Transformer2D / Temporal split.
 
-(B) Latent inter-frame delta cosine (docs/02.md) — replaces (A) entirely
+(B) Latent inter-frame delta supervision (docs/02.md) — replaces (A) entirely
     when `loss_space=trajectory_cosine`:
-  * `trajectory_cosine_loss` — supervises frame-to-frame structure in
-    student's predicted clean latent against the reference clip's latent,
-    via cosine on per-frame deltas. Scale-invariant + appearance-cancelling
-    by construction. The fundamental departure from (A): supervision unit
-    is *inter-frame relations*, not per-point eps/x0 values, avoiding the
-    4-anchor concentration that collapses (A) on a DMD few-step student.
-  * `prior_consistency_loss` — anti-drift regularizer; on non-reference
-    prompts, the LoRA-on prediction must agree with the LoRA-off base.
+  * `trajectory_cosine_loss` (L_dir) — supervises *direction* of frame-to-
+    frame change in student's predicted clean latent against reference,
+    via cosine on inter-frame deltas. Scale-invariant + appearance-cancelling.
+    Fundamental departure from (A): supervision unit is inter-frame
+    relations, not per-point eps/x0 values, avoiding the 4-anchor
+    concentration that collapses (A) on a DMD few-step student.
+  * `amplitude_penalty_loss` (L_amp) — supervises *magnitude* of the same
+    inter-frame delta. Companion to L_dir; without it, cosine's scale
+    invariance lets the LoRA collapse motion magnitude (Risk 1 in
+    docs/02.md §8, observed in 2026-05-19 traj_cos run: dynamic_degree
+    29 vs BASE 50).
+  * `prior_consistency_loss` (L_anchor) — anti-drift regularizer; on
+    non-reference prompts, LoRA-on prediction must agree with LoRA-off
+    base. Currently disabled (lambda_anchor=0) due to disable_adapter ×
+    FSDP × checkpoint incompat (Risk 3); pending option-C fix.
 """
 import math
 
@@ -85,6 +92,48 @@ def trajectory_cosine_loss(
     delta_r = delta_r.flatten(start_dim=2)
     cos = F.cosine_similarity(delta_s, delta_r, dim=-1, eps=eps)
     return (1.0 - cos).mean()
+
+
+def amplitude_penalty_loss(
+    pred_x0: torch.Tensor,
+    z_ref: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """L_amp — single-sided amplitude penalty companion to trajectory_cosine_loss.
+
+    For each pair of adjacent latent frames (f, f+1):
+        delta_s[f] = pred_x0[f+1] - pred_x0[f]      student
+        delta_r[f] = z_ref[f+1]   - z_ref[f]         reference (detached)
+        ratio[f]   = ||delta_s[f]|| / ||delta_r[f]||
+        loss[f]    = relu(1 - ratio[f])^2
+    Mean-reduced over batch and frame pairs.
+
+    Penalty fires only when student's inter-frame delta norm is *smaller*
+    than reference's (ratio < 1). Student motion exceeding reference
+    amplitude is unpenalized — we don't want to clamp generation magnitude
+    just because the LoRA happened to overshoot, only catch the failure
+    mode that cosine alone exhibits (Risk 1 in docs/02.md §8: cosine is
+    scale-invariant so the model can match direction with arbitrarily
+    small magnitude).
+
+    Args:
+        pred_x0: (B, F, C, H, W) — student's predicted clean latent at one
+            denoising anchor. Same forward output as trajectory_cosine_loss.
+        z_ref:   (B, F, C, H, W) — reference clip's clean VAE-encoded latent.
+
+    Notes:
+        * Normalized by reference norm (ratio form) so loss is in [0, 1],
+          numerically comparable to trajectory_cosine_loss in [0, 2]. Lets
+          a single lambda_amp on the order of 1.0 give meaningful weighting.
+        * Reference norm is detached. Gradient flows only through student's
+          delta_s magnitude.
+    """
+    delta_s = pred_x0[:, 1:] - pred_x0[:, :-1]
+    delta_r = z_ref[:, 1:] - z_ref[:, :-1]
+    norm_s = delta_s.flatten(start_dim=2).norm(dim=-1)
+    norm_r = delta_r.flatten(start_dim=2).norm(dim=-1).detach()
+    ratio = norm_s / (norm_r + eps)
+    return F.relu(1.0 - ratio).pow(2).mean()
 
 
 def prior_consistency_loss(

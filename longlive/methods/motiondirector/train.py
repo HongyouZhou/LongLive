@@ -39,6 +39,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from longlive.methods.motiondirector.data import GeneralPromptDataset, SkateboardingLatentDataset
 from longlive.methods.motiondirector.losses import (
+    amplitude_penalty_loss,
     appearance_debias_loss,
     prior_consistency_loss,
     trajectory_cosine_loss,
@@ -182,7 +183,7 @@ def main():
     # disable_adapter / second-forward path entirely (Risk 3: that path tripped
     # torch.utils.checkpoint mismatch under FSDP + PEFT in run 8939766).
     loss_space = str(getattr(cfg, "loss_space", "eps"))
-    lambda_anchor_init = float(getattr(cfg, "lambda_anchor", 1.0))
+    lambda_anchor_init = float(getattr(cfg, "lambda_anchor", 0.0))
     general_dataset = None
     if loss_space == "trajectory_cosine" and lambda_anchor_init > 0.0:
         general_dataset = GeneralPromptDataset(
@@ -453,11 +454,18 @@ def main():
         #     See docs/02.md.
         loss_space = str(getattr(cfg, "loss_space", "eps"))
         if loss_space == "trajectory_cosine":
-            # ---- L_motion (reference batch) ----
-            loss_motion = trajectory_cosine_loss(pred_x0, latent)
+            # ---- L_dir: cosine on inter-frame deltas (direction) ----
+            loss_dir = trajectory_cosine_loss(pred_x0, latent)
 
-            lambda_motion = float(getattr(cfg, "lambda_motion", 1.0))
-            lambda_anchor = float(getattr(cfg, "lambda_anchor", 1.0))
+            # ---- L_amp: single-sided amplitude penalty (magnitude) ----
+            # Companion to L_dir. cosine alone lets the LoRA collapse motion
+            # magnitude (Risk 1; observed in 2026-05-19 traj_cos run:
+            # dynamic_degree 29 vs BASE 50). L_amp closes that hole.
+            loss_amp = amplitude_penalty_loss(pred_x0, latent)
+
+            lambda_dir = float(getattr(cfg, "lambda_dir", 1.0))
+            lambda_amp = float(getattr(cfg, "lambda_amp", 0.0))
+            lambda_anchor = float(getattr(cfg, "lambda_anchor", 0.0))
 
             # ---- L_anchor (general batch) — gated by lambda_anchor > 0 ----
             # The LoRA-off forward inside `disable_adapter()` interacts badly
@@ -495,15 +503,20 @@ def main():
 
                 loss_anchor = prior_consistency_loss(pred_x0_lora, pred_x0_base)
             else:
-                loss_anchor = torch.zeros((), device=device, dtype=loss_motion.dtype)
+                loss_anchor = torch.zeros((), device=device, dtype=loss_dir.dtype)
 
-            loss = lambda_motion * loss_motion + lambda_anchor * loss_anchor
+            loss = (
+                lambda_dir * loss_dir
+                + lambda_amp * loss_amp
+                + lambda_anchor * loss_anchor
+            )
 
             # Logging slots — reuse mse / ad keys so existing wandb
-            # bucketing infra still produces meaningful series; the
-            # semantics differ but the dashboard columns line up.
-            loss_mse = loss_motion
-            loss_ad = loss_anchor
+            # bucketing infra still produces meaningful series; with
+            # lambda_anchor=0 today, ad slot carries L_amp (the active
+            # anti-failure-mode companion to L_dir).
+            loss_mse = loss_dir
+            loss_ad = loss_amp
         elif loss_space in ("eps", "x0"):
             if loss_space == "x0":
                 target_pred, target_gt = pred_x0, latent
