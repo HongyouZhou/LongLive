@@ -178,9 +178,13 @@ def main():
 
     # General-prompt dataset (anti-drift anchor in trajectory_cosine mode only).
     # docs/02.md §5.2 — reuses scripts/prepare_openvid.py output, no extra prep.
+    # Guarded by lambda_anchor>0 so an ablation with lambda_anchor=0 skips the
+    # disable_adapter / second-forward path entirely (Risk 3: that path tripped
+    # torch.utils.checkpoint mismatch under FSDP + PEFT in run 8939766).
     loss_space = str(getattr(cfg, "loss_space", "eps"))
+    lambda_anchor_init = float(getattr(cfg, "lambda_anchor", 1.0))
     general_dataset = None
-    if loss_space == "trajectory_cosine":
+    if loss_space == "trajectory_cosine" and lambda_anchor_init > 0.0:
         general_dataset = GeneralPromptDataset(
             data_root=cfg.data_root,
             vae=vae,
@@ -452,44 +456,47 @@ def main():
             # ---- L_motion (reference batch) ----
             loss_motion = trajectory_cosine_loss(pred_x0, latent)
 
-            # ---- L_anchor (general batch) ----
-            # Sample a generic clip + look up its pre-encoded cond.
-            z_gen, caption_g = general_dataset.sample()
-            cond_gen = general_caption_to_cond[caption_g]
-
-            # Independent noise + anchor timestep for the general batch
-            # (decoupled from the reference batch's t to maximize anchor
-            # coverage across the 4 anchors per step).
-            noise_g = torch.randn_like(z_gen)
-            n_frames_g = z_gen.shape[1]
-            if t_mode == "anchor_only":
-                anchors_g = list(getattr(cfg, "t_anchors", [1000, 750, 500, 250]))
-                t_scalar_g = torch.tensor(
-                    [anchors_g[torch.randint(0, len(anchors_g), (1,)).item()]],
-                    device=device, dtype=torch.long,
-                )
-            else:
-                t_scalar_g = torch.randint(
-                    int(cfg.t_min), int(cfg.t_max), (1,), device=device,
-                )
-            timestep_g = t_scalar_g.expand(1, n_frames_g).contiguous()
-            noisy_g = sched.add_noise(
-                z_gen.flatten(0, 1),
-                noise_g.flatten(0, 1),
-                timestep_g.flatten(0, 1),
-            ).unflatten(0, z_gen.shape[:2])
-
-            # LoRA-on prediction (carries grad through LoRA params)
-            _, pred_x0_lora = generator(noisy_g, cond_gen, timestep_g)
-            # LoRA-off prediction (frozen base; PEFT disable_adapter context)
-            with generator.model.disable_adapter():
-                with torch.no_grad():
-                    _, pred_x0_base = generator(noisy_g, cond_gen, timestep_g)
-
-            loss_anchor = prior_consistency_loss(pred_x0_lora, pred_x0_base)
-
             lambda_motion = float(getattr(cfg, "lambda_motion", 1.0))
             lambda_anchor = float(getattr(cfg, "lambda_anchor", 1.0))
+
+            # ---- L_anchor (general batch) — gated by lambda_anchor > 0 ----
+            # The LoRA-off forward inside `disable_adapter()` interacts badly
+            # with FSDP + torch.utils.checkpoint (mismatched saved-tensor count
+            # on recompute, see run 8939766 traceback). Until that's resolved
+            # via a second-base-model copy (option C in conversation), we skip
+            # the entire anti-drift path when lambda_anchor == 0.
+            if lambda_anchor > 0.0 and general_dataset is not None:
+                z_gen, caption_g = general_dataset.sample()
+                cond_gen = general_caption_to_cond[caption_g]
+
+                noise_g = torch.randn_like(z_gen)
+                n_frames_g = z_gen.shape[1]
+                if t_mode == "anchor_only":
+                    anchors_g = list(getattr(cfg, "t_anchors", [1000, 750, 500, 250]))
+                    t_scalar_g = torch.tensor(
+                        [anchors_g[torch.randint(0, len(anchors_g), (1,)).item()]],
+                        device=device, dtype=torch.long,
+                    )
+                else:
+                    t_scalar_g = torch.randint(
+                        int(cfg.t_min), int(cfg.t_max), (1,), device=device,
+                    )
+                timestep_g = t_scalar_g.expand(1, n_frames_g).contiguous()
+                noisy_g = sched.add_noise(
+                    z_gen.flatten(0, 1),
+                    noise_g.flatten(0, 1),
+                    timestep_g.flatten(0, 1),
+                ).unflatten(0, z_gen.shape[:2])
+
+                _, pred_x0_lora = generator(noisy_g, cond_gen, timestep_g)
+                with generator.model.disable_adapter():
+                    with torch.no_grad():
+                        _, pred_x0_base = generator(noisy_g, cond_gen, timestep_g)
+
+                loss_anchor = prior_consistency_loss(pred_x0_lora, pred_x0_base)
+            else:
+                loss_anchor = torch.zeros((), device=device, dtype=loss_motion.dtype)
+
             loss = lambda_motion * loss_motion + lambda_anchor * loss_anchor
 
             # Logging slots — reuse mse / ad keys so existing wandb

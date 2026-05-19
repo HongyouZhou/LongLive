@@ -63,10 +63,16 @@ t_max: 980
 # === Loss form — the key change ===
 loss_space: trajectory_cosine
 lambda_motion: 1.0
-lambda_anchor: 1.0
+# lambda_anchor = 0.0 — anchor term disabled in this run.
+# Reason: the LoRA-off forward inside PEFT disable_adapter() interacts badly
+# with FSDP + torch.utils.checkpoint (CheckpointError on recompute, run 8939766).
+# Validating L_motion in isolation first; once the cosine-only signal is
+# confirmed we'll add the anchor back via a second frozen-base-model copy
+# instead of disable_adapter (option C in design discussion).
+lambda_anchor: 0.0
 
-# General prompt dataset (anti-drift anchor source). Reuses
-# scripts/prepare_openvid.py output — no separate prep step.
+# General prompt dataset (only used when lambda_anchor > 0; kept here for
+# easy re-enabling in subsequent ablation runs).
 general_manifest_rel: prompts/motion_pairs_train.jsonl
 general_max_clips: 50
 general_seed: 0
