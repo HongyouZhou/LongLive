@@ -23,6 +23,11 @@ Two families used in this project:
     invariance lets the LoRA collapse motion magnitude (Risk 1 in
     docs/02.md §8, observed in 2026-05-19 traj_cos run: dynamic_degree
     29 vs BASE 50).
+  * `trajectory_nmse_loss` (L_nmse) — per-frame normalized MSE on the same
+    inter-frame deltas. Strict superset of L_dir: penalizes direction AND
+    magnitude in one coherent gradient signal. Supersedes the L_dir+L_amp
+    pair (2026-05-19 traj_cos+amp run showed the two terms conflict when
+    cosine is intermediate — see docs/02.md §12). Do NOT combine with L_amp.
   * `prior_consistency_loss` (L_anchor) — anti-drift regularizer; on
     non-reference prompts, LoRA-on prediction must agree with LoRA-off
     base. Currently disabled (lambda_anchor=0) due to disable_adapter ×
@@ -134,6 +139,62 @@ def amplitude_penalty_loss(
     norm_r = delta_r.flatten(start_dim=2).norm(dim=-1).detach()
     ratio = norm_s / (norm_r + eps)
     return F.relu(1.0 - ratio).pow(2).mean()
+
+
+def trajectory_nmse_loss(
+    pred_x0: torch.Tensor,
+    z_ref: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """L_nmse — per-frame normalized MSE on inter-frame deltas.
+
+    For each pair of adjacent latent frames (f, f+1):
+        delta_s[f] = pred_x0[f+1] - pred_x0[f]      student
+        delta_r[f] = z_ref[f+1]   - z_ref[f]         reference (detached)
+        loss[f]    = ||delta_s[f] - delta_r[f]||^2 / ||delta_r[f]||^2
+    Mean-reduced over batch and frame pairs.
+
+    Strict superset of `trajectory_cosine_loss`:
+      Let r = ||delta_s|| / ||delta_r||, c = cos(delta_s, delta_r).
+        nmse = r^2 - 2 r c + 1
+      The unique minimum is at delta_s = delta_r (i.e. c=1 AND r=1).
+      Cosine's degenerate ray of optima `delta_s = eps * delta_r` (c=1 with
+      any r>=0) is no longer flat: nmse = (r-1)^2 there, pulling r->1.
+
+    Why this is not just `MSE on x0 in disguise`:
+        Expand ||(z_s[f+1] - z_r[f+1]) - (z_s[f] - z_r[f])||^2
+            = ||e[f+1]||^2 + ||e[f]||^2 - 2 <e[f+1], e[f]>
+        where e[f] = z_s[f] - z_r[f] is the per-frame x0 error.
+        The cross-term `-2 <e[f+1], e[f]>` cancels appearance-shared error
+        (background / subject identity, which is static across f and f+1).
+        Memorizing reference appearance does not reduce L_nmse — only
+        learning the motion pattern does. This is why the loss escapes the
+        L_MSE-on-x0 failure mode (5 prior runs collapsed motion_fidelity).
+
+    Args:
+        pred_x0: (B, F, C, H, W) — student's predicted clean latent at one
+            denoising anchor.
+        z_ref:   (B, F, C, H, W) — reference clip's clean VAE-encoded latent.
+
+    Notes:
+        * Per-frame normalization (one ratio per (b, f) pair, not per
+          pixel). High-motion frames don't dominate the mean.
+        * eps floor only protects against fully-static reference frames
+          (rare). In normal operation, denominator is O(latent_var * C*H*W)
+          which dwarfs eps.
+        * DO NOT combine with `amplitude_penalty_loss`. NMSE already
+          contains a magnitude term (the r^2 piece); adding L_amp
+          unconditionally forces r->1 even when c is poor, re-creating
+          the destructive gradient conflict observed in the 2026-05-19
+          traj_cos+amp run (motion_fidelity 0.44 -> 0.20).
+    """
+    delta_s = pred_x0[:, 1:] - pred_x0[:, :-1]
+    delta_r = z_ref[:, 1:] - z_ref[:, :-1]
+    delta_s = delta_s.flatten(start_dim=2)
+    delta_r = delta_r.flatten(start_dim=2)
+    num = (delta_s - delta_r).pow(2).sum(dim=-1)
+    den = delta_r.pow(2).sum(dim=-1).add(eps)
+    return (num / den).mean()
 
 
 def prior_consistency_loss(

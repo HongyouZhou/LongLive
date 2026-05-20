@@ -43,6 +43,7 @@ from longlive.methods.motiondirector.losses import (
     appearance_debias_loss,
     prior_consistency_loss,
     trajectory_cosine_loss,
+    trajectory_nmse_loss,
 )
 from longlive.utils.distributed import fsdp_wrap, launch_distributed_job
 from longlive.utils.lora_utils import configure_adapter_for_model
@@ -185,7 +186,7 @@ def main():
     loss_space = str(getattr(cfg, "loss_space", "eps"))
     lambda_anchor_init = float(getattr(cfg, "lambda_anchor", 0.0))
     general_dataset = None
-    if loss_space == "trajectory_cosine" and lambda_anchor_init > 0.0:
+    if loss_space in ("trajectory_cosine", "trajectory_nmse") and lambda_anchor_init > 0.0:
         general_dataset = GeneralPromptDataset(
             data_root=cfg.data_root,
             vae=vae,
@@ -204,8 +205,9 @@ def main():
     # multi-caption training (paper Table 1, 12 motions) needs the encoder
     # to stay online instead.
     #
-    # In trajectory_cosine mode we ALSO pre-encode the general subset's
-    # captions here so the encoder can still be freed afterwards. Memory cost:
+    # In trajectory_cosine / trajectory_nmse mode we ALSO pre-encode the
+    # general subset's captions here so the encoder can still be freed
+    # afterwards (only when lambda_anchor > 0). Memory cost:
     # ~50 cond_dicts × ~1 MB each = trivial.
     if rank0:
         print("[motiondirector] loading text encoder (cache embeddings then free) ...", flush=True)
@@ -452,6 +454,10 @@ def main():
         #     (L_motion) plus prior-consistency MSE between LoRA-on and
         #     LoRA-off student on a general (non-reference) clip (L_anchor).
         #     See docs/02.md.
+        #   "trajectory_nmse": per-frame normalized MSE on the same inter-
+        #     frame deltas. Strict superset of trajectory_cosine (direction
+        #     + magnitude in one gradient signal). Replaces the
+        #     L_dir + L_amp pair. See docs/02.md §12.
         loss_space = str(getattr(cfg, "loss_space", "eps"))
         if loss_space == "trajectory_cosine":
             # ---- L_dir: cosine on inter-frame deltas (direction) ----
@@ -517,6 +523,57 @@ def main():
             # anti-failure-mode companion to L_dir).
             loss_mse = loss_dir
             loss_ad = loss_amp
+        elif loss_space == "trajectory_nmse":
+            # ---- L_nmse: per-frame normalized MSE on inter-frame deltas ----
+            # Single-term direction + magnitude. Strict superset of L_dir
+            # (replaces the L_dir + L_amp pair). See docs/02.md §12.
+            loss_nmse = trajectory_nmse_loss(pred_x0, latent)
+
+            lambda_nmse = float(getattr(cfg, "lambda_nmse", 1.0))
+            lambda_anchor = float(getattr(cfg, "lambda_anchor", 0.0))
+
+            # ---- L_anchor (general batch) — gated by lambda_anchor > 0 ----
+            # Same disable_adapter × FSDP × checkpoint constraint as the
+            # trajectory_cosine branch — kept off until option-C resolves it.
+            if lambda_anchor > 0.0 and general_dataset is not None:
+                z_gen, caption_g = general_dataset.sample()
+                cond_gen = general_caption_to_cond[caption_g]
+
+                noise_g = torch.randn_like(z_gen)
+                n_frames_g = z_gen.shape[1]
+                if t_mode == "anchor_only":
+                    anchors_g = list(getattr(cfg, "t_anchors", [1000, 750, 500, 250]))
+                    t_scalar_g = torch.tensor(
+                        [anchors_g[torch.randint(0, len(anchors_g), (1,)).item()]],
+                        device=device, dtype=torch.long,
+                    )
+                else:
+                    t_scalar_g = torch.randint(
+                        int(cfg.t_min), int(cfg.t_max), (1,), device=device,
+                    )
+                timestep_g = t_scalar_g.expand(1, n_frames_g).contiguous()
+                noisy_g = sched.add_noise(
+                    z_gen.flatten(0, 1),
+                    noise_g.flatten(0, 1),
+                    timestep_g.flatten(0, 1),
+                ).unflatten(0, z_gen.shape[:2])
+
+                _, pred_x0_lora = generator(noisy_g, cond_gen, timestep_g)
+                with generator.model.disable_adapter():
+                    with torch.no_grad():
+                        _, pred_x0_base = generator(noisy_g, cond_gen, timestep_g)
+
+                loss_anchor = prior_consistency_loss(pred_x0_lora, pred_x0_base)
+            else:
+                loss_anchor = torch.zeros((), device=device, dtype=loss_nmse.dtype)
+
+            loss = lambda_nmse * loss_nmse + lambda_anchor * loss_anchor
+
+            # Logging slots — mse carries L_nmse; ad carries L_anchor (zero
+            # unless lambda_anchor > 0). No L_amp slot — NMSE internalizes
+            # magnitude, adding L_amp would conflict (docs/02.md §12).
+            loss_mse = loss_nmse
+            loss_ad = loss_anchor
         elif loss_space in ("eps", "x0"):
             if loss_space == "x0":
                 target_pred, target_gt = pred_x0, latent

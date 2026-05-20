@@ -1,0 +1,95 @@
+# MotionDirector LoRA finetune — per-frame NMSE on inter-frame latent deltas.
+#
+# Single-variable change vs skateboarding_traj_cos.yaml (run 8943757, the
+# cosine-only baseline that beat BASE on motion_fidelity 0.354 -> 0.436 but
+# collapsed dynamic_score 4.63 -> 1.61 by exploiting cosine's scale
+# invariance). NMSE replaces the cosine term in one coherent gradient:
+#
+#   L_nmse = mean_f  ||Δs[f] - Δr[f]||^2 / ||Δr[f]||^2
+#   L      = lambda_nmse * L_nmse
+#
+# Properties (vs L_dir + L_amp pair tried in run 8956221):
+#   * Direction AND magnitude in a single term — no competing gradients.
+#   * Gameable cosine valley `Δs = ε·Δr` is removed (NMSE = (1-ε)^2 there).
+#   * NMSE prefers small Δs when direction is hard (c < 1 → optimal r = c),
+#     so it stays conservative in the same regime as L_dir did instead of
+#     forcing magnitude up unconditionally (which L_amp did, destroying
+#     direction — run 8956221 motion_fidelity 0.44 -> 0.20).
+#
+# Expectation:
+#   * If cosine-only's +0.082 motion_fidelity was REAL learning (just
+#     missing magnitude), NMSE should improve on it AND restore dyn_score.
+#   * If cosine-only's win was HOLLOW (Goodhart on the cosine metric),
+#     NMSE will drop motion_fidelity toward BASE level when forced to
+#     match magnitude jointly.
+#   This run disambiguates the two — see docs/02.md §12.
+#
+# L_amp deliberately NOT included — NMSE supersedes it. Combining them
+# re-creates the destructive gradient conflict observed in run 8956221.
+# L_anchor still off (disable_adapter × FSDP × checkpoint incompat).
+
+# data — same as skateboarding_traj_cos.yaml
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+
+# backbone — same as skateboarding_traj_cos.yaml
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA — same as skateboarding_traj_cos.yaml
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# Our LoRA — same hyperparams as skateboarding_traj_cos.yaml
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# training — same as skateboarding_traj_cos.yaml
+train_steps: 500
+lr: 5.0e-5
+weight_decay: 0.0
+warmup_steps: 50
+null_prompt_p: 0.1
+
+# Timestep sampling — anchor_only on the 4 DMD anchors
+t_sampling_mode: anchor_only
+t_anchors: [1000, 750, 500, 250]
+t_min: 20
+t_max: 980
+
+# === Loss form — the only change vs skateboarding_traj_cos.yaml ===
+# L = lambda_nmse * L_nmse + lambda_anchor * L_anchor
+loss_space: trajectory_nmse
+lambda_nmse: 1.0
+# lambda_anchor = 0.0 — anchor term disabled (disable_adapter × FSDP
+# incompat). Mirrors skateboarding_traj_cos.yaml.
+lambda_anchor: 0.0
+
+# General prompt dataset (only used when lambda_anchor > 0; kept here for
+# easy re-enabling in subsequent ablation runs).
+general_manifest_rel: prompts/motion_pairs_train.jsonl
+general_max_clips: 50
+general_seed: 0
+
+# logging / ckpt — separate out_dir so eval doesn't overwrite cosine-only run
+out_dir: ${oc.env:LL_DATA}/motiondirector_runs/skateboarding_traj_nmse
+ckpt_interval: 100
+ckpt_keep_last: 5
+
+# misc
+seed: 0
