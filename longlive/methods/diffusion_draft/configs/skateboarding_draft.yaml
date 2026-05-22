@@ -1,0 +1,81 @@
+# DRaFT-K reward-gradient backprop on the 4-step DMD base.
+#
+# Mechanism: paper arXiv:2309.17400 (Clark et al., ICLR 2024) adapted to our
+# 4-step DMD-distilled Wan2.1-T2V-1.3B base + motion_fidelity (CoTracker3
+# tracklet cosine vs reference clip) reward.  See
+#   longlive/methods/diffusion_draft/__init__.py
+#   docs/superpowers/specs/2026-05-22-draft-k-design.md
+#
+# Goal: VBench Total >= 80 AND Semantic >= 70 (avoid NFT-H3 caption collapse)
+# AND UCF motion_fidelity >= 0.31 (BASE 0.348 * 0.9), AND ideally >= RAM-v1
+# (0.314) — the headline question is whether reward gradient beats RAM's
+# scalar reward on this 4-step DMD ceiling.
+
+# ---- data ----
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+# ---- backbone ----
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# ---- NVlabs baseline LoRA — merged into base ----
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# ---- Trainable LoRA: rank 32 / alpha 64 (matches NFT/RAM) ----
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+# ---- DMD rollout schedule ----
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+# ---- DRaFT-K hyperparameters ----
+outer_epochs: 20
+k_grad_steps: 2                  # backprop last K of 4 DMD steps
+k_rollouts_per_outer: 2          # # reward-branch grad-on rollouts per outer
+reward_coef: 1.0                 # multiplier on -mf; sweep up later if mf stagnates
+n_kl_steps_per_outer: 4          # # cheap KL anchor forwards per outer
+beta_kl: 1.0e-3                  # explicit anti-drift (DRaFT has no implicit anchor)
+t_anchors: [1000, 750, 500, 250] # KL branch sample t cycle
+
+# ---- Reward (motion_fidelity) ----
+reward_n_frames: 16
+reward_grid_size: 30
+fps: 16
+
+# ---- Optimizer ----
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+# ---- Output ----
+out_dir: ${oc.env:LL_DATA}/diffusion_draft_runs/skateboarding_draft
+cache_dir: ${oc.env:LL_DATA}/diffusion_draft_runs/_tracklet_cache
+scratch_dir: /tmp/diffusion_draft_scratch
+ckpt_interval: 5
+ckpt_keep_last: 4
+
+# ---- misc ----
+seed: 0
+wandb_project: longlive_diffusion_draft
+wandb_entity: hongyou
