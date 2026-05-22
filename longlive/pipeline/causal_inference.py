@@ -151,6 +151,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 2: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
+        n_denoising_steps = len(self.denoising_step_list)
         for current_num_frames in all_num_frames:
             if profile:
                 block_start.record()
@@ -159,7 +160,6 @@ class CausalInferencePipeline(torch.nn.Module):
                 :, current_start_frame:current_start_frame + current_num_frames]
 
             # Step 2.1: Spatial denoising loop
-            n_denoising_steps = len(self.denoising_step_list)
             for index, current_timestep in enumerate(self.denoising_step_list):
                 # set current timestep
                 timestep = torch.ones(
@@ -202,10 +202,9 @@ class CausalInferencePipeline(torch.nn.Module):
                         )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
-            # Step 2.3: rerun with timestep zero to update KV cache using clean context
-            # This forward only mutates the KV cache for the *next* block; it does
-            # not contribute to the gradient flow from the output to the LoRA
-            # params, so we always run it under no_grad regardless of k_grad_steps.
+            # Step 2.3: rerun with timestep zero to update KV cache using clean context.
+            # KV cache mutation doesn't propagate gradient to the output, so this
+            # always runs under no_grad regardless of k_grad_steps.
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             with torch.no_grad():
                 self.generator(
@@ -235,10 +234,6 @@ class CausalInferencePipeline(torch.nn.Module):
             vae_start.record()
 
         # Step 3: Decode the output
-        # When k_grad_steps > 0, decode inherits caller grad mode so the
-        # CoTracker reward downstream can backprop through VAE.  When = 0,
-        # we keep decode under no_grad (matches original behavior for all
-        # existing inference callers).
         decode_ctx = torch.enable_grad() if k_grad_steps > 0 else torch.no_grad()
         with decode_ctx:
             if getattr(self.args.model_kwargs, "use_infinite_attention", False):
