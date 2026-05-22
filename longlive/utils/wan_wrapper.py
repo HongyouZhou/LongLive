@@ -209,21 +209,35 @@ class WanVAEWrapper(torch.nn.Module):
     def _decode_grad_ckpt(self, z: torch.Tensor, scale) -> torch.Tensor:
         """Per-frame gradient-checkpointed VAE decode for DRaFT-K.
 
-        Mirrors WanVAE_.decode (wan/modules/vae.py:545) but:
-          * Disables temporal cache (feat_cache=None) — each latent frame
-            decodes independently with zero-padded temporal context.
-            Forward peak ≈ 1 frame's decoder activations instead of 21.
-          * Wraps each per-frame decoder call with
-            torch.utils.checkpoint(use_reentrant=False) so forward
-            activations are dropped after each frame and recomputed
-            during backward.
+        Mirrors WanVAE_.decode (wan/modules/vae.py:545) **bytewise** — the
+        output is identical to non-checkpointed decode.  Memory peak is
+        reduced from ~21 frames' worth of decoder activations to ~1 frame's
+        worth.
 
-        Trade-off: disabling the cache produces small temporal-boundary
-        discontinuities in the decoded video.  Acceptable for the
-        motion-fidelity reward (CoTracker tracks point trajectories,
-        which survive small per-frame artifacts).  No-grad inference /
-        eval paths continue to use the original WanVAE_.decode with the
-        cache enabled — they don't hit this method.
+        Mechanism: WanVAE_.decode threads a temporal `_feat_map` cache
+        across the 21 per-frame decoder calls.  The cache is necessary
+        for the temporal-upsample blocks (Resample(mode='upsample3d') is
+        a no-op for the time dim when feat_cache is None — so disabling
+        the cache would shrink the output temporal length from 81 pixel
+        frames to 21).
+
+        We thread the cache through `torch.utils.checkpoint`:
+          1. Pass cache state as `*cache_in` positional args to the
+             checkpointed function (so ckpt's saved-tensor hooks capture
+             the iteration-START state, not the end state — replay sees
+             the correct state).
+          2. Inside the function, make a local list copy of cache_in,
+             pass it as `feat_cache` to the decoder.  The decoder does
+             `feat_cache[idx] = cache_x` (slot reassignment, NOT tensor
+             in-place mutation) — so the tensors in cache_in are
+             untouched; only the local list slots are replaced.
+          3. Return `(out,) + tuple(local_cache)` so the next iteration
+             gets the updated cache.
+
+        Each ckpt call drops the per-frame decoder activations after
+        forward; backward replay regenerates them.  Cache tensors
+        persist across iterations (they're inputs to subsequent ckpt
+        calls) but are small (single temporal slices ~ a few MB each).
         """
         model = self.model
         if isinstance(scale[0], torch.Tensor):
@@ -234,18 +248,35 @@ class WanVAEWrapper(torch.nn.Module):
         iter_ = z.shape[2]
         x = model.conv2(z)
 
-        def _per_frame(inp_frame):
-            return model.decoder(inp_frame, feat_cache=None, feat_idx=[0])
+        # Initialize cache state.  clear_cache() sets _feat_map = [None] * n_conv.
+        model.clear_cache()
+        cache = tuple(model._feat_map)
+
+        def _per_frame(inp_frame, *cache_in):
+            # Local mutable copy so decoder's slot reassignments don't
+            # touch the input tuple (which ckpt has saved as input).
+            local_cache = list(cache_in)
+            local_idx = [0]
+            out = model.decoder(
+                inp_frame, feat_cache=local_cache, feat_idx=local_idx,
+            )
+            return (out,) + tuple(local_cache)
 
         out = None
         for i in range(iter_):
-            decoder_out = torch.utils.checkpoint.checkpoint(
-                _per_frame, x[:, :, i:i + 1, :, :], use_reentrant=False
+            results = torch.utils.checkpoint.checkpoint(
+                _per_frame, x[:, :, i:i + 1, :, :], *cache,
+                use_reentrant=False,
             )
+            decoder_out = results[0]
+            cache = tuple(results[1:])
+
             if i == 0:
                 out = decoder_out
             else:
                 out = torch.cat([out, decoder_out], 2)
+
+        model.clear_cache()
         return out.float().clamp_(-1, 1).squeeze(0)
 
     def decode_to_pixel_chunk(self, latent: torch.Tensor, use_cache: bool = False, chunk_size: int = 120) -> torch.Tensor:
