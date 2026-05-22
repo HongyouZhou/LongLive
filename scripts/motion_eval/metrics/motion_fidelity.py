@@ -236,9 +236,27 @@ class CoTrackerWrapper:
         video_input = video * 255.0
         ctx = torch.enable_grad() if requires_grad else torch.no_grad()
         with ctx:
-            pred_tracks, pred_visibility = self._model(
-                video_input, grid_size=self.grid_size
-            )
+            if requires_grad:
+                # CoTrackerPredictor.forward is `@torch.no_grad()`-decorated,
+                # which overrides our enable_grad ctx.  Bypass by calling the
+                # un-decorated _compute_sparse_tracks directly with the same
+                # args the predictor's forward dispatches with for our use
+                # case (grid_size>0, queries=None, segm_mask=None →
+                # add_support_grid=False, grid_query_frame=0,
+                # backward_tracking=False).
+                pred_tracks, pred_visibility = self._model._compute_sparse_tracks(
+                    video=video_input,
+                    queries=None,
+                    segm_mask=None,
+                    grid_size=self.grid_size,
+                    add_support_grid=False,
+                    grid_query_frame=0,
+                    backward_tracking=False,
+                )
+            else:
+                pred_tracks, pred_visibility = self._model(
+                    video_input, grid_size=self.grid_size
+                )
         # Drop batch dim.  Keep on device + dtype unchanged so caller can
         # decide whether to .cpu() / .float() / etc.
         return pred_tracks[0], pred_visibility[0].bool()
