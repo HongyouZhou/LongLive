@@ -225,6 +225,14 @@ class CausalInferencePipeline(torch.nn.Module):
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
 
+        # Free KV / cross-attention caches — only needed during denoising, not
+        # for VAE decode or its backward graph.  Releasing them here reclaims
+        # ~1.7 GiB per rank before the peak-heavy VAE decoder runs, which is
+        # critical for grad-enabled rollouts (DRaFT-K).
+        self.kv_cache1 = None
+        self.crossattn_cache = None
+        torch.cuda.empty_cache()
+
         if profile:
             # End diffusion timing and synchronize CUDA
             diffusion_end.record()
