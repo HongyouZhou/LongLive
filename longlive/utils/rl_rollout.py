@@ -131,42 +131,6 @@ class RolloutEngine:
         )
         return video, latent
 
-    def rollout_with_grad(
-        self,
-        noise: torch.Tensor,
-        k_grad_steps: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run one full 4-step DMD rollout with last `k_grad_steps` steps grad ON.
-
-        Used by DRaFT-K (reward-gradient backprop).  NOT decorated with
-        @torch.no_grad() — the caller's grad mode controls behavior, and
-        the underlying pipeline.inference internally enables grad on the
-        last k_grad_steps + VAE decode.
-
-        Args:
-            noise: (B, F_lat, C, H_lat, W_lat) Gaussian noise tensor.
-            k_grad_steps: How many of the last denoising steps (per frame
-                block) keep gradient enabled. Must be ≤
-                len(pipeline.denoising_step_list).  k_grad_steps=0 forces
-                pipeline-internal no_grad on every step + decode, but
-                tensors returned still inherit the caller's outer grad
-                context — unlike rollout_one which uses @torch.no_grad()
-                and detaches.
-
-        Returns:
-            (video_pixel, latent_x0) — same shape semantics as rollout_one.
-            When k_grad_steps > 0, both tensors have `requires_grad=True`
-            and the autograd graph traces back to the trainable LoRA params
-            through the last k_grad_steps generator forwards + VAE decode.
-        """
-        video, latent = self.pipeline.inference(
-            noise=noise,
-            text_prompts=self._placeholder_prompts,
-            return_latents=True,
-            k_grad_steps=k_grad_steps,
-        )
-        return video, latent
-
     @torch.no_grad()
     def rollout_k(
         self,

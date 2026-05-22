@@ -96,54 +96,6 @@ def motion_fidelity_pair(
     return float(best_match.mean())
 
 
-def motion_fidelity_pair_grad(
-    gen_tracks: torch.Tensor,        # (T, N_gen, 2)  float, grad-tracked if needed
-    gen_visibility: torch.Tensor,    # (T, N_gen)     bool
-    ref_tracks: torch.Tensor,        # (T, N_ref, 2)  float
-    ref_visibility: torch.Tensor,    # (T, N_ref)     bool
-) -> torch.Tensor:
-    """Differentiable torch version of `motion_fidelity_pair` (numpy).
-
-    Same algorithm as Yatim et al. (CVPR 2024) tracklet velocity cosine,
-    but uses torch ops so gradients flow back through `gen_tracks`.
-
-    Args:
-        gen_tracks:     (T, N_gen, 2) generated-video tracklets.
-        gen_visibility: (T, N_gen)    boolean visibility mask (treated as
-                                       constant — no gradient through it).
-        ref_tracks:     (T, N_ref, 2) reference-video tracklets (constant).
-        ref_visibility: (T, N_ref)    constant.
-
-    Returns:
-        Scalar torch tensor with `requires_grad` matching `gen_tracks`.
-        Same value range as numpy version: ∈ [-1, 1].
-    """
-    assert gen_tracks.shape[0] == ref_tracks.shape[0], (
-        f"frame-count mismatch: gen T={gen_tracks.shape[0]} vs ref T={ref_tracks.shape[0]}"
-    )
-
-    # Visibility: keep only tracklets visible in ALL frames.
-    gen_visible = gen_visibility.all(dim=0)  # (N_gen,)
-    ref_visible = ref_visibility.all(dim=0)  # (N_ref,)
-    if not gen_visible.any() or not ref_visible.any():
-        return torch.zeros((), device=gen_tracks.device, dtype=gen_tracks.dtype)
-
-    gen_t = gen_tracks[:, gen_visible]   # (T, N_gen', 2)
-    ref_t = ref_tracks[:, ref_visible]   # (T, N_ref', 2)
-
-    # Per-frame displacement (velocity direction).
-    gen_d = gen_t[1:] - gen_t[:-1]       # (T-1, N_gen', 2)
-    ref_d = ref_t[1:] - ref_t[:-1]
-    gen_d = gen_d / (gen_d.norm(dim=-1, keepdim=True) + 1e-8)
-    ref_d = ref_d / (ref_d.norm(dim=-1, keepdim=True) + 1e-8)
-
-    # cos(d_ref[t, n], d_gen[t, m])  →  (T-1, N_ref', N_gen')
-    per_frame_cos = torch.einsum("tnc,tmc->tnm", ref_d, gen_d)
-    mean_t_cos = per_frame_cos.mean(dim=0)         # (N_ref', N_gen')
-    best_match = mean_t_cos.max(dim=1).values      # (N_ref',)
-    return best_match.mean()
-
-
 class CoTrackerWrapper:
     """Lazy-loaded CoTracker3 + optional per-reference tracklet cache."""
 
@@ -199,67 +151,6 @@ class CoTrackerWrapper:
         if cache is not None:
             np.savez_compressed(cache, tracks=tracks, visibility=visibility)
         return tracks, visibility
-
-    def get_tracklets_from_tensor(
-        self,
-        video: torch.Tensor,
-        requires_grad: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Same algorithm as `get_tracklets(video_path)` but takes an
-        in-memory torch tensor and optionally keeps gradients.
-
-        Args:
-            video: (T, 3, H, W) or (1, T, 3, H, W) float in [0, 1].
-            requires_grad: When True, the CoTracker forward is NOT wrapped
-                in torch.no_grad() so reward gradients can flow back to
-                the input video tensor (used by DRaFT-K reward backprop).
-
-        Returns:
-            tracks:     (T, N, 2) float torch tensor (still on device).
-            visibility: (T, N) bool  torch tensor.
-
-        NOTE: When `requires_grad=True`, the *visibility* output remains
-        boolean and is treated as a constant in the gradient path (we mask
-        invisible tracklets but don't differentiate through visibility).
-        """
-        self._ensure_model()
-        # Accept (T, 3, H, W) or (1, T, 3, H, W); CoTracker wants (B, T, 3, H, W).
-        if video.ndim == 4:
-            video = video.unsqueeze(0)
-        # Uniform-sample to self.n_frames if longer.
-        T_in = video.shape[1]
-        if T_in > self.n_frames:
-            idxs = torch.linspace(0, T_in - 1, self.n_frames, device=video.device).long()
-            video = video[:, idxs]
-        # CoTracker expects [0, 255] float input (matches existing _video_to_tensor).
-        # Mul runs outside `ctx`: grad flows through it when video.requires_grad.
-        video_input = video * 255.0
-        ctx = torch.enable_grad() if requires_grad else torch.no_grad()
-        with ctx:
-            if requires_grad:
-                # CoTrackerPredictor.forward is `@torch.no_grad()`-decorated,
-                # which overrides our enable_grad ctx.  Bypass by calling the
-                # un-decorated _compute_sparse_tracks directly with the same
-                # args the predictor's forward dispatches with for our use
-                # case (grid_size>0, queries=None, segm_mask=None →
-                # add_support_grid=False, grid_query_frame=0,
-                # backward_tracking=False).
-                pred_tracks, pred_visibility = self._model._compute_sparse_tracks(
-                    video=video_input,
-                    queries=None,
-                    segm_mask=None,
-                    grid_size=self.grid_size,
-                    add_support_grid=False,
-                    grid_query_frame=0,
-                    backward_tracking=False,
-                )
-            else:
-                pred_tracks, pred_visibility = self._model(
-                    video_input, grid_size=self.grid_size
-                )
-        # Drop batch dim.  Keep on device + dtype unchanged so caller can
-        # decide whether to .cpu() / .float() / etc.
-        return pred_tracks[0], pred_visibility[0].bool()
 
 
 class MotionFidelity:
