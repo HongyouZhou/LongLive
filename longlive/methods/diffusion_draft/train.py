@@ -294,7 +294,18 @@ def main():
         if ".anchor." in name:
             param.requires_grad_(False)
     generator.model.set_adapter("default")
-    generator.enable_gradient_checkpointing()
+    # NOTE: do NOT enable generator gradient checkpointing for DRaFT-K.
+    # The generator's KV cache (self.kv_cache1) is mutated in-place across
+    # the 7 frame blocks × 4 DMD steps within one inference() call.  With
+    # gradient checkpointing on, the backward replay sees the END-state of
+    # the KV cache (post all 7 blocks) instead of the per-block iter-time
+    # state — torch.utils.checkpoint detects the metadata mismatch and
+    # raises CheckpointError.  NFT/RAM enable gen ckpt because they do
+    # only ONE grad-on forward per outer (on a 1-block x_t, KV cache
+    # untouched).  DRaFT-K does 7 grad-on forwards in sequence within the
+    # same inference() call, so the cache-mutation problem materializes.
+    # Memory budget without gen ckpt: K_rollouts × K_grad × ~8 GB
+    # generator activations + VAE per-frame ckpt ~6 GB + CoTracker ~3 GB.
 
     # Cast fp32 PEFT params → bf16 (FSDP size-wrap dtype uniformity).
     n_cast = 0
