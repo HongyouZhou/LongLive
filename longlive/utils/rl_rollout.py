@@ -145,12 +145,13 @@ class RolloutEngine:
 
         Args:
             noise: (B, F_lat, C, H_lat, W_lat) Gaussian noise tensor.
-            k_grad_steps: How many of the last DMD denoising steps (per
-                frame block) keep gradient enabled.  Range 0..4 for our
-                4-step DMD schedule.  k_grad_steps=0 falls back to no_grad
-                behavior identical to rollout_one (but without the
-                @torch.no_grad() guard, so the caller's grad mode still
-                governs the post-pipeline graph).
+            k_grad_steps: How many of the last denoising steps (per frame
+                block) keep gradient enabled. Must be ≤
+                len(pipeline.denoising_step_list).  k_grad_steps=0 forces
+                pipeline-internal no_grad on every step + decode, but
+                tensors returned still inherit the caller's outer grad
+                context — unlike rollout_one which uses @torch.no_grad()
+                and detaches.
 
         Returns:
             (video_pixel, latent_x0) — same shape semantics as rollout_one.
