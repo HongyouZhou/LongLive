@@ -93,6 +93,12 @@ def _save_lora_ckpt(
     rank0: bool,
     adapter_name: str = "default",
 ) -> Path | None:
+    """Gather FSDP state on rank 0 and save the named PEFT adapter.
+
+    Saves ONLY the 'default' adapter by default — 'anchor' is zero by
+    construction (PEFT B-projection zero-init) and reconstructs at load
+    time, so it doesn't need to be in the checkpoint.
+    """
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(fsdp_peft_model, StateDictType.FULL_STATE_DICT, save_policy):
         full = fsdp_peft_model.state_dict()
@@ -490,12 +496,12 @@ def main():
         # ── LOG ──
         dt_outer = time.time() - t_outer
         avg_mf = sum_mf / max(1, k_rollouts_per_outer)
-        avg_reward_loss = sum_reward_loss
+        total_reward_loss = sum_reward_loss
         avg_kl = sum_kl
         if rank0:
             print(
                 f"[diffusion_draft] outer {outer:3d}/{outer_epochs}  "
-                f"mf={avg_mf:.4f}  reward_loss={avg_reward_loss:.4f}  "
+                f"mf={avg_mf:.4f}  reward_loss={total_reward_loss:.4f}  "
                 + (f"kl={avg_kl:.4f}  " if beta_kl > 0.0 else "")
                 + f"dt={dt_outer:.1f}s (reward={t_reward:.1f}, kl={t_kl:.1f})",
                 flush=True,
@@ -503,7 +509,7 @@ def main():
         if wandb_enabled:
             log_dict = {
                 "outer/mf": avg_mf,
-                "outer/reward_loss": avg_reward_loss,
+                "outer/reward_loss": total_reward_loss,
                 "outer/dt_total_s": dt_outer,
                 "outer/dt_reward_s": t_reward,
                 "outer/dt_kl_s": t_kl,
