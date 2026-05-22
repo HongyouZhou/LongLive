@@ -187,9 +187,25 @@ class WanVAEWrapper(torch.nn.Module):
         else:
             decode_function = self.model.decode
 
+        # When latent.requires_grad (DRaFT-K reward backprop), the per-frame
+        # decoder activations would dominate peak GPU memory (140 GiB H200 → OOM).
+        # Wrap the entire decode in torch.utils.checkpoint so activations are
+        # dropped after forward and recomputed during backward.  WanVAE_.decode
+        # calls clear_cache() at start, so the replayed forward reproduces
+        # the same temporal feat_map sequence.
+        use_ckpt = latent.requires_grad and not use_cache
+
         output = []
         for u in zs:
-            output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
+            if use_ckpt:
+                decoded = torch.utils.checkpoint.checkpoint(
+                    lambda x, s=scale: decode_function(x, s).float().clamp_(-1, 1).squeeze(0),
+                    u.unsqueeze(0),
+                    use_reentrant=False,
+                )
+            else:
+                decoded = decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0)
+            output.append(decoded)
         output = torch.stack(output, dim=0)
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]
