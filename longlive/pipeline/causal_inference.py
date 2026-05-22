@@ -60,6 +60,7 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
+        k_grad_steps: int = 0,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -68,6 +69,13 @@ class CausalInferencePipeline(torch.nn.Module):
                 (batch_size, num_output_frames, num_channels, height, width).
             text_prompts (List[str]): The list of text prompts.
             return_latents (bool): Whether to return the latents.
+            k_grad_steps (int): When > 0, the last `k_grad_steps` of the
+                `denoising_step_list` (per frame block) and the final VAE
+                decode are NOT wrapped in `torch.no_grad()` — they inherit
+                the caller's grad mode.  Used by DRaFT-K reward-gradient
+                backprop (see longlive/methods/diffusion_draft/).  Default 0
+                preserves the original behavior bytewise (every existing
+                caller wraps with @torch.no_grad() externally).
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -151,53 +159,63 @@ class CausalInferencePipeline(torch.nn.Module):
                 :, current_start_frame:current_start_frame + current_num_frames]
 
             # Step 2.1: Spatial denoising loop
+            n_denoising_steps = len(self.denoising_step_list)
             for index, current_timestep in enumerate(self.denoising_step_list):
-                # print(f"current_timestep: {current_timestep}")
-
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
                     device=noise.device,
                     dtype=torch.int64) * current_timestep
 
-                if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
-                    next_timestep = self.denoising_step_list[index + 1]
-                    noisy_input = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep * torch.ones(
-                            [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
-                    ).unflatten(0, denoised_pred.shape[:2])
-                else:
-                    # for getting real output
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
+                # k_grad_steps gating: force no_grad on the first
+                # (n_denoising_steps - k_grad_steps) steps; let the last
+                # k_grad_steps inherit caller's grad mode.
+                in_grad_window = index >= n_denoising_steps - k_grad_steps
+                step_ctx = torch.enable_grad() if in_grad_window else torch.no_grad()
+
+                with step_ctx:
+                    if index < n_denoising_steps - 1:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length
+                        )
+                        next_timestep = self.denoising_step_list[index + 1]
+                        noisy_input = self.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep * torch.ones(
+                                [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                        ).unflatten(0, denoised_pred.shape[:2])
+                    else:
+                        # for getting real output
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length
+                        )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
             # Step 2.3: rerun with timestep zero to update KV cache using clean context
+            # This forward only mutates the KV cache for the *next* block; it does
+            # not contribute to the gradient flow from the output to the LoRA
+            # params, so we always run it under no_grad regardless of k_grad_steps.
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=conditional_dict,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+            with torch.no_grad():
+                self.generator(
+                    noisy_image_or_video=denoised_pred,
+                    conditional_dict=conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
 
             if profile:
                 block_end.record()
@@ -217,11 +235,17 @@ class CausalInferencePipeline(torch.nn.Module):
             vae_start.record()
 
         # Step 3: Decode the output
-        if getattr(self.args.model_kwargs, "use_infinite_attention", False):
-            video = self.vae.decode_to_pixel_chunk(output.to(noise.device), use_cache=False)
-        else:
-            video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
+        # When k_grad_steps > 0, decode inherits caller grad mode so the
+        # CoTracker reward downstream can backprop through VAE.  When = 0,
+        # we keep decode under no_grad (matches original behavior for all
+        # existing inference callers).
+        decode_ctx = torch.enable_grad() if k_grad_steps > 0 else torch.no_grad()
+        with decode_ctx:
+            if getattr(self.args.model_kwargs, "use_infinite_attention", False):
+                video = self.vae.decode_to_pixel_chunk(output.to(noise.device), use_cache=False)
+            else:
+                video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
+            video = (video * 0.5 + 0.5).clamp(0, 1)
         if profile:
             # End VAE timing and synchronize CUDA
             vae_end.record()
