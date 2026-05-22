@@ -188,21 +188,15 @@ class WanVAEWrapper(torch.nn.Module):
             decode_function = self.model.decode
 
         # When latent.requires_grad (DRaFT-K reward backprop), the per-frame
-        # decoder activations would dominate peak GPU memory (140 GiB H200 → OOM).
-        # Wrap the entire decode in torch.utils.checkpoint so activations are
-        # dropped after forward and recomputed during backward.  WanVAE_.decode
-        # calls clear_cache() at start, so the replayed forward reproduces
-        # the same temporal feat_map sequence.
-        use_ckpt = latent.requires_grad and not use_cache
+        # decoder autograd graph for 21 latent frames would dominate peak GPU
+        # memory (140 GiB H200 → OOM).  Switch to per-frame gradient-
+        # checkpointed decode that drops activations after each frame.
+        use_grad_path = latent.requires_grad and not use_cache
 
         output = []
         for u in zs:
-            if use_ckpt:
-                decoded = torch.utils.checkpoint.checkpoint(
-                    lambda x, s=scale: decode_function(x, s).float().clamp_(-1, 1).squeeze(0),
-                    u.unsqueeze(0),
-                    use_reentrant=False,
-                )
+            if use_grad_path:
+                decoded = self._decode_grad_ckpt(u.unsqueeze(0), scale)
             else:
                 decoded = decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0)
             output.append(decoded)
@@ -211,6 +205,48 @@ class WanVAEWrapper(torch.nn.Module):
         # to [batch_size, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
         return output
+
+    def _decode_grad_ckpt(self, z: torch.Tensor, scale) -> torch.Tensor:
+        """Per-frame gradient-checkpointed VAE decode for DRaFT-K.
+
+        Mirrors WanVAE_.decode (wan/modules/vae.py:545) but:
+          * Disables temporal cache (feat_cache=None) — each latent frame
+            decodes independently with zero-padded temporal context.
+            Forward peak ≈ 1 frame's decoder activations instead of 21.
+          * Wraps each per-frame decoder call with
+            torch.utils.checkpoint(use_reentrant=False) so forward
+            activations are dropped after each frame and recomputed
+            during backward.
+
+        Trade-off: disabling the cache produces small temporal-boundary
+        discontinuities in the decoded video.  Acceptable for the
+        motion-fidelity reward (CoTracker tracks point trajectories,
+        which survive small per-frame artifacts).  No-grad inference /
+        eval paths continue to use the original WanVAE_.decode with the
+        cache enabled — they don't hit this method.
+        """
+        model = self.model
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, model.z_dim, 1, 1, 1) + scale[0].view(
+                1, model.z_dim, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
+        iter_ = z.shape[2]
+        x = model.conv2(z)
+
+        def _per_frame(inp_frame):
+            return model.decoder(inp_frame, feat_cache=None, feat_idx=[0])
+
+        out = None
+        for i in range(iter_):
+            decoder_out = torch.utils.checkpoint.checkpoint(
+                _per_frame, x[:, :, i:i + 1, :, :], use_reentrant=False
+            )
+            if i == 0:
+                out = decoder_out
+            else:
+                out = torch.cat([out, decoder_out], 2)
+        return out.float().clamp_(-1, 1).squeeze(0)
 
     def decode_to_pixel_chunk(self, latent: torch.Tensor, use_cache: bool = False, chunk_size: int = 120) -> torch.Tensor:
         """
