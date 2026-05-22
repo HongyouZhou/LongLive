@@ -232,6 +232,7 @@ class CoTrackerWrapper:
             idxs = torch.linspace(0, T_in - 1, self.n_frames, device=video.device).long()
             video = video[:, idxs]
         # CoTracker expects [0, 255] float input (matches existing _video_to_tensor).
+        # Mul runs outside `ctx`: grad flows through it when video.requires_grad.
         video_input = video * 255.0
         ctx = torch.enable_grad() if requires_grad else torch.no_grad()
         with ctx:

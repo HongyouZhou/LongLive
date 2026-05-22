@@ -5,16 +5,15 @@ scoring during the training loop. The reference clip's CoTracker3 tracklets are
 cached once at trainer startup; per-rollout cost is just one CoTracker forward
 on the generated video (~5-10s on H200).
 
-We mp4-roundtrip the generated video tensor before scoring because the existing
-`CoTrackerWrapper.get_tracklets` API is tied to a file path (and so is its
-on-disk cache, keyed by ref-path sha10). A future optimization is to add a
-tensor-input variant; for now the mp4 write (~50 ms) is in the noise floor
-next to CoTracker.
+MotionFidelityReward (mp4 round-trip, no-grad) is used for GRPO group scoring.
+MotionFidelityRewardGrad (tensor-in, grad-enabled) is used for DRaFT-K reward
+backprop. Both share the same CoTrackerWrapper + motion_fidelity_pair algorithm.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 # Heavy + env-specific imports (CoTracker, torchvision, PIL via motion_eval
@@ -152,7 +151,6 @@ class MotionFidelityRewardGrad:
         # Pre-extract ref tracklets via the file-based path. Returns
         # numpy arrays (from disk cache or fresh CoTracker run); convert
         # to torch tensors on self.device. Reference doesn't need grad.
-        import numpy as np
         ref_tracks_np, ref_vis_np = self.tracker.get_tracklets(self.ref_path)
         self.ref_tracks = torch.from_numpy(np.asarray(ref_tracks_np)).to(
             device=self.device, dtype=torch.float32
@@ -182,6 +180,7 @@ class MotionFidelityRewardGrad:
             video, requires_grad=video.requires_grad,
         )
         # Match dtype/device of gen with cached ref for the einsum.
+        # local cast; self.ref_tracks stays fp32 across calls.
         ref_tracks = self.ref_tracks.to(dtype=gen_tracks.dtype)
         return motion_fidelity_pair_grad(
             gen_tracks=gen_tracks,
