@@ -261,7 +261,9 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
             return
 
         if switch_recache_frames is not None:
-            frames_to_recache = torch.cat([switch_recache_frames, output], dim=1)[:, -21:, ...]
+            frames_to_recache = torch.cat([switch_recache_frames, output], dim=1)[
+                :, -self.cache_spec.global_context_frames:, ...
+            ]
             num_recache_frames = frames_to_recache.shape[1]
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-DMDSwitch] Using external switch_recache_frames (previous_frames): {frames_to_recache.shape}")
@@ -269,11 +271,11 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
             # Determine how to fetch frames based on whether local_start_frame is provided
             if local_start_frame is not None:
                 # Chunk mode: output is the current chunk's output; use relative coordinates
-                num_recache_frames = min(local_start_frame, 21)
+                num_recache_frames = min(local_start_frame, self.cache_spec.global_context_frames)
                 frames_to_recache = output[:, -num_recache_frames:]
             else:
                 # Full sequence mode: output is the complete sequence; use absolute coordinates
-                num_recache_frames = min(current_start_frame, 21)
+                num_recache_frames = min(current_start_frame, self.cache_spec.global_context_frames)
                 frames_to_recache = output[:, -num_recache_frames:]
             
         batch_size, num_recache_frames, c, h, w = frames_to_recache.shape
@@ -290,7 +292,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
             num_frames=num_recache_frames,
             frame_seqlen=self.frame_seq_length,
             num_frame_per_block=self.num_frame_per_block,
-            local_attn_size=21
+            local_attn_size=self.cache_spec.global_context_frames
         )
         
         # Prepare time steps

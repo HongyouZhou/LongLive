@@ -43,10 +43,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import peft
 import torch
 from torchvision.io import write_video
 
+from longlive.utils.checkpoints import cast_fp32_params_to_bf16, load_lora_state_dict
 from longlive.utils.lora_utils import configure_adapter_for_model
 from wan.configs.wan_t2v_14B import t2v_14B
 from wan.text2video import WanT2V
@@ -166,16 +166,11 @@ def main():
 
     if is_main:
         print(f"[sanity] loading LoRA weights from {args.lora_ckpt}", flush=True)
-    lora_state = torch.load(args.lora_ckpt, map_location="cpu")
-    peft.set_peft_model_state_dict(pipe.model, lora_state)
+    load_lora_state_dict(pipe.model, args.lora_ckpt)
 
     # PEFT initializes LoRA in fp32; cast to bf16 to match Wan base
     # (same fix as longlive/methods/motiondirector/train.py post-PEFT).
-    n_cast = 0
-    for p in pipe.model.parameters():
-        if p.dtype == torch.float32:
-            p.data = p.data.to(torch.bfloat16)
-            n_cast += 1
+    n_cast = cast_fp32_params_to_bf16(pipe.model)
     if is_main:
         print(f"[sanity] cast {n_cast} fp32 LoRA params to bfloat16", flush=True)
         print(f"[sanity] model ready, beginning generation", flush=True)

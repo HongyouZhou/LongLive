@@ -1,0 +1,90 @@
+# Reward-Tilted f-Divergence Flow-Map Distillation on the 4-step DMD base.
+#
+# Mechanism: RAM-style on-policy rollouts + motion_fidelity reward, but reward
+# defines a bounded density-ratio tilt inside the frozen-base support.  The
+# trainable velocity is pulled toward a reward-tilted flow target while a local
+# flow-map penalty keeps the one-step transition close to the anchor/base.
+#
+# Goal: improve motion without treating reward as standalone RL.  The default
+# tilt uses a JS-style bounded ratio rho/(1+rho), with rho=clip(exp(beta(r-b))).
+
+# ---- data ----
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+# ---- backbone (mirrors configs/longlive_inference.yaml) ----
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# ---- NVlabs baseline LoRA - merged into base ----
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# ---- Trainable LoRA - rank 32 / alpha 64 (PEFT scale alpha/r = 2.0) ----
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+# ---- DMD rollout schedule ----
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+# ---- rollout / inner-loop shape ----
+outer_epochs: 20
+inner_steps: 16              # = k_noisings_per_endpoint x g_endpoints_per_outer
+k_rollouts: 4                # endpoints per outer (must equal g_endpoints_per_outer)
+k_noisings_per_endpoint: 4   # (eps, t) draws per rollout endpoint
+g_endpoints_per_outer: 4     # rollout endpoints per outer (must equal k_rollouts)
+adv_clip_max: 5.0            # for group_normalize (NFT-H1 cross-rank gather sweep)
+t_anchors: [1000, 750, 500, 250]
+
+# ---- RT-fDMD-Flow objective ----
+tilt_mode: js                # js | clipped_fkl | exp
+reward_beta: 2.0             # density-ratio temperature: rho=exp(beta(r-baseline)).
+reward_baseline: 0.5         # group-normalized reward midpoint.
+ratio_clip_min: 0.25
+ratio_clip_max: 4.0
+reward_coef: 1.0             # scales the bounded tilt; default keeps convex target.
+lambda_flowmap: 0.05         # local transition trust-region against anchor flow.
+lambda_anchor: 0.0           # optional direct velocity anchor.
+beta_kl: 0.0                 # optional RAM-style direct anchor ablation.
+rollout_adapter: default     # default = on-policy; anchor = conservative ablation.
+
+# ---- Reward (motion_fidelity, identical to NFT) ----
+reward_n_frames: 16
+reward_grid_size: 30
+fps: 16
+
+# ---- Optimizer ----
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+# ---- Output + caching ----
+out_dir: ${oc.env:LL_DATA}/rt_fdmd_flow_runs/skateboarding_rt_fdmd_flow
+cache_dir: ${oc.env:LL_DATA}/rt_fdmd_flow_runs/_tracklet_cache
+scratch_dir: /tmp/rt_fdmd_flow_scratch
+ckpt_interval: 5
+ckpt_keep_last: 4
+
+# ---- misc ----
+seed: 0
+wandb_project: longlive_rt_fdmd_flow
+wandb_entity: hongyou

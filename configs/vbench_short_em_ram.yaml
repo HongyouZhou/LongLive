@@ -1,0 +1,49 @@
+# VBench short inference - for EM-RAM ckpts.
+#
+# EM-RAM idea-layer LoRA: rank 32 / alpha 64.
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+
+# inference defaults; dispatcher overrides per-run paths
+data_path: longlive_models/prompts/vidprom_filtered_extended.txt
+output_folder: vbench_runs/_unset
+inference_iter: -1
+num_output_frames: 21          # 81 pixel frames @ 16 fps = 5.06s
+use_ema: false
+seed: 0
+num_samples: 1
+save_with_index: true
+global_sink: true
+context_noise: 0
+
+generator_ckpt: longlive_models/models/longlive_base.pt
+
+# NVlabs baseline LoRA (rank 256, merged into base)
+baseline_lora_ckpt: longlive_models/models/lora.pt
+baseline_adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+# EM-RAM idea-layer LoRA: rank 32 / alpha 64
+lora_ckpt: ""
+adapter:
+  type: "lora"
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false

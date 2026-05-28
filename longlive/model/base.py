@@ -41,10 +41,10 @@ class BaseModel(nn.Module):
         self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
         self.fake_score.model.requires_grad_(True)
 
-        self.text_encoder = WanTextEncoder()
+        self.text_encoder = WanTextEncoder(model_name=self.generator.model_spec.name)
         self.text_encoder.requires_grad_(False)
 
-        self.vae = WanVAEWrapper()
+        self.vae = WanVAEWrapper(model_name=self.generator.model_spec.name)
         self.vae.requires_grad_(False)
 
         self.scheduler = self.generator.get_scheduler()

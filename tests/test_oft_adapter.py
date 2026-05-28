@@ -38,10 +38,25 @@ class CausalWanAttentionBlock(nn.Module):
         return h + self.ffn(h)
 
 
+class WanAttentionBlock(CausalWanAttentionBlock):
+    pass
+
+
 class FakeTransformer(nn.Module):
     def __init__(self, dim: int = 64, n_layers: int = 2):
         super().__init__()
         self.layers = nn.ModuleList([CausalWanAttentionBlock(dim) for _ in range(n_layers)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class FakeTeacherTransformer(nn.Module):
+    def __init__(self, dim: int = 64, n_layers: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([WanAttentionBlock(dim) for _ in range(n_layers)])
 
     def forward(self, x):
         for layer in self.layers:
@@ -162,6 +177,28 @@ def test_lora_dispatch_unchanged():
     assert pcfg.lora_alpha == 8
 
 
+def test_real_score_alias_targets_teacher_blocks():
+    lu = _fresh_import()
+    import peft
+
+    model = FakeTeacherTransformer()
+    cfg = {"type": "lora", "rank": 4, "alpha": 8, "dropout": 0.0, "verbose": False}
+    wrapped = lu.configure_adapter_for_model(model, "real_score", cfg, is_main_process=False)
+    assert isinstance(wrapped.peft_config["default"], peft.LoraConfig)
+
+
+def test_empty_targets_raise():
+    lu = _fresh_import()
+    model = nn.Sequential(nn.Linear(4, 4))
+    cfg = {"type": "lora", "rank": 4, "alpha": 8, "dropout": 0.0, "verbose": False}
+    try:
+        lu.configure_adapter_for_model(model, "generator", cfg, is_main_process=False)
+    except ValueError as e:
+        assert "No adapter target" in str(e)
+        return
+    raise AssertionError("expected ValueError when no adapter targets are found")
+
+
 # ---- Self-runner --------------------------------------------------------
 
 
@@ -173,6 +210,8 @@ def main():
         test_oft_dispatch_creates_peft_oft_model,
         test_oft_init_is_identity,
         test_lora_dispatch_unchanged,
+        test_real_score_alias_targets_teacher_blocks,
+        test_empty_targets_raise,
     ]
     print("running oft_adapter tests:")
     failed = 0

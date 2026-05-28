@@ -1,0 +1,32 @@
+# Code sync excludes. Keep data/checkpoints/results out of repo-to-HPC rsync.
+#
+# The sync script also reads .gitignore. This file is for project-specific
+# large artifacts and local-only state that must never be copied as code.
+
+.claude/
+.sync/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+__pycache__/
+*.py[cod]
+*.so
+
+data/
+hf_cache/
+wan_models/
+longlive_models/
+checkpoints/
+videos/
+wandb/
+logs/
+
+*.mp4
+*.avi
+*.mov
+*.pt
+*.pth
+*.safetensors
+*.ckpt

@@ -62,7 +62,7 @@ def configure_adapter_for_model(transformer, model_name, adapter_config, is_main
 
     if model_name == 'generator':
         adapter_target_modules = ['CausalWanAttentionBlock']
-    elif model_name == 'fake_score':
+    elif model_name in ('fake_score', 'real_score'):
         adapter_target_modules = ['WanAttentionBlock']
     else:
         raise ValueError(f"Invalid model name: {model_name}")
@@ -74,6 +74,11 @@ def configure_adapter_for_model(transformer, model_name, adapter_config, is_main
                     target_linear_modules.add(full_submodule_name)
 
     target_linear_modules = list(target_linear_modules)
+    if len(target_linear_modules) == 0:
+        raise ValueError(
+            f"No adapter target Linear layers found for model_name={model_name!r}. "
+            f"Expected block classes: {adapter_target_modules}"
+        )
 
     adapter_type = adapter_config.get('type', 'lora')
 

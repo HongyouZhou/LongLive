@@ -15,6 +15,7 @@ from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.causal_model_infinity import CausalWanModel as CausalWanModelInfinity
+from longlive.specs.wan import get_wan_model_spec
 
 
 # Root containing the pretrained Wan2.1 checkpoints
@@ -93,8 +94,9 @@ def _load_wan_with_meta(model_cls, path, **extra_kwargs):
     return model
 
 class WanTextEncoder(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, model_name: str = "Wan2.1-T2V-1.3B") -> None:
         super().__init__()
+        self.model_spec = get_wan_model_spec(model_name)
 
         self.text_encoder = umt5_xxl(
             encoder_only=True,
@@ -103,7 +105,7 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load(f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(str(self.model_spec.t5_checkpoint(WAN_MODELS_ROOT)),
                        map_location='cpu', weights_only=False)
         )
         # Stay on CPU here. The trainer FSDP-wraps this module (after wrapping
@@ -113,7 +115,7 @@ class WanTextEncoder(torch.nn.Module):
         # blow up the FSDP broadcast buffer allocation on 80 GB H100s.
 
         self.tokenizer = HuggingfaceTokenizer(
-            name=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=str(self.model_spec.tokenizer_dir(WAN_MODELS_ROOT)), seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -138,8 +140,9 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, model_name: str = "Wan2.1-T2V-1.3B"):
         super().__init__()
+        self.model_spec = get_wan_model_spec(model_name)
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
@@ -153,8 +156,8 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path=f"{WAN_MODELS_ROOT}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
-            z_dim=16,
+            pretrained_path=str(self.model_spec.vae_checkpoint(WAN_MODELS_ROOT)),
+            z_dim=self.model_spec.vae_z_dim,
         ).eval().requires_grad_(False)
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
@@ -259,6 +262,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             use_infinite_attention=False
     ):
         super().__init__()
+        self.model_spec = get_wan_model_spec(model_name)
+        self.cache_spec = self.model_spec.cache
 
         # Non-rank-0 ranks use meta-device init to avoid duplicate 14B-in-CPU
         # materialisation (see _load_wan_with_meta). FSDP's sync_module_states
@@ -266,7 +271,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # don't pass torch_dtype=bf16 — Wan keeps RoPE/sincos buffers in fp32
         # and FSDP's size-based auto-wrap refuses to flatten mixed-dtype
         # groups; FSDP's MixedPrecision handles runtime bf16 casting.
-        path = f"{WAN_MODELS_ROOT}/{model_name}/"
+        path = str(self.model_spec.model_dir(WAN_MODELS_ROOT)) + "/"
         if is_causal:
             model_cls = CausalWanModelInfinity if use_infinite_attention else CausalWanModel
             self.model = _load_wan_with_meta(
@@ -283,8 +288,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         )
         self.scheduler.set_timesteps(1000, training=True)
 
-        # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
-        self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
+        self.seq_len = self.cache_spec.wrapper_seq_len(local_attn_size)
         self.post_init()
 
     def enable_gradient_checkpointing(self) -> None:

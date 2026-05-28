@@ -1,0 +1,78 @@
+# Motion-Equivariant RAM smoke — 1 GPU, 2 outer × 4 inner × K=2.
+#
+# Run:
+#   torchrun --nproc_per_node=1 -m longlive.methods.motion_equivariant_ram.train \
+#     --config longlive/methods/motion_equivariant_ram/configs/skateboarding_motion_equivariant_ram_smoke.yaml
+
+# data / backbone / NVlabs LoRA — identical to main
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+# === SMOKE OVERRIDES ===
+outer_epochs: 2
+inner_steps: 4              # 2 noisings × 2 endpoints
+k_rollouts: 2
+k_noisings_per_endpoint: 2
+g_endpoints_per_outer: 2
+adv_clip_max: 5.0
+t_anchors: [1000, 750, 500, 250]
+
+reward_coef: 1.0
+lambda_motion: 1.0
+lambda_static: 0.05
+motion_pool: 2
+max_motion_weight: 1.0
+rollout_adapter: default
+beta_kl: 0.0
+
+reward_n_frames: 16
+reward_grid_size: 30
+reward_speed_lower: 0.5
+reward_speed_upper: 2.0
+reward_speed_penalty_coef: 0.25
+fps: 16
+
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+# Smoke output isolated.
+out_dir: ${oc.env:LL_DATA}/motion_equivariant_ram_runs/_smoke
+cache_dir: ${oc.env:LL_DATA}/motion_equivariant_ram_runs/_tracklet_cache
+scratch_dir: /tmp/motion_equivariant_ram_smoke_scratch
+ckpt_interval: 1
+ckpt_keep_last: 2
+
+seed: 0
+wandb_project: longlive_motion_equivariant_ram
+wandb_entity: hongyou

@@ -1,13 +1,11 @@
-"""K-rollout sampler shared by RL-style finetune methods on the 4-step DMD base.
+"""K-rollout sampler shared by on-policy finetune methods on the 4-step DMD base.
 
-Used by `longlive/methods/diffusion_nft/` (NFT) and `longlive/methods/diffusion_ram/`
-(RAM). Each outer epoch needs `K` rollouts of the same caption with whichever
-PEFT adapter the trainer activates (NFT rolls out from "old" EMA, RAM rolls out
-from "default" — adapter selection is the trainer's responsibility, not this
-module's). We reuse `longlive.pipeline.causal_inference.CausalInferencePipeline`
-so the rollout goes through the exact same 4-step DMD sampler as inference /
-eval — there is no separate "training-time sampler" that could drift from
-production.
+Each outer epoch needs `K` rollouts of the same caption with whichever PEFT
+adapter the trainer activates. Adapter selection is the trainer's
+responsibility, not this module's. We reuse
+`longlive.pipeline.causal_inference.CausalInferencePipeline` so the rollout goes
+through the exact same 4-step DMD sampler as inference / eval — there is no
+separate "training-time sampler" that could drift from production.
 
 Two integration details worth noting:
 
@@ -25,12 +23,26 @@ Two integration details worth noting:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import torch
 import torch.distributed as dist
 
 from longlive.pipeline.causal_inference import CausalInferencePipeline
+
+
+@dataclass(frozen=True)
+class RolloutOutput:
+    """Structured rollout result for future method APIs."""
+
+    video: torch.Tensor
+    latent_x0: torch.Tensor
+    noise: torch.Tensor | None = None
+    trajectory: list[dict] | None = None
+
+    def as_tuple(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.video, self.latent_x0
 
 
 class _CachedTextEncoder:
@@ -71,10 +83,9 @@ class _CachedTextEncoder:
 class RolloutEngine:
     """K-rollout sampler that wraps `CausalInferencePipeline`.
 
-    The trainer constructs ONE of these and calls `rollout()` K times per
-    outer epoch.  Adapter switching (`set_adapter("old")` / `set_adapter
-    ("default")`) is the trainer's responsibility — this class is unaware
-    of which adapter is active.
+    The trainer constructs one of these and calls `rollout()` K times per
+    outer epoch. Adapter switching is the trainer's responsibility; this class
+    is unaware of which adapter is active.
     """
 
     def __init__(
@@ -107,9 +118,14 @@ class RolloutEngine:
         # reaches the encoder, but pipeline.inference signature wants a list.
         self._placeholder_prompts = ["<cached>"] * self.latent_shape[0]
 
-    @torch.no_grad()
-    def rollout_one(self, noise: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run one full 4-step DMD rollout.
+    def rollout(
+        self,
+        noise: torch.Tensor,
+        *,
+        return_trajectory: bool = False,
+        trajectory_device: str | torch.device | None = None,
+    ) -> RolloutOutput:
+        """Run one full 4-step DMD rollout with a structured result.
 
         Args:
             noise: (B, F_lat, C, H_lat, W_lat) Gaussian noise tensor in the
@@ -121,15 +137,50 @@ class RolloutEngine:
               * video_pixel: (B, F_pix, 3, H_pix, W_pix) in [0, 1] (pipeline
                 already applies `(v * 0.5 + 0.5).clamp(0, 1)`).
               * latent_x0:   (B, F_lat, C, H_lat, W_lat) clean latent at the
-                end of denoising — this is the x_0 used as the FM target in
-                the NFT loss.
+                end of denoising.
+              * trajectory:  optional list of denoising states visited by the
+                sampler. Each item stores a block-local noisy latent and its
+                timestep; this is intended for on-policy distillation methods.
         """
-        video, latent = self.pipeline.inference(
+        with torch.no_grad():
+            inference_kwargs = {
+                "noise": noise,
+                "text_prompts": self._placeholder_prompts,
+                "return_latents": True,
+            }
+            if return_trajectory:
+                inference_kwargs["return_trajectory"] = True
+                inference_kwargs["trajectory_device"] = trajectory_device
+            result = self.pipeline.inference(**inference_kwargs)
+        if return_trajectory:
+            video, latent, trajectory = result
+        else:
+            video, latent = result
+            trajectory = None
+        return RolloutOutput(
+            video=video,
+            latent_x0=latent,
             noise=noise,
-            text_prompts=self._placeholder_prompts,
-            return_latents=True,
+            trajectory=trajectory,
         )
-        return video, latent
+
+    @torch.no_grad()
+    def rollout_one(self, noise: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Backward-compatible tuple API for existing trainers."""
+        return self.rollout(noise).as_tuple()
+
+    def rollout_with_grad(self, noise: torch.Tensor, k_grad_steps: int | None = None) -> RolloutOutput:
+        """Reserved API for DRaFT-style methods that backprop through rollout.
+
+        The current inference pipeline writes denoised blocks into a preallocated
+        latent buffer, which is fine for sampling but not a reliable autograd
+        boundary.  Keep this explicit so future methods do not accidentally
+        assume they are training through the rollout when gradients are absent.
+        """
+        raise NotImplementedError(
+            "rollout_with_grad requires a grad-preserving inference path; "
+            "use rollout() for no-grad sampling."
+        )
 
     @torch.no_grad()
     def rollout_k(
@@ -157,12 +208,43 @@ class RolloutEngine:
                 )
             else:
                 noise = torch.randn(self.latent_shape, device=self.device, dtype=dtype)
-            video, latent = self.rollout_one(noise)
-            results.append((video, latent))
+            results.append(self.rollout_one(noise))
             # Free the pipeline's per-call KV caches between rollouts.  The
             # pipeline re-initialises them inside inference(), so this is
             # belt-and-braces; we add it because K rollouts back-to-back
             # would otherwise hold K × cache memory if anything leaked.
+            self.pipeline.kv_cache1 = None
+            self.pipeline.crossattn_cache = None
+        return results
+
+    @torch.no_grad()
+    def rollout_k_structured(
+        self,
+        k: int,
+        dtype: torch.dtype,
+        base_seed: Optional[int] = None,
+        *,
+        return_trajectory: bool = False,
+        trajectory_device: str | torch.device | None = None,
+    ) -> list[RolloutOutput]:
+        """Generate K rollouts and return structured outputs."""
+        results: list[RolloutOutput] = []
+        gen = torch.Generator(device=self.device) if base_seed is not None else None
+        for i in range(k):
+            if gen is not None:
+                gen.manual_seed(int(base_seed) + i)
+                noise = torch.randn(
+                    self.latent_shape, device=self.device, dtype=dtype, generator=gen,
+                )
+            else:
+                noise = torch.randn(self.latent_shape, device=self.device, dtype=dtype)
+            results.append(
+                self.rollout(
+                    noise,
+                    return_trajectory=return_trajectory,
+                    trajectory_device=trajectory_device,
+                )
+            )
             self.pipeline.kv_cache1 = None
             self.pipeline.crossattn_cache = None
         return results

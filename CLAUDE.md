@@ -2,6 +2,12 @@
 
 LongLive — video diffusion motion finetune research framework. Built on Wan2.1 (1.3B / 14B) with DMD distillation. Core code lives under a single `longlive/` umbrella (`longlive/{model,pipeline,trainer,utils}`); `longlive/methods/<idea>/` hosts independent finetune method implementations (OFT, Schrödinger Bridge, etc.) sharing the core Wan loader + DMD pipeline. `wan/` stays at root as vendored upstream.
 
+Current fast-adaptation direction: `longlive/methods/on_policy_context_distillation/`
+implements current-student on-policy rollouts plus frozen context-teacher
+velocity matching on visited states. The old executable `diffusion_nft` method
+was removed on 2026-05-26; `docs/04.md` / `docs/05.md` are historical failure
+records, not active method entry points.
+
 ## Workflow
 
 - **Confirm experiment config before launch.** Never start a training / eval run without explicit user sign-off on the config (model size, data, hyperparams, ckpt source, output logdir). Print the resolved config and wait for approval, even when the user has asked you to "go run X" — the resolved values may differ from what they expected.
@@ -141,6 +147,23 @@ tail -f logs/<job-name>-$JID.out
 
 `fetch_data.sh` and `setup_mamba_env.sh` must run on a **login node** — compute nodes lack outbound network for HF Hub / pip wheels.
 
+#### Code sync to HPC
+
+Canonical code sync is **local → HPC one-way rsync**. Do not edit code on the
+HPC worktree except for emergency debugging; bring any emergency patch back to
+local before continuing. Data/checkpoints/results are not code sync: use
+`scripts/hpc/fetch_data.sh` for staging data and `scripts/local/pull_hpc_results.sh`
+for pulling outputs.
+
+```bash
+export HPC_PASS=...
+bash scripts/local/sync_hpc_code.sh          # dry-run, no remote writes
+bash scripts/local/sync_hpc_code.sh --apply  # update $PROJECT_DEV/LongLive
+```
+
+The sync script writes `$PROJECT_DEV/LongLive/.sync/last_code_sync.txt` with
+source host, branch, commit, and dirty status for experiment provenance.
+
 ## Commands
 
 Entry-points live under `scripts/local/`(本地)和 `scripts/hpc/`(SLURM)。从 repo 根调用:
@@ -151,10 +174,32 @@ torchrun --nproc_per_node=8 scripts/local/train.py --config configs/<config>.yam
 python scripts/local/inference.py --config configs/<config>.yaml                        # inference
 bash scripts/local/train_long.sh                                                        # thin torchrun wrapper
 python -m pytest tests/                                                                 # tests
+bash scripts/local/sync_hpc_code.sh                                                     # dry-run code sync to HPC
+bash scripts/local/sync_hpc_code.sh --apply                                             # apply code sync to HPC
 bash scripts/hpc/fetch_data.sh                                                          # cross-machine data sync
+LL_ON_POLICY_CONTEXT_DISTILLATION_SMOKE=1 source scripts/hpc/submit.sh sbatch_on_policy_context_distillation_train.sh
 ```
 
 **Always use parallel orchestrators / SLURM array for multi-config or multi-dataset work.** Do NOT loop single-GPU jobs in bash.
+
+## Eval reporting
+
+汇总不同 ckpt 的 eval 分数时,**固定输出三张表**,顺序固定:
+
+1. **UCF Sports**(60 prompts)— `app_div`, `temp_consist`, `pick_score`, `motion_fidelity`, `dynamic_score`
+2. **LOVEU-TGVE**(304 prompts)— 同上 5 个 motion_eval metric
+3. **VBench**(944 prompts)— `Total`, `Quality`, `Semantic`, `dynamic_degree`(`per_dim`)
+
+每张表:**列 = metric,行 = 方法(BASE 第一行作 anchor)**。
+**每列 header 标朝向**(`↑` higher better / `↓` lower better)。当前 9 个 metric 全部是 ↑。
+**每列最优值加粗**,按朝向取最优 —— ↑ 列取数值最大,↓ 列取最小。BASE 跟 finetune 一起参与排名。
+
+`dynamic_score` / `dynamic_degree` 标 ↑(DMD 4-step 内禀 amplitude collapse,数值高基本 = motion 没塌);但**过高**(如远超 BASE)可能是 motion artifact,加粗只标数值最大,**不替用户判断 artifact**。
+
+- 不要合表(UCF / LOVEU 各一张;motion_eval 和 VBench 不合)
+- 不要在同一格塞多个数据集数字
+- 不要附加 Δ-vs-BASE 衍生表(要时另问)
+- 三张表都跑 **full 集**(`run_motion_eval.sh` 默认 `--datasets ucf,loveu` 无 limit;`run_vbench.sh` 944 无 limit),不跑 in-domain 子集
 
 ## Architecture
 

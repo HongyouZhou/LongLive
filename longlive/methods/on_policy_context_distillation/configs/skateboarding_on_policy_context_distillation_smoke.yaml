@@ -1,0 +1,65 @@
+# Smoke config for on-policy context distillation.
+#
+# This allows a base teacher so the trainer can run without a prepared context
+# adapter. It is a plumbing check, not a meaningful context-distillation run.
+
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+teacher_lora_ckpt: ${oc.env:LL_ON_POLICY_CONTEXT_DISTILLATION_TEACHER_LORA,}
+teacher_lora_key: generator_lora
+teacher_caption: ""
+allow_base_teacher: true
+
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+outer_epochs: 2
+inner_steps: 4
+k_rollouts: 2
+k_noisings_per_endpoint: 2
+g_endpoints_per_outer: 2
+t_anchors: [1000, 750, 500, 250]
+distill_weight: 1.0
+beta_anchor: 0.0
+save_rollout_trajectory: false
+trajectory_device: cpu
+
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+out_dir: ${oc.env:LL_DATA}/on_policy_context_distillation_runs/_smoke
+ckpt_interval: 1
+ckpt_keep_last: 2
+
+seed: 0
+wandb_project: longlive_on_policy_context_distillation
+wandb_entity: hongyou

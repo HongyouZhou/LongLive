@@ -5,6 +5,7 @@ import torch
 import os
 
 from longlive.utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from longlive.specs.wan import get_config_value, get_wan_model_spec_from_config
 
 from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
 from longlive.utils.debug_option import DEBUG
@@ -23,10 +24,15 @@ class CausalInferencePipeline(torch.nn.Module):
         # Step 1: Initialize all models
         if DEBUG:
             print(f"args.model_kwargs: {args.model_kwargs}")
+        self.model_kwargs = getattr(args, "model_kwargs", {})
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
-        self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
-        self.vae = WanVAEWrapper() if vae is None else vae
+            **self.model_kwargs, is_causal=True) if generator is None else generator
+        self.model_spec = getattr(self.generator, "model_spec", None)
+        if self.model_spec is None:
+            self.model_spec = get_wan_model_spec_from_config(self.model_kwargs)
+        self.text_encoder = WanTextEncoder(model_name=self.model_spec.name) if text_encoder is None else text_encoder
+        self.vae = WanVAEWrapper(model_name=self.model_spec.name) if vae is None else vae
+        self.cache_spec = self.model_spec.cache
 
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
@@ -36,14 +42,13 @@ class CausalInferencePipeline(torch.nn.Module):
             timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
-        # hard code for Wan2.1-T2V-1.3B
-        self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        self.num_transformer_blocks = self.cache_spec.transformer_blocks
+        self.frame_seq_length = self.cache_spec.frame_seq_length
 
         self.kv_cache1 = None
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
-        self.local_attn_size = args.model_kwargs.local_attn_size
+        self.local_attn_size = get_config_value(self.model_kwargs, "local_attn_size", -1)
 
         # Normalize to list if sequence-like (e.g., OmegaConf ListConfig)
 
@@ -58,6 +63,8 @@ class CausalInferencePipeline(torch.nn.Module):
         noise: torch.Tensor,
         text_prompts: List[str],
         return_latents: bool = False,
+        return_trajectory: bool = False,
+        trajectory_device: str | torch.device | None = None,
         profile: bool = False,
         low_memory: bool = False,
     ) -> torch.Tensor:
@@ -107,16 +114,7 @@ class CausalInferencePipeline(torch.nn.Module):
             init_start.record()
 
         # Step 1: Initialize KV cache to all zeros
-        local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
-        kv_policy = ""
-        if local_attn_cfg != -1:
-            # local attention
-            kv_cache_size = local_attn_cfg * self.frame_seq_length
-            kv_policy = f"int->local, size={local_attn_cfg}"
-        else:
-            # global attention
-            kv_cache_size = num_output_frames * self.frame_seq_length
-            kv_policy = "global (-1)"
+        kv_cache_size, kv_policy = self._resolve_kv_cache_size(num_output_frames)
         print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
 
         self._initialize_kv_cache(
@@ -141,6 +139,9 @@ class CausalInferencePipeline(torch.nn.Module):
             torch.cuda.synchronize()
             diffusion_start.record()
 
+        trajectory = [] if return_trajectory else None
+        trajectory_device = torch.device(trajectory_device) if trajectory_device is not None else noise.device
+
         # Step 2: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
         for current_num_frames in all_num_frames:
@@ -159,6 +160,15 @@ class CausalInferencePipeline(torch.nn.Module):
                     [batch_size, current_num_frames],
                     device=noise.device,
                     dtype=torch.int64) * current_timestep
+
+                if trajectory is not None:
+                    trajectory.append({
+                        "noisy_latent": noisy_input.detach().to(trajectory_device),
+                        "timestep": timestep.detach().to(trajectory_device),
+                        "block_start_frame": current_start_frame,
+                        "num_frames": current_num_frames,
+                        "denoise_step_index": index,
+                    })
 
                 if index < len(self.denoising_step_list) - 1:
                     _, denoised_pred = self.generator(
@@ -237,8 +247,12 @@ class CausalInferencePipeline(torch.nn.Module):
             print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
             print(f"  - Total time: {total_time:.2f} ms")
 
-        if return_latents:
+        if return_latents and return_trajectory:
+            return video, output.to(noise.device), trajectory
+        elif return_latents:
             return video, output.to(noise.device)
+        elif return_trajectory:
+            return video, trajectory
         else:
             return video
 
@@ -251,17 +265,12 @@ class CausalInferencePipeline(torch.nn.Module):
         if kv_cache_size_override is not None:
             kv_cache_size = kv_cache_size_override
         else:
-            if self.local_attn_size != -1:
-                # Local attention: cache only needs to store the window
-                kv_cache_size = self.local_attn_size * self.frame_seq_length
-            else:
-                # Global attention: default cache for 21 frames (backward compatibility)
-                kv_cache_size = 32760
+            kv_cache_size = self.cache_spec.default_kv_tokens(self.local_attn_size)
 
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros(self.cache_spec.kv_shape(batch_size, kv_cache_size), dtype=dtype, device=device),
+                "v": torch.zeros(self.cache_spec.kv_shape(batch_size, kv_cache_size), dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -276,23 +285,35 @@ class CausalInferencePipeline(torch.nn.Module):
 
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros(self.cache_spec.crossattn_shape(batch_size), dtype=dtype, device=device),
+                "v": torch.zeros(self.cache_spec.crossattn_shape(batch_size), dtype=dtype, device=device),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
 
+    def _resolve_kv_cache_size(self, num_output_frames: int) -> tuple[int, str]:
+        local_attn_cfg = get_config_value(self.model_kwargs, "local_attn_size", -1)
+        if int(local_attn_cfg) != -1:
+            return (
+                self.cache_spec.kv_tokens_for_frames(num_output_frames, int(local_attn_cfg)),
+                f"int->local, size={local_attn_cfg}",
+            )
+        return (
+            self.cache_spec.kv_tokens_for_frames(num_output_frames, -1),
+            "global (-1)",
+        )
+
     def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
         """
         Set max_attention_size on all submodules that define it.
-        If local_attn_size_value == -1, use the model's global default (32760 for Wan, 28160 for 5B).
+        If local_attn_size_value == -1, use the model spec's global default.
         Otherwise, set to local_attn_size_value * frame_seq_length.
         """
-        if local_attn_size_value == -1:
-            target_size = 32760
+        if int(local_attn_size_value) == -1:
+            target_size = self.cache_spec.attention_tokens(-1)
             policy = "global"
         else:
-            target_size = int(local_attn_size_value) * self.frame_seq_length
+            target_size = self.cache_spec.attention_tokens(int(local_attn_size_value))
             policy = "local"
 
         updated_modules = []

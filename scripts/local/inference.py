@@ -24,7 +24,12 @@ from longlive.pipeline import (  # noqa: E402
 )
 from longlive.utils.dataset import TextDataset  # noqa: E402
 from longlive.utils.misc import set_seed  # noqa: E402
-
+from longlive.utils.checkpoints import (  # noqa: E402
+    load_generator_checkpoint,
+    load_lora_state_dict,
+    merge_lora_into_transformer,
+)
+from longlive.utils.lora_utils import configure_adapter_for_model  # noqa: E402
 from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory  # noqa: E402
 
 parser = argparse.ArgumentParser()
@@ -78,32 +83,34 @@ pipeline = CausalInferencePipeline(config, device=device)
 
 # Load generator checkpoint
 if config.generator_ckpt:
-    state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-    if "generator" in state_dict or "generator_ema" in state_dict:
-        raw_gen_state_dict = state_dict["generator_ema" if config.use_ema else "generator"]
-    elif "model" in state_dict:
-        raw_gen_state_dict = state_dict["model"]
-    else:
-        raise ValueError(f"Generator state dict not found in {config.generator_ckpt}")
-    if config.use_ema:
-        def _clean_key(name: str) -> str:
-            """Remove FSDP / checkpoint wrapper prefixes from parameter names."""
-            name = name.replace("_fsdp_wrapped_module.", "")
-            return name
-
-        cleaned_state_dict = { _clean_key(k): v for k, v in raw_gen_state_dict.items() }
-        missing, unexpected = pipeline.generator.load_state_dict(cleaned_state_dict, strict=False)
+    result = load_generator_checkpoint(
+        pipeline.generator,
+        config.generator_ckpt,
+        use_ema=getattr(config, "use_ema", False),
+        strict=not getattr(config, "use_ema", False),
+        clean_keys=getattr(config, "use_ema", False),
+    )
+    if getattr(config, "use_ema", False):
+        missing, unexpected = result
         if local_rank == 0:
             if len(missing) > 0:
                 print(f"[Warning] {len(missing)} parameters are missing when loading checkpoint: {missing[:8]} ...")
             if len(unexpected) > 0:
                 print(f"[Warning] {len(unexpected)} unexpected parameters encountered when loading checkpoint: {unexpected[:8]} ...")
-    else:
-        pipeline.generator.load_state_dict(raw_gen_state_dict)
 
 # --------------------------- LoRA support (optional) ---------------------------
-from longlive.utils.lora_utils import configure_lora_for_model
-import peft
+baseline_lora_ckpt = getattr(config, "baseline_lora_ckpt", None)
+baseline_adapter = getattr(config, "baseline_adapter", None)
+if baseline_lora_ckpt and baseline_adapter:
+    if local_rank == 0:
+        print(f"Overlaying baseline LoRA and merging into base: {baseline_lora_ckpt}")
+    pipeline.generator.model = merge_lora_into_transformer(
+        pipeline.generator.model,
+        model_name="generator",
+        adapter_config=baseline_adapter,
+        lora_ckpt=baseline_lora_ckpt,
+        is_main_process=(local_rank == 0),
+    )
 
 pipeline.is_lora_enabled = False
 if getattr(config, "adapter", None) and configure_lora_for_model is not None:
@@ -123,12 +130,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
     if lora_ckpt_path:
         if local_rank == 0:
             print(f"Loading LoRA checkpoint from {lora_ckpt_path}")
-        lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
-        # 兼容包含 `generator_lora` 键或直接是 LoRA state dict 两种格式
-        if isinstance(lora_checkpoint, dict) and "generator_lora" in lora_checkpoint:
-            peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint["generator_lora"])  # type: ignore
-        else:
-            peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint)  # type: ignore
+        load_lora_state_dict(pipeline.generator.model, lora_ckpt_path)
         if local_rank == 0:
             print("LoRA weights loaded for generator")
     else:

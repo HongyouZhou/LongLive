@@ -1,0 +1,93 @@
+# Motion-Equivariant RAM RefDelta fast-adaptation on the 4-step DMD base.
+#
+# Mechanism: RAM's efficient rollout/reward loop, but reward updates only a
+# coarse temporal-delta motion subspace toward the encoded reference clip.
+# Frame-shared/static velocity stays anchored to the base so pixel/color/
+# appearance are not rewarded.
+#
+# Goal: motion_fidelity > BASE 0.348 on UCF Sports without the caption-content
+# collapse that hit NFT-H3 / H3' (VBench Semantic 12.06 / 13.59 vs BASE 76.36).
+# First test uses 10 outer epochs because the reference-delta target is denser
+# than self-rollout motion.  If it beats RAM-v1, sweep lower budgets next.
+
+# ---- data ----
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+# ---- backbone (mirrors configs/longlive_inference.yaml) ----
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# ---- NVlabs baseline LoRA — merged into base ----
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# ---- Trainable LoRA — rank 32 / alpha 64 (PEFT scale alpha/r = 2.0) ----
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+# ---- DMD rollout schedule ----
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+# ---- RAM loop hyperparameters ----
+outer_epochs: 10
+inner_steps: 16              # = k_noisings_per_endpoint × g_endpoints_per_outer
+k_rollouts: 4                # endpoints per outer (must equal g_endpoints_per_outer)
+k_noisings_per_endpoint: 4   # (ε, t) draws per rollout endpoint
+g_endpoints_per_outer: 4     # rollout endpoints per outer (must equal k_rollouts)
+adv_clip_max: 5.0            # for group_normalize (NFT-H1 cross-rank gather sweep)
+t_anchors: [1000, 750, 500, 250]
+
+# ---- Motion-Equivariant RAM RefDelta-specific ----
+reward_coef: 1.0             # multiplier on group-normed reward before clipping to max_motion_weight.
+lambda_motion: 1.0           # coarse temporal-delta x0 NMSE.
+lambda_static: 0.05          # temporal-mean velocity anchor; keeps appearance/static drift weak.
+motion_pool: 2               # spatial avg-pool on latent deltas; removes texture-scale detail.
+max_motion_weight: 1.0       # keep target_delta a convex anchor→reference interpolation.
+rollout_adapter: default     # "default" (on-policy, RAM Alg 1); "anchor" available as ablation
+                             # (off-policy: rollouts from frozen base, more conservative).
+beta_kl: 0.0                 # optional full velocity anchor on top of projected objective.
+
+# ---- Reward (tracklet direction + speed-ratio band; no pixel/appearance terms) ----
+reward_n_frames: 16
+reward_grid_size: 30
+reward_speed_lower: 0.5
+reward_speed_upper: 2.0
+reward_speed_penalty_coef: 0.25
+fps: 16
+
+# ---- Optimizer ----
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+# ---- Output + caching ----
+out_dir: ${oc.env:LL_DATA}/motion_equivariant_ram_refdelta_runs/skateboarding_motion_equivariant_ram_refdelta
+cache_dir: ${oc.env:LL_DATA}/motion_equivariant_ram_refdelta_runs/_tracklet_cache
+scratch_dir: /tmp/motion_equivariant_ram_refdelta_scratch
+ckpt_interval: 5
+ckpt_keep_last: 4
+
+# ---- misc ----
+seed: 0
+wandb_project: longlive_motion_equivariant_ram_refdelta
+wandb_entity: hongyou

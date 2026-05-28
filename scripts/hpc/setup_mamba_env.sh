@@ -10,6 +10,9 @@
 #
 # Idempotent: re-running only redoes the missing pieces.
 #
+# This is the BF16/Hopper-safe environment for HPC H200/H100 jobs. Keep
+# Blackwell-only NVFP4 dependencies in scripts/lab/setup_blackwell_env.sh.
+#
 # Usage:
 #   bash scripts/hpc/setup_mamba_env.sh
 #

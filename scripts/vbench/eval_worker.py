@@ -68,8 +68,12 @@ def _stdout_for_response():
 from longlive.pipeline import CausalInferencePipeline  # noqa: E402
 from longlive.utils.misc import set_seed  # noqa: E402
 from longlive.utils.memory import DynamicSwapInstaller  # noqa: E402
+from longlive.utils.checkpoints import (  # noqa: E402
+    load_generator_checkpoint,
+    load_lora_state_dict,
+    merge_lora_into_transformer,
+)
 from longlive.utils.lora_utils import configure_lora_for_model  # noqa: E402
-import peft  # noqa: E402
 
 
 def _log(msg: str) -> None:
@@ -94,24 +98,19 @@ class EvalWorker:
         # Load base generator weights (same logic as scripts/local/inference.py:73-95).
         if self.config.generator_ckpt:
             _log(f"loading base generator from {self.config.generator_ckpt}")
-            sd = torch.load(self.config.generator_ckpt, map_location="cpu")
-            if "generator" in sd or "generator_ema" in sd:
-                gen_sd = sd["generator_ema" if self.config.use_ema else "generator"]
-            elif "model" in sd:
-                gen_sd = sd["model"]
-            else:
-                raise ValueError(
-                    f"generator state dict not found in {self.config.generator_ckpt}; "
-                    f"keys={list(sd.keys())}")
-            if self.config.use_ema:
-                clean = {k.replace("_fsdp_wrapped_module.", ""): v for k, v in gen_sd.items()}
-                missing, unexpected = self.pipeline.generator.load_state_dict(clean, strict=False)
+            result = load_generator_checkpoint(
+                self.pipeline.generator,
+                self.config.generator_ckpt,
+                use_ema=getattr(self.config, "use_ema", False),
+                strict=not getattr(self.config, "use_ema", False),
+                clean_keys=getattr(self.config, "use_ema", False),
+            )
+            if getattr(self.config, "use_ema", False):
+                missing, unexpected = result
                 if missing:
                     _log(f"missing keys (head 8): {missing[:8]}")
                 if unexpected:
                     _log(f"unexpected keys (head 8): {unexpected[:8]}")
-            else:
-                self.pipeline.generator.load_state_dict(gen_sd)
 
         # Optional: overlay NVlabs baseline LoRA (the few-step capability LoRA
         # released alongside longlive_base.pt) and merge it into the base
@@ -124,19 +123,14 @@ class EvalWorker:
         baseline_adapter = getattr(self.config, "baseline_adapter", None)
         if baseline_lora_ckpt and baseline_adapter:
             _log(f"overlaying NVlabs baseline LoRA: {baseline_lora_ckpt}")
-            self.pipeline.generator.model = configure_lora_for_model(
+            self.pipeline.generator.model = merge_lora_into_transformer(
                 self.pipeline.generator.model,
                 model_name="generator",
                 adapter_config=baseline_adapter,
+                lora_ckpt=baseline_lora_ckpt,
                 is_main_process=True,
             )
-            baseline_state = torch.load(baseline_lora_ckpt, map_location="cpu")
-            if isinstance(baseline_state, dict) and "generator_lora" in baseline_state:
-                baseline_state = baseline_state["generator_lora"]
-            peft.set_peft_model_state_dict(self.pipeline.generator.model, baseline_state)
-            self.pipeline.generator.model = self.pipeline.generator.model.merge_and_unload()
             _log("baseline LoRA merged into base weights")
-            del baseline_state
 
         # Apply LoRA + load LoRA weights (mirrors scripts/local/inference.py:97-131).
         self.pipeline.is_lora_enabled = False
@@ -151,13 +145,7 @@ class EvalWorker:
             lora_path = getattr(self.config, "lora_ckpt", None)
             if lora_path:
                 _log(f"loading LoRA weights from {lora_path}")
-                blob = torch.load(lora_path, map_location="cpu")
-                if isinstance(blob, dict) and "generator_lora" in blob:
-                    peft.set_peft_model_state_dict(
-                        self.pipeline.generator.model, blob["generator_lora"])
-                else:
-                    peft.set_peft_model_state_dict(
-                        self.pipeline.generator.model, blob)
+                load_lora_state_dict(self.pipeline.generator.model, lora_path)
             self.pipeline.is_lora_enabled = True
 
         # Move to device + dtype (matches scripts/local/inference.py:134-139).

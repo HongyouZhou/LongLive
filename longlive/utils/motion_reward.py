@@ -1,4 +1,4 @@
-"""Online motion_fidelity reward for NFT rollouts.
+"""Online motion_fidelity reward for rollout-based finetuning.
 
 Wraps `scripts.motion_eval.metrics.motion_fidelity.MotionFidelity` for in-process
 scoring during the training loop. The reference clip's CoTracker3 tracklets are
@@ -18,9 +18,8 @@ from pathlib import Path
 import torch
 
 # Heavy + env-specific imports (CoTracker, torchvision, PIL via motion_eval
-# helpers) are deferred to the method bodies — keeps the top-level NFT package
-# importable on boxes that haven't run scripts/motion_eval/setup_motion_eval_env.sh
-# yet, so e.g. losses / stat_tracking smoke tests don't pull these in.
+# helpers) are deferred to the method bodies so basic method imports do not
+# require scripts/motion_eval/setup_motion_eval_env.sh dependencies.
 
 
 class MotionFidelityReward:

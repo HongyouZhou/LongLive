@@ -1,0 +1,87 @@
+# Reinforce Adjoint Matching (RAM) fast-adaptation on the 4-step DMD base.
+#
+# Mechanism: paper arXiv:2605.10759 (Bergmeister et al., 2026-05) — independently
+# derived from NFT.  See `longlive/methods/diffusion_ram/__init__.py` for the
+# derivation chain and the adaptations made for our 4-step DMD video setting.
+#
+# Goal: motion_fidelity > BASE 0.348 on UCF Sports without the caption-content
+# collapse that hit NFT-H3 / H3' (VBench Semantic 12.06 / 13.59 vs BASE 76.36).
+# Wall-clock budget identical to NFT (20 outer × 16 inner × K=4 ≈ 60 min on 8 H200).
+
+# ---- data ----
+data_root: ${oc.env:LL_DATA}
+category: Swing-Bench
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+# ---- backbone (mirrors configs/longlive_inference.yaml) ----
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# ---- NVlabs baseline LoRA — merged into base ----
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# ---- Trainable LoRA — rank 32 / alpha 64 (PEFT scale alpha/r = 2.0) ----
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+# ---- DMD rollout schedule ----
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+# ---- RAM hyperparameters ----
+outer_epochs: 20
+inner_steps: 16              # = k_noisings_per_endpoint × g_endpoints_per_outer
+k_rollouts: 4                # endpoints per outer (must equal g_endpoints_per_outer)
+k_noisings_per_endpoint: 4   # (ε, t) draws per rollout endpoint
+g_endpoints_per_outer: 4     # rollout endpoints per outer (must equal k_rollouts)
+adv_clip_max: 5.0            # for group_normalize (NFT-H1 cross-rank gather sweep)
+t_anchors: [1000, 750, 500, 250]
+
+# ---- RAM-specific ----
+reward_coef: 1.0             # multiplier on group-normed reward in target shift.
+                             # paper uses 100 / 1000 for [0,1] partial-credit / continuous binary;
+                             # we start at 1.0 since motion_fidelity is continuous in [-1, 1].
+rollout_adapter: default     # "default" (on-policy, RAM Alg 1); "anchor" available as ablation
+                             # (off-policy: rollouts from frozen base, more conservative).
+beta_kl: 0.0                 # OFF by default; RAM target already anchors via v_ref.
+                             # > 0 adds F.mse_loss(v_default, v_anchor.detach()) on top of ram_loss.
+
+# ---- Reward (motion_fidelity, identical to NFT) ----
+reward_n_frames: 16
+reward_grid_size: 30
+fps: 16
+
+# ---- Optimizer ----
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+# ---- Output + caching ----
+out_dir: ${oc.env:LL_DATA}/diffusion_ram_runs/swing_bench_ram
+cache_dir: ${oc.env:LL_DATA}/diffusion_ram_runs/_tracklet_cache
+scratch_dir: /tmp/diffusion_ram_scratch
+ckpt_interval: 5
+ckpt_keep_last: 4
+
+# ---- misc ----
+seed: 0
+wandb_project: longlive_diffusion_ram
+wandb_entity: hongyou

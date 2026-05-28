@@ -1,0 +1,90 @@
+# Motion-Projected EM-RAM budget sweep: keep K=4 endpoint selection, reduce
+# M-step work from 10x16 to 6x12.  This tests whether motion-subspace EM/RAM
+# preserves motion quality under a materially smaller training budget.
+
+# ---- data ----
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+# ---- backbone (mirrors configs/longlive_inference.yaml) ----
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# ---- NVlabs baseline LoRA, merged into base ----
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# ---- Trainable LoRA, rank 32 / alpha 64 (PEFT scale alpha/r = 2.0) ----
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+# ---- DMD rollout schedule ----
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+# ---- rollout / inner-loop shape ----
+outer_epochs: 6
+inner_steps: 12              # = k_noisings_per_endpoint x g_endpoints_per_outer
+k_rollouts: 4                # endpoints per outer (must equal g_endpoints_per_outer)
+k_noisings_per_endpoint: 3   # (eps, t) draws per rollout endpoint
+g_endpoints_per_outer: 4     # rollout endpoints per outer (must equal k_rollouts)
+adv_clip_max: 5.0            # z-score advantage clip before the E-step softmax
+t_anchors: [1000, 750, 500, 250]
+
+# ---- Motion-Projected EM-RAM objective ----
+em_target_kl: 0.10           # E-step trust-region KL(q || uniform)
+em_eta: null                 # null = solve eta by bisection each outer
+em_weight_clip: 4.0          # cap on importance weights w=N*q
+em_alpha_mode: positive_excess
+em_alpha_max: 1.0            # cap on positive correction coefficient before reward_coef
+em_std_floor: 1.0e-4         # reward-collapse guard; alpha=0 below this std
+reward_coef: 1.0             # multiplier on EM-gated RAM residual target shift
+rollout_adapter: default     # default = on-policy; anchor = conservative ablation
+beta_kl: 0.0                 # optional direct anchor on top of Motion-Projected EM-RAM target
+lambda_motion: 1.0           # projected RAM target MSE
+lambda_static: 0.05          # temporal-mean velocity anchor
+motion_pool: 2               # spatial low-pass factor for the rewarded residual
+motion_temporal_center: true # remove frame-shared velocity before reward can act
+
+# ---- Reward (tracklet direction + speed-ratio band; no pixel/appearance terms) ----
+reward_n_frames: 16
+reward_grid_size: 30
+reward_speed_lower: 0.5
+reward_speed_upper: 2.0
+reward_speed_penalty_coef: 0.25
+fps: 16
+
+# ---- Optimizer ----
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+# ---- Output + caching ----
+out_dir: ${oc.env:LL_DATA}/motion_projected_em_ram_runs/skateboarding_motion_projected_em_ram_budget_6x12
+cache_dir: ${oc.env:LL_DATA}/motion_projected_em_ram_runs/_tracklet_cache
+scratch_dir: /tmp/motion_projected_em_ram_scratch
+ckpt_interval: 3
+ckpt_keep_last: 4
+
+# ---- misc ----
+seed: 0
+wandb_project: longlive_motion_projected_em_ram
+wandb_entity: hongyou

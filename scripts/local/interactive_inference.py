@@ -29,6 +29,12 @@ from einops import rearrange  # noqa: E402
 
 from longlive.utils.misc import set_seed  # noqa: E402
 from longlive.utils.distributed import barrier  # noqa: E402
+from longlive.utils.checkpoints import (  # noqa: E402
+    load_generator_checkpoint,
+    load_lora_state_dict,
+    merge_lora_into_transformer,
+)
+from longlive.utils.lora_utils import configure_adapter_for_model  # noqa: E402
 from longlive.utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller  # noqa: E402
 
 from longlive.pipeline.interactive_causal_inference import (  # noqa: E402
@@ -83,28 +89,34 @@ torch.set_grad_enabled(False)
 pipeline = InteractiveCausalInferencePipeline(config, device=device)
 
 if config.generator_ckpt:
-    state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-    raw_gen_state_dict = state_dict["generator_ema" if config.use_ema else "generator"]
-
-    if config.use_ema:
-        def _clean_key(name: str) -> str:
-            return name.replace("_fsdp_wrapped_module.", "")
-
-        cleaned_state_dict = {_clean_key(k): v for k, v in raw_gen_state_dict.items()}
-        missing, unexpected = pipeline.generator.load_state_dict(
-            cleaned_state_dict, strict=False
-        )
+    result = load_generator_checkpoint(
+        pipeline.generator,
+        config.generator_ckpt,
+        use_ema=getattr(config, "use_ema", False),
+        strict=not getattr(config, "use_ema", False),
+        clean_keys=getattr(config, "use_ema", False),
+    )
+    if getattr(config, "use_ema", False):
+        missing, unexpected = result
         if local_rank == 0:
             if missing:
                 print(f"[Warning] {len(missing)} parameters missing: {missing[:8]} ...")
             if unexpected:
                 print(f"[Warning] {len(unexpected)} unexpected params: {unexpected[:8]} ...")
-    else:
-        pipeline.generator.load_state_dict(raw_gen_state_dict)
 
 # --------------------------- LoRA support (optional) ---------------------------
-from longlive.utils.lora_utils import configure_lora_for_model
-import peft
+baseline_lora_ckpt = getattr(config, "baseline_lora_ckpt", None)
+baseline_adapter = getattr(config, "baseline_adapter", None)
+if baseline_lora_ckpt and baseline_adapter:
+    if local_rank == 0:
+        print(f"Overlaying baseline LoRA and merging into base: {baseline_lora_ckpt}")
+    pipeline.generator.model = merge_lora_into_transformer(
+        pipeline.generator.model,
+        model_name="generator",
+        adapter_config=baseline_adapter,
+        lora_ckpt=baseline_lora_ckpt,
+        is_main_process=(local_rank == 0),
+    )
 
 pipeline.is_lora_enabled = False
 if getattr(config, "adapter", None) and configure_lora_for_model is not None:
@@ -115,7 +127,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
     pipeline.generator.model = configure_lora_for_model(
         pipeline.generator.model,
         model_name="generator",
-        lora_config=config.adapter,
+        adapter_config=config.adapter,
         is_main_process=(local_rank == 0),
     )
 
@@ -124,12 +136,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
     if lora_ckpt_path:
         if local_rank == 0:
             print(f"Loading LoRA checkpoint from {lora_ckpt_path}")
-        lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
-        # Support both formats: containing the `generator_lora` key or a raw LoRA state dict
-        if isinstance(lora_checkpoint, dict) and "generator_lora" in lora_checkpoint:
-            peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint["generator_lora"])  # type: ignore
-        else:
-            peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint)  # type: ignore
+        load_lora_state_dict(pipeline.generator.model, lora_ckpt_path)
         if local_rank == 0:
             print("LoRA weights loaded for generator")
     else:
@@ -236,4 +243,4 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         break
 
 if dist.is_initialized():
-    dist.destroy_process_group() 
+    dist.destroy_process_group()

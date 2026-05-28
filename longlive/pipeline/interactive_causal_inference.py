@@ -143,16 +143,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         )
 
         # initialize caches
-        local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
-        kv_policy = ""
-        if local_attn_cfg != -1:
-            # local attention
-            kv_cache_size = local_attn_cfg * self.frame_seq_length
-            kv_policy = f"int->local, size={local_attn_cfg}"
-        else:
-            # global attention
-            kv_cache_size = num_output_frames * self.frame_seq_length
-            kv_policy = "global (-1)"
+        kv_cache_size, kv_policy = self._resolve_kv_cache_size(num_output_frames)
         print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
 
         self._initialize_kv_cache(
@@ -266,4 +257,4 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
         if return_latents:
             return video, output
-        return video 
+        return video

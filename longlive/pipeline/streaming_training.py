@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from longlive.utils.debug_option import DEBUG, LOG_GPU_MEMORY
 from longlive.utils.memory import log_gpu_memory
+from longlive.specs.wan import get_wan_model_spec
 
 
 class StreamingTrainingPipeline:
@@ -34,8 +35,10 @@ class StreamingTrainingPipeline:
             self.denoising_step_list = self.denoising_step_list[:-1]  # remove the zero timestep for inference
 
         # Wan specific hyperparameters
-        self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        self.model_spec = getattr(generator, "model_spec", get_wan_model_spec())
+        self.cache_spec = self.model_spec.cache
+        self.num_transformer_blocks = self.cache_spec.transformer_blocks
+        self.frame_seq_length = self.cache_spec.frame_seq_length
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
 
@@ -265,8 +268,8 @@ class StreamingTrainingPipeline:
             print(f"rank {dist.get_rank()} initialize kv cache with batch_size: {batch_size}, kv_cache_size: {self.kv_cache_size}")
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros(self.cache_spec.kv_shape(batch_size, self.kv_cache_size), dtype=dtype, device=device),
+                "v": torch.zeros(self.cache_spec.kv_shape(batch_size, self.kv_cache_size), dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -281,8 +284,8 @@ class StreamingTrainingPipeline:
 
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros(self.cache_spec.crossattn_shape(batch_size), dtype=dtype, device=device),
+                "v": torch.zeros(self.cache_spec.crossattn_shape(batch_size), dtype=dtype, device=device),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
@@ -313,17 +316,17 @@ class StreamingTrainingPipeline:
     def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
         """
         Set a unified upper bound for all submodules that contain the max_attention_size attribute.
-        local_attn_size_value == -1 indicates global attention (use Wan's default token limit 32760).
+        local_attn_size_value == -1 indicates global attention.
         Otherwise set to local_attn_size_value * frame_seq_length.
         """
         if isinstance(local_attn_size_value, (list, tuple)):
             raise ValueError("_set_all_modules_max_attention_size expects an int, got list/tuple.")
 
         if int(local_attn_size_value) == -1:
-            target_size = 32760
+            target_size = self.cache_spec.attention_tokens(-1)
             policy = "global"
         else:
-            target_size = int(local_attn_size_value) * self.frame_seq_length
+            target_size = self.cache_spec.attention_tokens(int(local_attn_size_value))
             policy = "local"
 
         # Root module

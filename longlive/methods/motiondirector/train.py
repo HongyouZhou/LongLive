@@ -37,7 +37,7 @@ from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from longlive.methods.motiondirector.data import GeneralPromptDataset, SkateboardingLatentDataset
+from longlive.data.motion_refs import GeneralPromptDataset, SkateboardingLatentDataset
 from longlive.methods.motiondirector.losses import (
     amplitude_penalty_loss,
     appearance_debias_loss,
@@ -164,7 +164,7 @@ def main():
     # ---------- VAE (small, per rank) ----------
     if rank0:
         print("[motiondirector] loading VAE ...", flush=True)
-    vae = WanVAEWrapper()
+    vae = WanVAEWrapper(model_name=str(cfg.model_name))
     vae.to(device).eval()
 
     # ---------- Data ----------
@@ -211,7 +211,7 @@ def main():
     # ~50 cond_dicts × ~1 MB each = trivial.
     if rank0:
         print("[motiondirector] loading text encoder (cache embeddings then free) ...", flush=True)
-    text_encoder = WanTextEncoder()
+    text_encoder = WanTextEncoder(model_name=str(cfg.model_name))
     text_encoder.to(device).eval()
     with torch.no_grad():
         null_cond = {k: v.detach().clone() for k, v in text_encoder([""]).items()}
