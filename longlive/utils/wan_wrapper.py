@@ -162,7 +162,9 @@ class WanVAEWrapper(torch.nn.Module):
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
-        device, dtype = pixel.device, pixel.dtype
+        model_param = next(self.model.parameters())
+        device, dtype = model_param.device, model_param.dtype
+        pixel = pixel.to(device=device, dtype=dtype)
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
 
