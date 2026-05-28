@@ -14,8 +14,8 @@ __pycache__/
 *.py[cod]
 *.so
 
-data/
-hf_cache/
+/data/
+/hf_cache/
 wan_models/
 longlive_models/
 checkpoints/
