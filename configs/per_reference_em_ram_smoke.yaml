@@ -1,0 +1,48 @@
+# Per-reference smoke protocol: BASE + EM-RAM on one UCF unit and one
+# LOVEU unit.  This validates the train -> unit-local eval path.
+
+experiment_name: per_reference_em_ram_smoke
+data_root: ${oc.env:LL_DATA}
+output_root: ${oc.env:LL_DATA}/per_reference_adaptation_runs
+
+protocol:
+  name: per_reference_adaptation
+  seed: 0
+  datasets:
+    ucf:
+      enabled: true
+      categories: all
+      max_categories: 1
+      refs_per_category: 1
+      prompts_per_unit: 2
+    loveu:
+      enabled: true
+      max_units: 1
+      unit_ids: null
+      prompts_per_unit: 2
+      prompt_types:
+        - Style Change Caption
+        - Object Change Caption
+        - Background Change Caption
+        - Multiple Changes Caption
+
+runtime:
+  nproc_per_node: 1
+  eval_gpus: "0"
+  master_port: 29500
+  disable_wandb: true
+  skip_completed_train: true
+
+methods:
+  - name: base
+
+  - name: em_ram
+    overrides:
+      outer_epochs: 2
+      inner_steps: 4
+      k_rollouts: 2
+      k_noisings_per_endpoint: 2
+      g_endpoints_per_outer: 2
+      ckpt_interval: 2
+      ckpt_keep_last: 2
+      warmup_steps: 0

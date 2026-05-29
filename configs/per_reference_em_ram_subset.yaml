@@ -1,0 +1,50 @@
+# Per-reference subset protocol for the first real HPC trial.
+#
+# Scope:
+#   UCF:   2 categories x 1 reference/category x 6 prompts = 12 eval videos
+#   LOVEU: 4 reference videos x 4 edit prompts = 16 eval videos
+#
+# Methods:
+#   BASE + EM-RAM.  No MP projection yet; this isolates whether EM
+#   credit assignment helps before adding Motion-Projected constraints.
+
+experiment_name: per_reference_em_ram_subset
+data_root: ${oc.env:LL_DATA}
+output_root: ${oc.env:LL_DATA}/per_reference_adaptation_runs
+
+protocol:
+  name: per_reference_adaptation
+  seed: 0
+  datasets:
+    ucf:
+      enabled: true
+      categories: all
+      max_categories: 2
+      refs_per_category: 1
+      prompts_per_unit: all
+    loveu:
+      enabled: true
+      max_units: 4
+      unit_ids: null
+      prompts_per_unit: all
+      prompt_types:
+        - Style Change Caption
+        - Object Change Caption
+        - Background Change Caption
+        - Multiple Changes Caption
+
+runtime:
+  nproc_per_node: 8
+  eval_gpus: "0,1,2,3,4,5,6,7"
+  master_port: 29500
+  disable_wandb: false
+  skip_completed_train: true
+
+methods:
+  - name: base
+
+  - name: em_ram
+    overrides:
+      outer_epochs: 10
+      ckpt_interval: 5
+      ckpt_keep_last: 4

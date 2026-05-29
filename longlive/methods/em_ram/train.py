@@ -54,7 +54,7 @@ from torch.distributed.fsdp import (
 from torch.optim import AdamW
 
 from longlive.methods.em_ram.losses import em_ram_loss, em_tilt_weights, kl_anchor_loss
-from longlive.data.motion_refs import SkateboardingLatentDataset
+from longlive.data.motion_refs import make_reference_dataset
 from longlive.utils.distributed import fsdp_wrap, launch_distributed_job
 from longlive.utils.lora_utils import configure_adapter_for_model
 from longlive.utils.motion_reward import MotionFidelityReward
@@ -231,15 +231,7 @@ def main():
     vae.to(device=device, dtype=torch.bfloat16).eval()
 
     # ---------- Dataset (ref clip path + train caption only) ----------
-    dataset = SkateboardingLatentDataset(
-        data_root=cfg.data_root,
-        vae=vae,
-        frame_count=int(cfg.frame_count),
-        resolution=int(cfg.resolution),
-        category=str(cfg.category),
-        device=device,
-        single_video=True,
-    )
+    dataset = make_reference_dataset(cfg, vae=vae, device=device)
     train_caption = dataset.train_caption
     ref_clip_path = dataset.train_clip_path
 

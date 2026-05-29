@@ -1,0 +1,67 @@
+# RAM method template for per-reference adaptation.
+#
+# This file defines only method/backbone hyperparameters.  The protocol runner
+# injects the concrete reference_video_path, train_caption, unit_id, output
+# dirs, and seed for each reference unit.
+
+data_root: ${oc.env:LL_DATA}
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+outer_epochs: 20
+inner_steps: 16
+k_rollouts: 4
+k_noisings_per_endpoint: 4
+g_endpoints_per_outer: 4
+adv_clip_max: 5.0
+t_anchors: [1000, 750, 500, 250]
+
+reward_coef: 1.0
+rollout_adapter: default
+beta_kl: 0.0
+
+reward_n_frames: 16
+reward_grid_size: 30
+fps: 16
+
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+out_dir: ${oc.env:LL_DATA}/per_reference_template_runs/ram
+cache_dir: ${oc.env:LL_DATA}/per_reference_template_runs/_tracklet_cache
+scratch_dir: ${oc.env:LL_DATA}/per_reference_template_runs/_scratch/ram
+ckpt_interval: 5
+ckpt_keep_last: 4
+
+seed: 0
+wandb_project: longlive_diffusion_ram
+wandb_entity: hongyou

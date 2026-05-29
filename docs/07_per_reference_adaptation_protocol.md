@@ -98,7 +98,9 @@ It does not answer whether the reference motion was distilled correctly.
 ## 3. Configurable Scale
 
 Every experiment should expose protocol scale in config, so smoke runs and full
-runs share the same code path.
+runs share the same code path.  The experiment YAML is the user-facing source
+of truth: it chooses the reference videos, which implicitly choose the eval
+prompts, and it chooses the method list.
 
 Recommended schema:
 
@@ -129,6 +131,26 @@ protocol:
     enabled: false
     adapted_unit_ids: []     # run VBench only for listed adapted LoRAs
 ```
+
+For hand-picked videos, the same config can bypass dataset selectors and list
+explicit units:
+
+```yaml
+protocol:
+  units:
+    - unit_id: skate_ref_001
+      dataset: custom
+      reference_video: ucf_sports/videos/Skateboarding/example.mp4
+      train_caption: A person is skateboarding.
+      eval_prompts:
+        - A robot is skateboarding.
+        - A panda is skateboarding.
+```
+
+The number of resolved reference units is the experiment count.  With one train
+method, `n` reference videos produce `n` distillation runs and `n` unit-local
+eval runs.  With multiple methods, each train method runs once per reference
+unit; `base` is a no-training method and only runs eval per unit.
 
 The protocol runner should materialize a resolved unit manifest before starting
 training. That manifest should be written to the run directory and should record:
@@ -341,6 +363,25 @@ Every unit should get stable output paths:
 ```text
 $LL_DATA/per_reference_adaptation_runs/{experiment}/{dataset}/{unit_id}/
 $LL_DATA/motion_eval_runs/{experiment}_{slurm_job_id}/{dataset}/{unit_id}/
+```
+
+Executable implementation:
+
+```text
+scripts/per_reference/run_protocol.py
+scripts/hpc/sbatch_per_reference_adaptation.sh
+configs/per_reference_em_ram_smoke.yaml
+configs/per_reference_em_ram.yaml
+configs/per_reference_em_ram_subset.yaml
+configs/per_reference_method_matrix_smoke.yaml
+```
+
+The protocol runner writes `units.jsonl`, one resolved train config per
+method/unit, one unit-local prompt manifest per eval, and aggregate summaries:
+
+```text
+$LL_DATA/per_reference_adaptation_runs/{experiment}/summary.json
+$LL_DATA/per_reference_adaptation_runs/{experiment}/summary_by_method_dataset.csv
 ```
 
 The aggregate result should keep the existing reporting convention:

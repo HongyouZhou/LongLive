@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import random
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -55,6 +56,55 @@ def _load_clip_to_pixel_tensor(
 
     x = x.permute(1, 0, 2, 3).unsqueeze(0) * 2.0 - 1.0
     return x.to(device, dtype=torch.float32)
+
+
+def _resolve_video_path(data_root: str | Path, path: str | Path) -> Path:
+    candidate = Path(os.path.expandvars(str(path))).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(data_root) / candidate
+    if not candidate.exists():
+        raise FileNotFoundError(f"reference video not found: {candidate}")
+    return candidate
+
+
+class ReferenceVideoDataset:
+    """Yield one explicit reference video and caption for per-unit adaptation."""
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        vae: WanVAEWrapper,
+        reference_video_path: str | Path,
+        train_caption: str,
+        frame_count: int = 81,
+        resolution: int = 480,
+        device: torch.device | str = "cuda",
+        unit_id: str | None = None,
+    ):
+        if not str(train_caption).strip():
+            raise ValueError("ReferenceVideoDataset requires a non-empty train_caption")
+        self.data_root = Path(data_root)
+        self.vae = vae
+        self.frame_count = frame_count
+        self.resolution = resolution
+        self.device = torch.device(device)
+        self.unit_id = unit_id or Path(reference_video_path).stem
+        self.train_clip_path = _resolve_video_path(self.data_root, reference_video_path)
+        self.clips = [self.train_clip_path]
+        self.train_caption = str(train_caption)
+
+        print(
+            f"[ReferenceVideoDataset] unit_id={self.unit_id!r} "
+            f"ref={self.train_clip_path}, caption={self.train_caption!r}"
+        )
+
+    @torch.no_grad()
+    def sample(self) -> tuple[torch.Tensor, str]:
+        pixels = _load_clip_to_pixel_tensor(
+            self.train_clip_path, self.frame_count, self.resolution, self.device,
+        )
+        latent = self.vae.encode_to_latent(pixels)
+        return latent.to(torch.bfloat16), self.train_caption
 
 
 class SkateboardingLatentDataset:
@@ -121,6 +171,41 @@ class SkateboardingLatentDataset:
         )
         latent = self.vae.encode_to_latent(pixels)
         return latent.to(torch.bfloat16), self.train_caption
+
+
+def make_reference_dataset(
+    cfg,
+    *,
+    vae: WanVAEWrapper,
+    device: torch.device | str,
+):
+    """Build the reference dataset requested by a method config.
+
+    Per-reference protocol configs provide ``reference_video_path`` and
+    ``train_caption``.  Legacy single-category configs omit those fields and
+    keep using the deterministic first UCF category clip.
+    """
+    reference_video_path = getattr(cfg, "reference_video_path", None)
+    if reference_video_path:
+        return ReferenceVideoDataset(
+            data_root=cfg.data_root,
+            vae=vae,
+            reference_video_path=reference_video_path,
+            train_caption=str(getattr(cfg, "train_caption", "")),
+            frame_count=int(cfg.frame_count),
+            resolution=int(cfg.resolution),
+            device=device,
+            unit_id=str(getattr(cfg, "unit_id", "")) or None,
+        )
+    return SkateboardingLatentDataset(
+        data_root=cfg.data_root,
+        vae=vae,
+        frame_count=int(cfg.frame_count),
+        resolution=int(cfg.resolution),
+        category=str(cfg.category),
+        device=device,
+        single_video=True,
+    )
 
 
 class GeneralPromptDataset:

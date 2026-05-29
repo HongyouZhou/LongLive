@@ -61,7 +61,7 @@ from longlive.methods.motion_projected_em_ram.losses import (
     score_consistency_weights,
 )
 from longlive.methods.motion_projected_em_ram.reward import MotionProjectedEMReward
-from longlive.methods.motiondirector.data import SkateboardingLatentDataset
+from longlive.data.motion_refs import make_reference_dataset
 from longlive.utils.distributed import fsdp_wrap, launch_distributed_job
 from longlive.utils.lora_utils import configure_adapter_for_model
 from longlive.utils.rl_rollout import RolloutEngine, maybe_barrier
@@ -254,15 +254,7 @@ def main():
     vae.to(device=device, dtype=torch.bfloat16).eval()
 
     # ---------- Dataset (ref clip path + train caption only) ----------
-    dataset = SkateboardingLatentDataset(
-        data_root=cfg.data_root,
-        vae=vae,
-        frame_count=int(cfg.frame_count),
-        resolution=int(cfg.resolution),
-        category=str(cfg.category),
-        device=device,
-        single_video=True,
-    )
+    dataset = make_reference_dataset(cfg, vae=vae, device=device)
     train_caption = dataset.train_caption
     ref_clip_path = dataset.train_clip_path
     reference_latent = None

@@ -1,0 +1,47 @@
+# Full per-reference protocol for the first EM-RAM ablation:
+# BASE vs EM-RAM.  UCF = 10 reference units x 6 prompts; LOVEU =
+# 76 reference units x 4 prompts.  VBench is intentionally not part of this
+# default metric because it has no paired reference video.
+
+experiment_name: per_reference_em_ram
+data_root: ${oc.env:LL_DATA}
+output_root: ${oc.env:LL_DATA}/per_reference_adaptation_runs
+
+protocol:
+  name: per_reference_adaptation
+  seed: 0
+  datasets:
+    ucf:
+      enabled: true
+      categories: all
+      max_categories: null
+      refs_per_category: 1
+      prompts_per_unit: all
+    loveu:
+      enabled: true
+      max_units: null
+      unit_ids: null
+      prompts_per_unit: all
+      prompt_types:
+        - Style Change Caption
+        - Object Change Caption
+        - Background Change Caption
+        - Multiple Changes Caption
+
+runtime:
+  nproc_per_node: 8
+  eval_gpus: "0,1,2,3,4,5,6,7"
+  master_port: 29500
+  disable_wandb: false
+  skip_completed_train: true
+
+methods:
+  - name: base
+
+  - name: em_ram
+    overrides:
+      # Match MP-EM-RAM's current 10-outer budget so this ablation tests
+      # EM credit assignment before adding motion projection.
+      outer_epochs: 10
+      ckpt_interval: 5
+      ckpt_keep_last: 4
