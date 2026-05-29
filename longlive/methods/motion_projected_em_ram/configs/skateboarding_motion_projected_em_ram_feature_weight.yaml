@@ -1,0 +1,120 @@
+# Motion-Projected EM-RAM with continuous feature-space endpoint weighting.
+#
+# The hard feature selector made alpha sparse late in training.  This variant
+# keeps every endpoint trainable and softly redistributes EM's update mass
+# toward CoTracker-consistent motion, while preserving the stable coarse-motion
+# M-step.
+
+# ---- data ----
+data_root: ${oc.env:LL_DATA}
+category: Skateboarding
+frame_count: 81
+resolution: 480
+pixel_width: 832
+
+# ---- backbone (mirrors configs/longlive_inference.yaml) ----
+model_name: Wan2.1-T2V-1.3B
+timestep_shift: 5.0
+is_causal: true
+local_attn_size: 12
+sink_size: 3
+base_ckpt: ${oc.env:LL_DATA}/longlive_models/models/longlive_base.pt
+
+# ---- NVlabs baseline LoRA, merged into base ----
+baseline_lora_ckpt: ${oc.env:LL_DATA}/longlive_models/models/lora.pt
+baseline_adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  verbose: false
+
+# ---- Trainable LoRA, rank 32 / alpha 64 (PEFT scale alpha/r = 2.0) ----
+adapter:
+  type: lora
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  verbose: false
+
+# ---- DMD rollout schedule ----
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+context_noise: 0
+
+# ---- rollout / inner-loop shape ----
+outer_epochs: 10
+inner_steps: 16
+k_rollouts: 4
+k_noisings_per_endpoint: 4
+g_endpoints_per_outer: 4
+adv_clip_max: 5.0
+t_anchors: [1000, 750, 500, 250]
+
+# ---- Continuous feature-weighted MP-EM-RAM objective ----
+em_target_kl: 0.10
+em_eta: null
+em_weight_clip: 4.0
+em_alpha_mode: positive_excess
+em_alpha_max: 1.0
+em_std_floor: 1.0e-4
+reward_coef: 1.0
+rollout_adapter: default
+beta_kl: 0.0
+lambda_motion: 1.0
+lambda_static: 0.05
+subspace_mode: coarse_motion
+motion_pool: 2
+motion_temporal_center: true
+
+# Reference projector remains disabled for this experiment.
+reference_motion_scope: frame
+reference_motion_positive: false
+reference_motion_mix: 1.0
+reference_motion_temporal_center: false
+lambda_reference_orthogonal: 0.0
+
+# Soft feature weighting.  Mean normalization keeps update mass near the
+# baseline MP-EM-RAM run; min/max prevent a single endpoint from dominating.
+feature_selector_mode: component_weight
+feature_weight_direction_center: 0.0
+feature_weight_direction_temperature: 0.25
+feature_weight_speed_penalty_coef: 0.25
+feature_weight_min: 0.25
+feature_weight_max: 1.5
+feature_weight_normalize_mean: true
+
+# Hard selector fields are unused in component_weight mode.
+feature_selector_direction_min: 0.0
+feature_selector_speed_penalty_max: null
+feature_selector_speed_ratio_min: null
+feature_selector_speed_ratio_max: null
+feature_selector_fallback_topk: 0
+feature_selector_fallback_speed_penalty_coef: 0.25
+
+# ---- Reward (tracklet direction + speed-ratio band; no pixel/appearance terms) ----
+reward_n_frames: 16
+reward_grid_size: 30
+reward_speed_lower: 0.5
+reward_speed_upper: 2.0
+reward_speed_penalty_coef: 0.25
+fps: 16
+
+# ---- Optimizer ----
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_steps: 0
+
+# ---- Output + caching ----
+out_dir: ${oc.env:LL_DATA}/motion_projected_em_ram_runs/skateboarding_motion_projected_em_ram_feature_weight
+cache_dir: ${oc.env:LL_DATA}/motion_projected_em_ram_runs/_tracklet_cache
+scratch_dir: /tmp/motion_projected_em_ram_scratch
+ckpt_interval: 5
+ckpt_keep_last: 4
+
+# ---- misc ----
+seed: 0
+wandb_project: longlive_motion_projected_em_ram
+wandb_entity: hongyou
+

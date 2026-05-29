@@ -54,8 +54,11 @@ from torch.optim import AdamW
 
 from longlive.methods.motion_projected_em_ram.losses import (
     em_tilt_weights,
+    feature_consistency_gates,
+    feature_consistency_weights,
     kl_anchor_loss,
     motion_projected_em_ram_loss,
+    score_consistency_weights,
 )
 from longlive.methods.motion_projected_em_ram.reward import MotionProjectedEMReward
 from longlive.methods.motiondirector.data import SkateboardingLatentDataset
@@ -189,8 +192,11 @@ def main():
     reference_motion_temporal_center = bool(
         getattr(cfg, "reference_motion_temporal_center", False)
     )
-    assert subspace_mode in ("coarse_motion", "reference_motion"), (
-        f"subspace_mode must be 'coarse_motion' or 'reference_motion', got {subspace_mode!r}"
+    lambda_reference_orthogonal = float(getattr(cfg, "lambda_reference_orthogonal", 0.0))
+    reference_subspace_modes = ("reference_motion", "hybrid_reference_motion")
+    assert subspace_mode in ("coarse_motion", *reference_subspace_modes), (
+        f"subspace_mode must be 'coarse_motion', 'reference_motion', or "
+        f"'hybrid_reference_motion', got {subspace_mode!r}"
     )
     assert reference_motion_scope in ("frame", "global"), (
         f"reference_motion_scope must be 'frame' or 'global', got {reference_motion_scope!r}"
@@ -260,7 +266,7 @@ def main():
     train_caption = dataset.train_caption
     ref_clip_path = dataset.train_clip_path
     reference_latent = None
-    if subspace_mode == "reference_motion":
+    if subspace_mode in reference_subspace_modes:
         if rank0:
             print("[motion_projected_em_ram] encoding reference latent for subspace projector ...", flush=True)
         reference_latent, _ = dataset.sample()
@@ -339,10 +345,10 @@ def main():
         del baseline_state
 
     # ---------- Attach 2 PEFT adapters (BEFORE FSDP wrap) ----------
-    # Motion-Projected EM-RAM only needs 2: "default" (trainable) + "anchor" (zero-init, frozen, = v_ref).
+    # Motion-Projected EM-RAM only needs 2: "default" (trainable) + "anchor" (zero-init, frozen LongLive base).
     # No "old" EMA adapter (NFT-specific).
     if rank0:
-        print("[motion_projected_em_ram] attaching adapters: default + anchor (v_ref)", flush=True)
+        print("[motion_projected_em_ram] attaching adapters: default + anchor (frozen LongLive base)", flush=True)
     generator.model = configure_adapter_for_model(
         generator.model,
         model_name="generator",
@@ -510,11 +516,68 @@ def main():
     reward_mode = str(getattr(cfg, "reward_mode", "absolute"))
     reward_relative_margin = float(getattr(cfg, "reward_relative_margin", 0.0))
     reward_relative_gate = bool(getattr(cfg, "reward_relative_gate", True))
+    feature_selector_mode = str(getattr(cfg, "feature_selector_mode", "none"))
+    feature_selector_direction_min = float(
+        getattr(cfg, "feature_selector_direction_min", 0.0)
+    )
+    feature_selector_speed_penalty_max_cfg = getattr(
+        cfg, "feature_selector_speed_penalty_max", None
+    )
+    feature_selector_speed_penalty_max = (
+        None
+        if feature_selector_speed_penalty_max_cfg is None
+        else float(feature_selector_speed_penalty_max_cfg)
+    )
+    feature_selector_speed_ratio_min_cfg = getattr(
+        cfg, "feature_selector_speed_ratio_min", None
+    )
+    feature_selector_speed_ratio_min = (
+        None
+        if feature_selector_speed_ratio_min_cfg is None
+        else float(feature_selector_speed_ratio_min_cfg)
+    )
+    feature_selector_speed_ratio_max_cfg = getattr(
+        cfg, "feature_selector_speed_ratio_max", None
+    )
+    feature_selector_speed_ratio_max = (
+        None
+        if feature_selector_speed_ratio_max_cfg is None
+        else float(feature_selector_speed_ratio_max_cfg)
+    )
+    feature_selector_fallback_topk = int(getattr(cfg, "feature_selector_fallback_topk", 0))
+    feature_selector_fallback_speed_penalty_coef = float(
+        getattr(
+            cfg,
+            "feature_selector_fallback_speed_penalty_coef",
+            getattr(cfg, "reward_speed_penalty_coef", 0.25),
+        )
+    )
+    feature_weight_direction_center = float(
+        getattr(cfg, "feature_weight_direction_center", 0.0)
+    )
+    feature_weight_direction_temperature = float(
+        getattr(cfg, "feature_weight_direction_temperature", 0.25)
+    )
+    feature_weight_speed_penalty_coef = float(
+        getattr(cfg, "feature_weight_speed_penalty_coef", getattr(cfg, "reward_speed_penalty_coef", 0.25))
+    )
+    feature_weight_min = float(getattr(cfg, "feature_weight_min", 0.25))
+    feature_weight_max = float(getattr(cfg, "feature_weight_max", 1.5))
+    feature_weight_normalize_mean = bool(getattr(cfg, "feature_weight_normalize_mean", True))
+    feature_score_center = float(getattr(cfg, "feature_score_center", 0.0))
+    feature_score_temperature = float(getattr(cfg, "feature_score_temperature", 0.25))
+    feature_score_min = float(getattr(cfg, "feature_score_min", 0.0))
+    feature_score_max = float(getattr(cfg, "feature_score_max", 1.0))
+    feature_score_normalize_mean = bool(getattr(cfg, "feature_score_normalize_mean", False))
     assert rollout_adapter in ("default", "anchor"), (
         f"rollout_adapter must be 'default' or 'anchor', got {rollout_adapter!r}"
     )
     assert reward_mode in ("absolute", "baseline_relative"), (
         f"reward_mode must be 'absolute' or 'baseline_relative', got {reward_mode!r}"
+    )
+    assert feature_selector_mode in ("none", "component_gate", "component_weight", "score_weight"), (
+        f"feature_selector_mode must be 'none', 'component_gate', "
+        f"'component_weight', or 'score_weight', got {feature_selector_mode!r}"
     )
     if reward_mode == "baseline_relative":
         assert rollout_adapter == "default", (
@@ -531,6 +594,7 @@ def main():
             f"em_alpha_mode={em_alpha_mode} | em_alpha_max={em_alpha_max} | "
             f"em_std_floor={em_std_floor} | lambda_motion={lambda_motion} | "
             f"lambda_static={lambda_static} | motion_pool={motion_pool} | "
+            f"lambda_reference_orthogonal={lambda_reference_orthogonal} | "
             f"motion_temporal_center={motion_temporal_center} | "
             f"subspace_mode={subspace_mode} | reference_scope={reference_motion_scope} | "
             f"reference_positive={reference_motion_positive} | "
@@ -538,7 +602,24 @@ def main():
             f"reference_temporal_center={reference_motion_temporal_center} | "
             f"rollout_adapter={rollout_adapter} | reward_mode={reward_mode} | "
             f"relative_margin={reward_relative_margin} | "
-            f"relative_gate={reward_relative_gate} | anchors={anchors}",
+            f"relative_gate={reward_relative_gate} | "
+            f"feature_selector={feature_selector_mode} | "
+            f"selector_dir_min={feature_selector_direction_min} | "
+            f"selector_speed_penalty_max={feature_selector_speed_penalty_max} | "
+            f"selector_speed_ratio_min={feature_selector_speed_ratio_min} | "
+            f"selector_speed_ratio_max={feature_selector_speed_ratio_max} | "
+            f"selector_fallback_topk={feature_selector_fallback_topk} | "
+            f"selector_fallback_speed_penalty_coef={feature_selector_fallback_speed_penalty_coef} | "
+            f"feature_weight_center={feature_weight_direction_center} | "
+            f"feature_weight_temp={feature_weight_direction_temperature} | "
+            f"feature_weight_speed_coef={feature_weight_speed_penalty_coef} | "
+            f"feature_weight_minmax={feature_weight_min}/{feature_weight_max} | "
+            f"feature_weight_normalize={feature_weight_normalize_mean} | "
+            f"feature_score_center={feature_score_center} | "
+            f"feature_score_temp={feature_score_temperature} | "
+            f"feature_score_minmax={feature_score_min}/{feature_score_max} | "
+            f"feature_score_normalize={feature_score_normalize_mean} | "
+            f"anchors={anchors}",
             flush=True,
         )
 
@@ -672,6 +753,42 @@ def main():
                 dtype=alpha_tensor.dtype,
             )
             alpha_tensor = alpha_tensor * accepted_t
+        feature_selector_diag = {}
+        if feature_selector_mode == "component_gate":
+            feature_gates, feature_selector_diag = feature_consistency_gates(
+                reward_components,
+                direction_min=feature_selector_direction_min,
+                speed_penalty_max=feature_selector_speed_penalty_max,
+                speed_ratio_min=feature_selector_speed_ratio_min,
+                speed_ratio_max=feature_selector_speed_ratio_max,
+                fallback_topk=feature_selector_fallback_topk,
+                fallback_speed_penalty_coef=feature_selector_fallback_speed_penalty_coef,
+                device=device,
+            )
+            alpha_tensor = alpha_tensor * feature_gates.to(dtype=alpha_tensor.dtype)
+        elif feature_selector_mode == "component_weight":
+            feature_weights, feature_selector_diag = feature_consistency_weights(
+                reward_components,
+                direction_center=feature_weight_direction_center,
+                direction_temperature=feature_weight_direction_temperature,
+                speed_penalty_coef=feature_weight_speed_penalty_coef,
+                min_weight=feature_weight_min,
+                max_weight=feature_weight_max,
+                normalize_mean=feature_weight_normalize_mean,
+                device=device,
+            )
+            alpha_tensor = alpha_tensor * feature_weights.to(dtype=alpha_tensor.dtype)
+        elif feature_selector_mode == "score_weight":
+            feature_weights, feature_selector_diag = score_consistency_weights(
+                rewards,
+                score_center=feature_score_center,
+                score_temperature=feature_score_temperature,
+                min_weight=feature_score_min,
+                max_weight=feature_score_max,
+                normalize_mean=feature_score_normalize_mean,
+                device=device,
+            )
+            alpha_tensor = alpha_tensor * feature_weights.to(dtype=alpha_tensor.dtype)
 
         # ---- TRAINING phase ----
         generator.model.set_adapter("default")
@@ -698,6 +815,7 @@ def main():
             "mpem/reference_coef_mean",
             "mpem/reference_coef_abs_mean",
             "mpem/reference_mix",
+            "mpem/reference_orthogonal_loss",
             "mpem/projected_shift_norm",
         )
         sum_optional_diag = {key: 0.0 for key in optional_diag_keys}
@@ -756,6 +874,7 @@ def main():
                 reference_motion_positive=reference_motion_positive,
                 reference_motion_mix=reference_motion_mix,
                 reference_motion_temporal_center=reference_motion_temporal_center,
+                lambda_reference_orthogonal=lambda_reference_orthogonal,
                 anchor_idx=t_idx,
             )
             if beta_kl > 0.0:
@@ -831,11 +950,41 @@ def main():
                 f"em_kl={em_diag['em/kl']:.3f}  "
                 f"ess={em_diag['em/ess']:.1f}  "
                 f"alpha={avg_alpha:.3f}/{avg_alpha_eff:.3f}  "
-                f"shift={avg_raw_shift:.3f}->{avg_motion_shift:.3f}  "
+                + (
+                    f"sel={feature_selector_diag.get('feature_selector/accepted', 0.0):.0f}/{K} "
+                    f"sel_dir={feature_selector_diag.get('feature_selector/direction_mean', 0.0):.3f} "
+                    f"sel_sp={feature_selector_diag.get('feature_selector/speed_penalty_mean', 0.0):.3f}  "
+                    if feature_selector_mode == "component_gate"
+                    else ""
+                )
+                + (
+                    f"w={feature_selector_diag.get('feature_selector/weight_mean', 0.0):.3f} "
+                    f"w_rng={feature_selector_diag.get('feature_selector/weight_min', 0.0):.3f}/"
+                    f"{feature_selector_diag.get('feature_selector/weight_max', 0.0):.3f} "
+                    f"w_dir={feature_selector_diag.get('feature_selector/direction_mean', 0.0):.3f} "
+                    f"w_sp={feature_selector_diag.get('feature_selector/speed_penalty_mean', 0.0):.3f}  "
+                    if feature_selector_mode == "component_weight"
+                    else ""
+                )
+                + (
+                    f"w={feature_selector_diag.get('feature_selector/weight_mean', 0.0):.3f} "
+                    f"w_rng={feature_selector_diag.get('feature_selector/weight_min', 0.0):.3f}/"
+                    f"{feature_selector_diag.get('feature_selector/weight_max', 0.0):.3f} "
+                    f"w_score={feature_selector_diag.get('feature_selector/score_mean', 0.0):.3f}  "
+                    if feature_selector_mode == "score_weight"
+                    else ""
+                )
+                + f"shift={avg_raw_shift:.3f}->{avg_motion_shift:.3f}  "
                 + ref_diag
                 + (
                     f"ref_resid={avg_optional_diag['mpem/reference_projection_residual_norm']:.3f}  "
                     if "mpem/reference_projection_residual_norm" in avg_optional_diag
+                    else ""
+                )
+                + (
+                    f"ref_orth={avg_optional_diag['mpem/reference_orthogonal_loss']:.4f}  "
+                    if "mpem/reference_orthogonal_loss" in avg_optional_diag
+                    and lambda_reference_orthogonal > 0.0
                     else ""
                 )
                 + f"v_def={avg_v_default:.3f}  v_anc={avg_v_anchor:.3f}  "
@@ -864,6 +1013,7 @@ def main():
                 **{f"reward/{k.split('/')[-1]}": v for k, v in em_diag.items() if k.startswith("reward/")},
                 **{f"reward/{k.split('/')[-1]}": v for k, v in reward_component_diag.items()},
             }
+            log_dict.update(feature_selector_diag)
             if beta_kl > 0.0:
                 log_dict["outer/kl"] = avg_kl
             log_dict.update(avg_optional_diag)

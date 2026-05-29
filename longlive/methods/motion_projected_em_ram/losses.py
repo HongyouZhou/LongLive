@@ -6,7 +6,8 @@ subspace:
 
   E-step:  q_i proportional to exp(A_i / eta), with KL(q || uniform) controlled.
   M-step:  alpha_i gates only a configured motion projection of RAM's
-           residual; all other velocity components stay anchored to v_ref.
+           residual; all other velocity components stay anchored to the
+           frozen LongLive base.
 
 This writes the intended invariance into the optimization problem: reward can
 increase motion-consistent residuals, but static/appearance/color directions do
@@ -139,6 +140,173 @@ def em_tilt_weights(
         "em/alpha_mean": float(alpha.mean()),
     }
     return alpha.float(), diag
+
+
+def feature_consistency_gates(
+    components: list[dict[str, float]],
+    *,
+    direction_min: float = 0.0,
+    speed_penalty_max: float | None = None,
+    speed_ratio_min: float | None = None,
+    speed_ratio_max: float | None = None,
+    fallback_topk: int = 0,
+    fallback_speed_penalty_coef: float = 0.25,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Return per-rollout gates for feature-consistent motion selection.
+
+    This is deliberately a selector, not a new loss.  EM still ranks endpoints
+    by reward, but an endpoint can update the model only when its CoTracker
+    direction is compatible with the reference and its speed is not far outside
+    the configured band.  Pixel/appearance information is not inspected.
+    """
+    if not components:
+        raise ValueError("feature_consistency_gates requires at least one component dict")
+
+    direction = torch.tensor(
+        [float(c.get("direction", 0.0)) for c in components],
+        dtype=torch.float32,
+        device=device,
+    )
+    speed_penalty = torch.tensor(
+        [float(c.get("speed_penalty", 0.0)) for c in components],
+        dtype=torch.float32,
+        device=device,
+    )
+    speed_ratio = torch.tensor(
+        [float(c.get("speed_ratio", 0.0)) for c in components],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    gate = direction >= float(direction_min)
+    if speed_penalty_max is not None:
+        gate = gate & (speed_penalty <= float(speed_penalty_max))
+    if speed_ratio_min is not None:
+        gate = gate & (speed_ratio >= float(speed_ratio_min))
+    if speed_ratio_max is not None:
+        gate = gate & (speed_ratio <= float(speed_ratio_max))
+
+    accepted_before_fallback = int(gate.sum().item())
+    fallback_used = 0
+    topk = int(fallback_topk)
+    if accepted_before_fallback == 0 and topk > 0:
+        k = min(topk, direction.numel())
+        selector_score = direction - float(fallback_speed_penalty_coef) * speed_penalty
+        top_idx = torch.topk(selector_score, k=k).indices
+        gate[top_idx] = True
+        fallback_used = 1
+
+    gate_f = gate.float()
+    diag = {
+        "feature_selector/accepted": float(gate_f.sum().item()),
+        "feature_selector/accept_rate": float(gate_f.mean().item()),
+        "feature_selector/fallback_used": float(fallback_used),
+        "feature_selector/direction_mean": float(direction.mean().item()),
+        "feature_selector/direction_min": float(direction.min().item()),
+        "feature_selector/direction_max": float(direction.max().item()),
+        "feature_selector/speed_penalty_mean": float(speed_penalty.mean().item()),
+        "feature_selector/speed_ratio_mean": float(speed_ratio.mean().item()),
+    }
+    return gate_f, diag
+
+
+def feature_consistency_weights(
+    components: list[dict[str, float]],
+    *,
+    direction_center: float = 0.0,
+    direction_temperature: float = 0.25,
+    speed_penalty_coef: float = 0.25,
+    min_weight: float = 0.25,
+    max_weight: float = 1.5,
+    normalize_mean: bool = True,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Return soft per-rollout weights from CoTracker motion components.
+
+    Unlike the hard selector, this keeps every endpoint trainable and only
+    redistributes EM's update mass toward feature-consistent motion.  Mean-one
+    normalization preserves the coarse MP-EM-RAM update budget, which is useful
+    when the whole rollout group is mediocre but still contains a relative best
+    endpoint.
+    """
+    if not components:
+        raise ValueError("feature_consistency_weights requires at least one component dict")
+
+    direction = torch.tensor(
+        [float(c.get("direction", 0.0)) for c in components],
+        dtype=torch.float32,
+        device=device,
+    )
+    speed_penalty = torch.tensor(
+        [float(c.get("speed_penalty", 0.0)) for c in components],
+        dtype=torch.float32,
+        device=device,
+    )
+    speed_ratio = torch.tensor(
+        [float(c.get("speed_ratio", 0.0)) for c in components],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    temp = max(float(direction_temperature), 1e-6)
+    direction_weight = torch.sigmoid((direction - float(direction_center)) / temp)
+    speed_weight = torch.exp(-float(speed_penalty_coef) * speed_penalty.clamp_min(0.0))
+    weights = direction_weight * speed_weight
+    if normalize_mean:
+        weights = weights / weights.mean().clamp_min(1e-6)
+    weights = weights.clamp(float(min_weight), float(max_weight))
+
+    diag = {
+        "feature_selector/weight_mean": float(weights.mean().item()),
+        "feature_selector/weight_min": float(weights.min().item()),
+        "feature_selector/weight_max": float(weights.max().item()),
+        "feature_selector/direction_mean": float(direction.mean().item()),
+        "feature_selector/direction_min": float(direction.min().item()),
+        "feature_selector/direction_max": float(direction.max().item()),
+        "feature_selector/speed_penalty_mean": float(speed_penalty.mean().item()),
+        "feature_selector/speed_ratio_mean": float(speed_ratio.mean().item()),
+    }
+    return weights, diag
+
+
+def score_consistency_weights(
+    rewards: list[float] | torch.Tensor,
+    *,
+    score_center: float = 0.0,
+    score_temperature: float = 0.25,
+    min_weight: float = 0.0,
+    max_weight: float = 1.0,
+    normalize_mean: bool = False,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Return soft feasibility weights from absolute rollout reward.
+
+    EM's KL tilt is relative within the sampled group, so a rollout can receive
+    positive update mass even when every endpoint is poor in absolute motion
+    reward.  This weight is an absolute acceptor: endpoints below the motion
+    reward floor still participate in ranking, but their M-step update mass is
+    reduced instead of being preserved by mean normalization.
+    """
+    rewards_t = _as_float_tensor(rewards, device=device).view(-1)
+    if rewards_t.numel() == 0:
+        raise ValueError("score_consistency_weights requires at least one reward")
+
+    temp = max(float(score_temperature), 1e-6)
+    weights = torch.sigmoid((rewards_t - float(score_center)) / temp)
+    if normalize_mean:
+        weights = weights / weights.mean().clamp_min(1e-6)
+    weights = weights.clamp(float(min_weight), float(max_weight))
+
+    diag = {
+        "feature_selector/weight_mean": float(weights.mean().item()),
+        "feature_selector/weight_min": float(weights.min().item()),
+        "feature_selector/weight_max": float(weights.max().item()),
+        "feature_selector/score_mean": float(rewards_t.mean().item()),
+        "feature_selector/score_min": float(rewards_t.min().item()),
+        "feature_selector/score_max": float(rewards_t.max().item()),
+    }
+    return weights, diag
 
 
 def motion_project(
@@ -329,6 +497,7 @@ def motion_projected_em_ram_loss(
     reference_motion_positive: bool = False,
     reference_motion_mix: float = 1.0,
     reference_motion_temporal_center: bool = False,
+    lambda_reference_orthogonal: float = 0.0,
     anchor_idx: int = -1,
 ) -> tuple[torch.Tensor, dict]:
     """EM-gated RAM residual, projected onto the configured motion subspace.
@@ -336,7 +505,7 @@ def motion_projected_em_ram_loss(
     Target construction:
         raw_shift    = (eps - x0) - stopgrad(v_theta)
         motion_shift = P_subspace(raw_shift)
-        target       = v_ref + reward_coef * alpha * motion_shift
+        target       = v_anchor + reward_coef * alpha * motion_shift
 
     `alpha=0` makes the step a pure anchor update.  Positive alpha applies the
     RAM residual only in the projected motion subspace selected by the E-step.
@@ -348,15 +517,18 @@ def motion_projected_em_ram_loss(
     raw_shift = (noise - x0_ref) - v_default.detach()
     subspace = str(subspace_mode)
     projector_diag: dict[str, torch.Tensor] = {}
+    uses_reference_subspace = subspace in ("reference_motion", "hybrid_reference_motion")
     if subspace == "coarse_motion":
         motion_shift = motion_project(
             raw_shift,
             spatial_pool=motion_pool,
             temporal_center=motion_temporal_center,
         )
-    elif subspace == "reference_motion":
+    elif uses_reference_subspace:
         if x0_reference is None:
-            raise ValueError("subspace_mode='reference_motion' requires x0_reference")
+            raise ValueError(
+                f"subspace_mode={subspace!r} requires x0_reference"
+            )
         motion_shift, projector_diag = reference_motion_project(
             raw_shift,
             x0_reference,
@@ -376,13 +548,39 @@ def motion_projected_em_ram_loss(
     static_anchor = v_anchor_d.mean(dim=1, keepdim=True)
     static_loss = F.mse_loss(static_default, static_anchor)
 
-    loss = float(lambda_motion) * motion_loss + float(lambda_static) * static_loss
+    reference_orthogonal_loss = torch.zeros((), device=v_default.device, dtype=v_default.dtype)
+    if uses_reference_subspace and float(lambda_reference_orthogonal) > 0.0:
+        assert x0_reference is not None
+        delta_v = v_default - v_anchor_d
+        coarse_delta = motion_project(
+            delta_v,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+        )
+        ref_delta, _ref_delta_diag = reference_motion_project(
+            delta_v,
+            x0_reference,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+            reference_temporal_center=reference_motion_temporal_center,
+            projection_scope=reference_motion_scope,
+            positive_only=False,
+            mix=1.0,
+        )
+        reference_orthogonal_loss = (coarse_delta - ref_delta).float().square().mean()
+
+    loss = (
+        float(lambda_motion) * motion_loss
+        + float(lambda_static) * static_loss
+        + float(lambda_reference_orthogonal) * reference_orthogonal_loss
+    )
 
     with torch.no_grad():
         diag = {
             "loss/mpem": loss.detach(),
             "mpem/motion_loss": motion_loss.detach(),
             "mpem/static_loss": static_loss.detach(),
+            "mpem/reference_orthogonal_loss": reference_orthogonal_loss.detach(),
             "mpem/raw_shift_norm": raw_shift.float().flatten(1).norm(dim=1).mean(),
             "mpem/motion_shift_norm": motion_shift.float().flatten(1).norm(dim=1).mean(),
             "mpem/target_norm": target.float().flatten(1).norm(dim=1).mean(),
@@ -391,7 +589,8 @@ def motion_projected_em_ram_loss(
             "mpem/alpha": alpha_b.float().mean(),
             "mpem/alpha_eff": alpha_eff.float().mean(),
             "mpem/anchor_idx": torch.tensor(float(anchor_idx)),
-            "mpem/subspace_reference": torch.tensor(float(subspace == "reference_motion")),
+            "mpem/subspace_reference": torch.tensor(float(uses_reference_subspace)),
+            "mpem/subspace_hybrid": torch.tensor(float(subspace == "hybrid_reference_motion")),
         }
         diag.update(projector_diag)
     return loss, diag

@@ -109,7 +109,7 @@ python -m pytest tests/
 bash scripts/local/sync_hpc_code.sh          # dry-run code sync to HPC
 bash scripts/local/sync_hpc_code.sh --apply  # apply code sync to HPC
 bash scripts/hpc/fetch_data.sh
-LL_ON_POLICY_CONTEXT_DISTILLATION_SMOKE=1 source scripts/hpc/submit.sh sbatch_on_policy_context_distillation_train.sh
+LL_MPEM_SMOKE=1 source scripts/hpc/submit.sh sbatch_motion_projected_em_ram_train.sh
 ```
 
 For multi-config or multi-dataset work, use SLURM/orchestrators instead of a
@@ -188,9 +188,10 @@ Important context from the latest docs:
   showed collapse or unstable motion in this setting. The executable
   `diffusion_nft` method has been removed; `docs/04.md` / `docs/05.md` are
   historical failure records only.
-- The active new direction is `longlive/methods/on_policy_context_distillation`:
-  current-student on-policy rollouts plus frozen context-teacher velocity
-  matching on visited states.
+- The active new direction is per-reference MP-EM-RAM and EM-weighted
+  on-policy forward-KL around the fixed LongLive few-step teacher. The
+  executable `on_policy_context_distillation` path was removed because it
+  incorrectly depended on a separate context-teacher LoRA.
 - DRaFT-style reward-gradient backprop is memory-prohibitive for 21-frame
   causal video DMD with KV caches.
 - RAM-v1 is the current working fast-adaptation baseline: rank-32 LoRA on top

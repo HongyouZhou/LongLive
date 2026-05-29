@@ -1,4 +1,7 @@
-"""MotionDirector LoRA finetune on the few-step LongLive model.
+"""Legacy MotionDirector-style LoRA finetune on the few-step LongLive model.
+
+This is a direct reference-video finetune baseline, not a teacher-LoRA
+construction and not the active few-step-to-few-step distillation framework.
 
 Entry-point: ``longlive.methods.motiondirector.train`` (standalone trainer).
 Loss: L_temporal_MSE + L_AD (alpha=sqrt(2), beta=1) in epsilon space via

@@ -61,7 +61,7 @@ reward_coef: 1.0             # multiplier on group-normed reward in target shift
                              # we start at 1.0 since motion_fidelity is continuous in [-1, 1].
 rollout_adapter: default     # "default" (on-policy, RAM Alg 1); "anchor" available as ablation
                              # (off-policy: rollouts from frozen base, more conservative).
-beta_kl: 0.0                 # OFF by default; RAM target already anchors via v_ref.
+beta_kl: 0.0                 # OFF by default; RAM target already anchors via frozen LongLive base.
                              # > 0 adds F.mse_loss(v_default, v_anchor.detach()) on top of ram_loss.
 
 # ---- Reward (motion_fidelity, identical to NFT) ----

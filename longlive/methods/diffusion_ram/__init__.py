@@ -18,9 +18,9 @@ variant.  Its derivation chain (paper §3–4):
 
 What we lift verbatim from the paper:
   * Single MSE policy loss with the target-shift form (Eq. 17).
-  * Frozen reference velocity `v_ref` as the anchor (no EMA self-mirror).
+  * Frozen LongLive base velocity `v_anchor` as the anchor (no EMA self-mirror).
   * Reward enters as a multiplicative coefficient on the target shift,
-    so r→0 collapses the target back to v_ref (strict base anchor).
+    so r→0 collapses the target back to v_anchor (strict base anchor).
   * Analytical Gaussian noising `X_t = (1−σ)·X_0 + σ·ε` identical to the
     pretraining law — no SDE rollout in the loss path.
 
@@ -32,7 +32,7 @@ What we adapt to our 4-step DMD video setting (not validated by the paper):
     continuous in [-1, 1] — paper uses [0, 1] partial-credit binary rewards.
   * Cross-rank `dist.all_gather` group_normalize over K×world_size rewards
     (carried over from the NFT-H1 fix, see docs/04.md addendum).
-  * Frozen `v_ref` is implemented as a zero-init PEFT adapter ("anchor"),
+  * Frozen `v_anchor` is implemented as a zero-init PEFT adapter ("anchor"),
     not a separate copy of the base — sidesteps the FSDP × PEFT ×
     gradient_checkpointing `disable_adapter()` incompatibility.
 

@@ -15,7 +15,7 @@ mirror-descent step:
 The important design choice is that reward decides which endpoints receive a
 RAM correction; reward does not control full velocity space:
 
-    target = v_ref + alpha_i * P_motion((eps - x0_i) - stopgrad(v_theta))
+    target = v_anchor + alpha_i * P_motion((eps - x0_i) - stopgrad(v_theta))
 
 Low/average reward endpoints get alpha_i near 0 and therefore act as anchor
 updates.  Static, appearance, and texture-scale velocity components stay

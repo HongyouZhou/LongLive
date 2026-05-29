@@ -313,10 +313,10 @@ def main():
         del baseline_state
 
     # ---------- Attach 2 PEFT adapters (BEFORE FSDP wrap) ----------
-    # RAM only needs 2: "default" (trainable) + "anchor" (zero-init, frozen, = v_ref).
+    # RAM only needs 2: "default" (trainable) + "anchor" (zero-init, frozen LongLive base).
     # No "old" EMA adapter (NFT-specific).
     if rank0:
-        print("[motion_equivariant_ram] attaching adapters: default + anchor (v_ref)", flush=True)
+        print("[motion_equivariant_ram] attaching adapters: default + anchor (frozen LongLive base)", flush=True)
     generator.model = configure_adapter_for_model(
         generator.model,
         model_name="generator",

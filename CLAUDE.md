@@ -2,11 +2,12 @@
 
 LongLive — video diffusion motion finetune research framework. Built on Wan2.1 (1.3B / 14B) with DMD distillation. Core code lives under a single `longlive/` umbrella (`longlive/{model,pipeline,trainer,utils}`); `longlive/methods/<idea>/` hosts independent finetune method implementations (OFT, Schrödinger Bridge, etc.) sharing the core Wan loader + DMD pipeline. `wan/` stays at root as vendored upstream.
 
-Current fast-adaptation direction: `longlive/methods/on_policy_context_distillation/`
-implements current-student on-policy rollouts plus frozen context-teacher
-velocity matching on visited states. The old executable `diffusion_nft` method
-was removed on 2026-05-26; `docs/04.md` / `docs/05.md` are historical failure
-records, not active method entry points.
+Current fast-adaptation direction: per-reference MP-EM-RAM and EM-weighted
+on-policy forward-KL around the fixed LongLive few-step teacher; see
+`docs/07_per_reference_adaptation_protocol.md`. The old executable `diffusion_nft` method
+was removed on 2026-05-26, and the erroneous executable
+`on_policy_context_distillation` method was removed on 2026-05-29 because it
+depended on a separate context-teacher LoRA, which is not the intended framework.
 
 ## Workflow
 
@@ -177,7 +178,7 @@ python -m pytest tests/                                                         
 bash scripts/local/sync_hpc_code.sh                                                     # dry-run code sync to HPC
 bash scripts/local/sync_hpc_code.sh --apply                                             # apply code sync to HPC
 bash scripts/hpc/fetch_data.sh                                                          # cross-machine data sync
-LL_ON_POLICY_CONTEXT_DISTILLATION_SMOKE=1 source scripts/hpc/submit.sh sbatch_on_policy_context_distillation_train.sh
+LL_MPEM_SMOKE=1 source scripts/hpc/submit.sh sbatch_motion_projected_em_ram_train.sh
 ```
 
 **Always use parallel orchestrators / SLURM array for multi-config or multi-dataset work.** Do NOT loop single-GPU jobs in bash.

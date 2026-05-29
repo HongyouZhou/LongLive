@@ -355,12 +355,9 @@ class Trainer:
                 if self.is_main_process:
                     print("No LoRA checkpoint to load, starting from scratch")
 
-        # Extension hook for trainer subclasses (L5 seam, see docs/01.md and
-        # CLAUDE.md "L5 trainer phase: subclass ScoreDistillationTrainer; LoRA
-        # attach point ≈ line 350"). Default = no-op; subclasses can attach
-        # additional adapters / LoRAs to self.model.real_score before it gets
-        # FSDP-wrapped just below. Used by
-        # longlive/methods/motiondirector/trainer.py for Phase 3 teacher LoRA.
+        # Extension hook for trainer subclasses. Default = no-op; subclasses can
+        # attach additional adapters to self.model.real_score before it is
+        # FSDP-wrapped below.
         self._attach_real_score_lora()
 
         self.model.generator = fsdp_wrap(
@@ -1491,9 +1488,8 @@ class Trainer:
 
         Called from __init__ AFTER student/critic LoRA setup and BEFORE FSDP
         wrap of real_score. Default = no-op. Subclasses override to attach
-        adapters to ``self.model.real_score.model`` (e.g.
-        longlive.methods.motiondirector.trainer attaches a Phase 2 teacher
-        LoRA here). Subclasses are responsible for the full attach lifecycle
+        adapters to ``self.model.real_score.model``. Subclasses are responsible
+        for the full attach lifecycle
         (configure_adapter_for_model + fp32→bf16 cast + ckpt load + re-freeze).
         """
         pass

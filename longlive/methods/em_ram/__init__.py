@@ -14,7 +14,7 @@ EM-RAM treats each outer epoch as a small empirical EM / mirror-descent step:
 The important design choice is that reward decides which endpoints receive a
 RAM correction; the velocity target geometry remains RAM:
 
-    target = v_ref + alpha_i * ((eps - x0_i) - stopgrad(v_theta))
+    target = v_anchor + alpha_i * ((eps - x0_i) - stopgrad(v_theta))
 
 Low/average reward endpoints get alpha_i near 0 and therefore act as anchor
 updates.  This is meant to preserve RAM-v1's non-collapse behavior while using

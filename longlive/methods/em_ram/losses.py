@@ -9,7 +9,8 @@ EM / mirror-descent step:
 
 This avoids the RT-fDMD failure mode where reward directly pulled the velocity
 toward a self-generated flow target.  Here reward selects which endpoints
-deserve a RAM correction; low/average endpoints only anchor back to v_ref.
+deserve a RAM correction; low/average endpoints only anchor back to the frozen
+LongLive base.
 """
 from __future__ import annotations
 
@@ -153,7 +154,7 @@ def em_ram_loss(
 
     Target construction:
         shift  = (eps - x0) - stopgrad(v_theta)
-        target = v_ref + reward_coef * alpha * shift
+        target = v_anchor + reward_coef * alpha * shift
 
     `alpha=0` makes the step a pure anchor update; positive alpha applies the
     RAM residual only to endpoints selected by the E-step.

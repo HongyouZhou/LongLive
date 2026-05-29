@@ -1,8 +1,8 @@
 """RAM (Reinforce Adjoint Matching) loss — paper Eq. 17, v-space.
 
-Single MSE between v_θ(X_t) and a stop-grad target that pulls toward v_ref
-when reward is low and toward the rectified-flow target (ε − X_0) when
-reward is high.
+Single MSE between v_θ(X_t) and a stop-grad target that pulls toward the
+frozen LongLive base anchor when reward is low and toward the rectified-flow
+target (ε − X_0) when reward is high.
 
 Conventions (Wan / our `WanDiffusionWrapper`):
   * The generator outputs (flow_pred, pred_x0) = (v_θ, x_t − σ_t · v_θ).
@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 def ram_loss(
     v_default: torch.Tensor,     # (B, F, C, H, W) bf16, grad ON  — v_θ(X_t)
-    v_anchor: torch.Tensor,      # (B, F, C, H, W) bf16, no_grad   — v_ref(X_t)
+    v_anchor: torch.Tensor,      # (B, F, C, H, W) bf16, no_grad   — base anchor output
     noise: torch.Tensor,         # (B, F, C, H, W) bf16            — ε used to build X_t
     x0_ref: torch.Tensor,        # (B, F, C, H, W) bf16            — rollout endpoint x_0
     r: torch.Tensor,             # (1,) float32                    — group-normed reward ∈ [0, 1]
@@ -30,18 +30,19 @@ def ram_loss(
 
     Target construction (all stop-grad):
         shift  = (ε − x_0) − v_θ
-        target = v_ref + reward_coef · r · shift
+        target = v_anchor + reward_coef · r · shift
         loss   = ‖v_θ − sg(target)‖²
 
-    When r → 0, target collapses to v_ref → loss pulls v_θ back to no-LoRA base.
-    When r → 1, target equals v_ref + coef · (ε − x_0 − v_θ); gradient direction
-    is set by (ε − x_0) − v_θ, which is the rectified-flow pretraining residual.
+    When r → 0, target collapses to v_anchor → loss pulls v_θ back to the
+    frozen LongLive base. When r → 1, target equals
+    v_anchor + coef · (ε − x_0 − v_θ); gradient direction is set by
+    (ε − x_0) − v_θ, which is the rectified-flow pretraining residual.
 
     Args:
         v_default: trainable network output at (X_t, t).
-        v_anchor: frozen reference output at the same (X_t, t).  Caller must
-            have produced this under `no_grad` with the LoRA disabled (via the
-            zero-init "anchor" adapter in our setup).
+        v_anchor: frozen LongLive base output at the same (X_t, t).  Caller
+            must have produced this under `no_grad` with the trainable LoRA
+            disabled (via the zero-init "anchor" adapter in our setup).
         noise: the ε tensor that was used to construct X_t.  RAM uses the raw
             ε − x_0, NOT the rescaled (X_t − x_0)/σ_t form.
         x0_ref: the clean endpoint latent x_0 (from rollout).
@@ -82,9 +83,9 @@ def kl_anchor_loss(
     v_default: torch.Tensor,
     v_anchor: torch.Tensor,
 ) -> torch.Tensor:
-    """Optional anti-drift MSE between v_θ and the frozen v_ref.
+    """Optional anti-drift MSE between v_θ and the frozen LongLive anchor.
 
-    RAM's target form already anchors v_θ toward v_ref when r is low — this
+    RAM's target form already anchors v_θ toward v_anchor when r is low — this
     function is exposed for runs that want an *explicit* β_KL penalty on top
     (gated by `beta_kl > 0` in the yaml; off by default).
     """
