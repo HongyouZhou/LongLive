@@ -1,0 +1,57 @@
+# Two-video train-efficiency diagnostic for per-reference adaptation.
+#
+# Goal:
+#   Test whether motion-projected EM-RAM can keep single-reference distillation
+#   near a 10 minute train budget while avoiding raw EM-RAM's dynamic collapse.
+#
+# Comparison anchors are already available from per_reference_em_ram_subset:
+#   BASE + raw EM-RAM final/lora_5 for the same units.
+
+experiment_name: per_reference_mp_em_ram_2video_10min
+data_root: ${oc.env:LL_DATA}
+output_root: ${oc.env:LL_DATA}/per_reference_adaptation_runs
+
+protocol:
+  name: per_reference_adaptation
+  seed: 0
+  datasets:
+    ucf:
+      enabled: true
+      categories:
+        - Golf-Swing
+      max_categories: null
+      refs_per_category: 1
+      prompts_per_unit: all
+    loveu:
+      enabled: true
+      max_units: null
+      unit_ids:
+        - miami-surf
+      prompts_per_unit: all
+      prompt_types:
+        - Style Change Caption
+        - Object Change Caption
+        - Background Change Caption
+        - Multiple Changes Caption
+
+runtime:
+  nproc_per_node: 8
+  eval_gpus: "0,1,2,3,4,5,6,7"
+  master_port: 29600
+  disable_wandb: false
+  skip_completed_train: true
+
+methods:
+  - name: mp_em_ram
+    overrides:
+      outer_epochs: 4
+      inner_steps: 8
+      k_rollouts: 4
+      g_endpoints_per_outer: 4
+      k_noisings_per_endpoint: 2
+      em_target_kl: 0.02
+      reward_coef: 0.25
+      em_alpha_max: 0.25
+      beta_kl: 0.1
+      ckpt_interval: 2
+      ckpt_keep_last: 3
