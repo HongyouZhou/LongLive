@@ -7,12 +7,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from longlive.methods.motion_projected_em_ram.losses import (
+    em_tilt_alpha_and_weights,
+    em_tilt_weights,
     feature_consistency_gates,
     feature_consistency_weights,
     motion_project,
     motion_projected_em_ram_loss,
     reference_motion_basis,
     reference_motion_project,
+    reward_weighted_velocity_loss,
     score_consistency_weights,
 )
 
@@ -152,6 +155,29 @@ def test_score_consistency_weights_downweight_bad_absolute_rewards() -> None:
     assert diag["feature_selector/score_mean"] == 0.0
 
 
+def test_em_tilt_exposes_importance_weights_without_changing_alpha() -> None:
+    rewards = torch.tensor([-1.0, 0.0, 2.0])
+
+    alpha, importance, diag = em_tilt_alpha_and_weights(
+        rewards,
+        target_kl=0.05,
+        weight_clip=4.0,
+        alpha_max=1.0,
+    )
+    alpha_compat, diag_compat = em_tilt_weights(
+        rewards,
+        target_kl=0.05,
+        weight_clip=4.0,
+        alpha_max=1.0,
+    )
+
+    assert torch.allclose(alpha, alpha_compat)
+    assert importance.shape == rewards.shape
+    assert importance[-1] > importance[0]
+    assert diag["em/importance_weight_mean"] > 0.0
+    assert diag_compat["em/alpha_mean"] == diag["em/alpha_mean"]
+
+
 def test_hybrid_reference_motion_mix_keeps_coarse_component() -> None:
     torch.manual_seed(2)
     reference = torch.randn(1, 5, 3, 4, 4)
@@ -230,6 +256,70 @@ def test_coarse_motion_loss_keeps_anchor_detached() -> None:
     assert "mpem/motion_shift_norm" in diag
 
 
+def test_reward_weighted_velocity_loss_weights_loss_not_target_shift() -> None:
+    student = torch.zeros(1, 4, 2, 3, 3, requires_grad=True)
+    anchor = torch.zeros_like(student, requires_grad=True)
+    noise = torch.ones_like(student)
+    x0 = torch.zeros_like(student)
+
+    loss_low, diag_low = reward_weighted_velocity_loss(
+        v_default=student,
+        v_anchor=anchor,
+        noise=noise,
+        x0_ref=x0,
+        loss_weight=torch.tensor([0.25]),
+        shift_coef=0.5,
+        anchor_beta=0.0,
+        lambda_static=0.0,
+        subspace_mode="coarse_motion",
+        motion_pool=1,
+        motion_temporal_center=False,
+    )
+    loss_high, diag_high = reward_weighted_velocity_loss(
+        v_default=student,
+        v_anchor=anchor,
+        noise=noise,
+        x0_ref=x0,
+        loss_weight=torch.tensor([2.0]),
+        shift_coef=0.5,
+        anchor_beta=0.0,
+        lambda_static=0.0,
+        subspace_mode="coarse_motion",
+        motion_pool=1,
+        motion_temporal_center=False,
+    )
+
+    assert torch.allclose(diag_low["mpem/target_norm"], diag_high["mpem/target_norm"])
+    assert loss_high > loss_low
+    assert diag_high["mpem/loss_weight"] > diag_low["mpem/loss_weight"]
+
+
+def test_reward_weighted_velocity_loss_keeps_anchor_when_weight_zero() -> None:
+    student = torch.zeros(1, 4, 2, 3, 3, requires_grad=True)
+    anchor = torch.ones_like(student, requires_grad=True)
+    noise = torch.zeros_like(student)
+    x0 = torch.zeros_like(student)
+
+    loss, diag = reward_weighted_velocity_loss(
+        v_default=student,
+        v_anchor=anchor,
+        noise=noise,
+        x0_ref=x0,
+        loss_weight=torch.tensor([0.0]),
+        shift_coef=0.5,
+        anchor_beta=0.1,
+        lambda_static=0.0,
+        subspace_mode="coarse_motion",
+    )
+    loss.backward()
+
+    assert float(loss) > 0.0
+    assert student.grad is not None
+    assert anchor.grad is None
+    assert diag["mpem/loss_weight"] == 0.0
+    assert diag["mpem/anchor_loss"] > 0.0
+
+
 def main() -> None:
     test_reference_motion_project_recovers_basis_direction()
     test_reference_motion_positive_clamps_opposite_direction()
@@ -238,9 +328,12 @@ def main() -> None:
     test_feature_consistency_gates_optional_fallback_topk()
     test_feature_consistency_weights_are_soft_and_mean_preserving()
     test_score_consistency_weights_downweight_bad_absolute_rewards()
+    test_em_tilt_exposes_importance_weights_without_changing_alpha()
     test_hybrid_reference_motion_mix_keeps_coarse_component()
     test_hybrid_reference_motion_loss_reports_orthogonal_penalty()
     test_coarse_motion_loss_keeps_anchor_detached()
+    test_reward_weighted_velocity_loss_weights_loss_not_target_shift()
+    test_reward_weighted_velocity_loss_keeps_anchor_when_weight_zero()
 
 
 if __name__ == "__main__":

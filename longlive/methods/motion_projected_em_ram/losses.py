@@ -42,7 +42,7 @@ def _softmax_weights(advantages: torch.Tensor, beta: float) -> tuple[torch.Tenso
     return q, w, kl
 
 
-def em_tilt_weights(
+def em_tilt_alpha_and_weights(
     rewards: list[float] | torch.Tensor,
     *,
     target_kl: float = 0.10,
@@ -53,8 +53,8 @@ def em_tilt_weights(
     alpha_max: float = 1.0,
     std_floor: float = 1e-4,
     device: torch.device | None = None,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Compute empirical EM weights from rollout rewards.
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Compute empirical EM alpha and importance weights from rollout rewards.
 
     Args:
         rewards: one scalar reward per rollout in the gathered cross-rank group.
@@ -69,8 +69,10 @@ def em_tilt_weights(
         device: optional output device.
 
     Returns:
-        (alpha, diagnostics), where alpha has shape (N,) and mean correction
-        mass is zero when all rewards are tied.
+        (alpha, importance_weight, diagnostics), where both tensors have shape
+        (N,).  ``alpha`` is the historical MP-EM-RAM target-shift coefficient.
+        ``importance_weight`` is the clipped EM importance weight ``N*q`` for
+        reward-weighted M-step objectives.
     """
     rewards_t = _as_float_tensor(rewards, device=device).view(-1)
     if rewards_t.numel() == 0:
@@ -120,6 +122,7 @@ def em_tilt_weights(
     else:
         raise ValueError(f"unknown alpha_mode: {alpha_mode!r}")
     alpha = alpha.clamp(0.0, float(alpha_max))
+    importance_weight = w_clipped.float()
 
     ess = 1.0 / (q.square().sum().clamp_min(1e-12))
     entropy = -(q * torch.log(q.clamp_min(1e-12))).sum()
@@ -138,8 +141,38 @@ def em_tilt_weights(
         "em/alpha_min": float(alpha.min()),
         "em/alpha_max": float(alpha.max()),
         "em/alpha_mean": float(alpha.mean()),
+        "em/importance_weight_min": float(importance_weight.min()),
+        "em/importance_weight_max": float(importance_weight.max()),
+        "em/importance_weight_mean": float(importance_weight.mean()),
     }
-    return alpha.float(), diag
+    return alpha.float(), importance_weight, diag
+
+
+def em_tilt_weights(
+    rewards: list[float] | torch.Tensor,
+    *,
+    target_kl: float = 0.10,
+    eta: float | None = None,
+    adv_clip_max: float = 5.0,
+    weight_clip: float = 4.0,
+    alpha_mode: str = "positive_excess",
+    alpha_max: float = 1.0,
+    std_floor: float = 1e-4,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Backward-compatible wrapper returning only historical EM alpha."""
+    alpha, _importance_weight, diag = em_tilt_alpha_and_weights(
+        rewards,
+        target_kl=target_kl,
+        eta=eta,
+        adv_clip_max=adv_clip_max,
+        weight_clip=weight_clip,
+        alpha_mode=alpha_mode,
+        alpha_max=alpha_max,
+        std_floor=std_floor,
+        device=device,
+    )
+    return alpha, diag
 
 
 def feature_consistency_gates(
@@ -480,6 +513,47 @@ def reference_motion_project(
     return projected.to(dtype=x.dtype), diag
 
 
+def _project_ram_shift(
+    raw_shift: torch.Tensor,
+    *,
+    x0_reference: torch.Tensor | None = None,
+    subspace_mode: str = "coarse_motion",
+    motion_pool: int = 2,
+    motion_temporal_center: bool = True,
+    reference_motion_scope: str = "frame",
+    reference_motion_positive: bool = False,
+    reference_motion_mix: float = 1.0,
+    reference_motion_temporal_center: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], bool]:
+    subspace = str(subspace_mode)
+    projector_diag: dict[str, torch.Tensor] = {}
+    uses_reference_subspace = subspace in ("reference_motion", "hybrid_reference_motion")
+    if subspace == "coarse_motion":
+        motion_shift = motion_project(
+            raw_shift,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+        )
+    elif uses_reference_subspace:
+        if x0_reference is None:
+            raise ValueError(
+                f"subspace_mode={subspace!r} requires x0_reference"
+            )
+        motion_shift, projector_diag = reference_motion_project(
+            raw_shift,
+            x0_reference,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+            reference_temporal_center=reference_motion_temporal_center,
+            projection_scope=reference_motion_scope,
+            positive_only=reference_motion_positive,
+            mix=reference_motion_mix,
+        )
+    else:
+        raise ValueError(f"unknown subspace_mode: {subspace_mode!r}")
+    return motion_shift, projector_diag, uses_reference_subspace
+
+
 def motion_projected_em_ram_loss(
     v_default: torch.Tensor,
     v_anchor: torch.Tensor,
@@ -515,32 +589,17 @@ def motion_projected_em_ram_loss(
     alpha_eff = float(reward_coef) * alpha_b
 
     raw_shift = (noise - x0_ref) - v_default.detach()
-    subspace = str(subspace_mode)
-    projector_diag: dict[str, torch.Tensor] = {}
-    uses_reference_subspace = subspace in ("reference_motion", "hybrid_reference_motion")
-    if subspace == "coarse_motion":
-        motion_shift = motion_project(
-            raw_shift,
-            spatial_pool=motion_pool,
-            temporal_center=motion_temporal_center,
-        )
-    elif uses_reference_subspace:
-        if x0_reference is None:
-            raise ValueError(
-                f"subspace_mode={subspace!r} requires x0_reference"
-            )
-        motion_shift, projector_diag = reference_motion_project(
-            raw_shift,
-            x0_reference,
-            spatial_pool=motion_pool,
-            temporal_center=motion_temporal_center,
-            reference_temporal_center=reference_motion_temporal_center,
-            projection_scope=reference_motion_scope,
-            positive_only=reference_motion_positive,
-            mix=reference_motion_mix,
-        )
-    else:
-        raise ValueError(f"unknown subspace_mode: {subspace_mode!r}")
+    motion_shift, projector_diag, uses_reference_subspace = _project_ram_shift(
+        raw_shift,
+        x0_reference=x0_reference,
+        subspace_mode=subspace_mode,
+        motion_pool=motion_pool,
+        motion_temporal_center=motion_temporal_center,
+        reference_motion_scope=reference_motion_scope,
+        reference_motion_positive=reference_motion_positive,
+        reference_motion_mix=reference_motion_mix,
+        reference_motion_temporal_center=reference_motion_temporal_center,
+    )
     target = v_anchor_d + alpha_eff * motion_shift
     motion_loss = F.mse_loss(v_default, target.detach())
 
@@ -590,7 +649,130 @@ def motion_projected_em_ram_loss(
             "mpem/alpha_eff": alpha_eff.float().mean(),
             "mpem/anchor_idx": torch.tensor(float(anchor_idx)),
             "mpem/subspace_reference": torch.tensor(float(uses_reference_subspace)),
-            "mpem/subspace_hybrid": torch.tensor(float(subspace == "hybrid_reference_motion")),
+            "mpem/subspace_hybrid": torch.tensor(float(str(subspace_mode) == "hybrid_reference_motion")),
+        }
+        diag.update(projector_diag)
+    return loss, diag
+
+
+def reward_weighted_velocity_loss(
+    v_default: torch.Tensor,
+    v_anchor: torch.Tensor,
+    noise: torch.Tensor,
+    x0_ref: torch.Tensor,
+    loss_weight: torch.Tensor,
+    x0_reference: torch.Tensor | None = None,
+    shift_coef: float = 0.25,
+    anchor_beta: float = 0.1,
+    lambda_motion: float = 1.0,
+    lambda_static: float = 0.05,
+    subspace_mode: str = "coarse_motion",
+    motion_pool: int = 2,
+    motion_temporal_center: bool = True,
+    reference_motion_scope: str = "frame",
+    reference_motion_positive: bool = False,
+    reference_motion_mix: float = 1.0,
+    reference_motion_temporal_center: bool = False,
+    lambda_reference_orthogonal: float = 0.0,
+    anchor_idx: int = -1,
+) -> tuple[torch.Tensor, dict]:
+    """Reward-weighted RAM residual with fixed target-shift magnitude.
+
+    This objective decouples rollout confidence from target amplitude:
+
+        target = v_anchor + shift_coef * P_motion(raw_shift)
+        loss   = w_i * ||v_default - sg(target)||^2
+               + anchor_beta * ||v_default - sg(v_anchor)||^2
+
+    The reward/EM information enters only through ``loss_weight``.  The target
+    displacement from LongLive is controlled by ``shift_coef``.
+    """
+    v_anchor_d = v_anchor.detach()
+    weight = loss_weight.to(v_default.dtype).view(-1)
+    if weight.numel() != v_default.shape[0]:
+        if weight.numel() == 1:
+            weight = weight.expand(v_default.shape[0])
+        else:
+            raise ValueError(
+                f"loss_weight batch mismatch: weights={tuple(loss_weight.shape)} "
+                f"v_default={tuple(v_default.shape)}"
+            )
+
+    raw_shift = (noise - x0_ref) - v_default.detach()
+    motion_shift, projector_diag, uses_reference_subspace = _project_ram_shift(
+        raw_shift,
+        x0_reference=x0_reference,
+        subspace_mode=subspace_mode,
+        motion_pool=motion_pool,
+        motion_temporal_center=motion_temporal_center,
+        reference_motion_scope=reference_motion_scope,
+        reference_motion_positive=reference_motion_positive,
+        reference_motion_mix=reference_motion_mix,
+        reference_motion_temporal_center=reference_motion_temporal_center,
+    )
+    target = v_anchor_d + float(shift_coef) * motion_shift
+
+    per_sample_motion = (
+        v_default.float() - target.detach().float()
+    ).square().flatten(1).mean(dim=1)
+    weighted_motion_loss = (weight.float() * per_sample_motion).mean()
+    anchor_loss = F.mse_loss(v_default, v_anchor_d)
+
+    static_default = v_default.mean(dim=1, keepdim=True)
+    static_anchor = v_anchor_d.mean(dim=1, keepdim=True)
+    static_loss = F.mse_loss(static_default, static_anchor)
+
+    reference_orthogonal_loss = torch.zeros((), device=v_default.device, dtype=v_default.dtype)
+    if uses_reference_subspace and float(lambda_reference_orthogonal) > 0.0:
+        assert x0_reference is not None
+        delta_v = v_default - v_anchor_d
+        coarse_delta = motion_project(
+            delta_v,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+        )
+        ref_delta, _ref_delta_diag = reference_motion_project(
+            delta_v,
+            x0_reference,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+            reference_temporal_center=reference_motion_temporal_center,
+            projection_scope=reference_motion_scope,
+            positive_only=False,
+            mix=1.0,
+        )
+        reference_orthogonal_loss = (coarse_delta - ref_delta).float().square().mean()
+
+    loss = (
+        float(lambda_motion) * weighted_motion_loss
+        + float(anchor_beta) * anchor_loss
+        + float(lambda_static) * static_loss
+        + float(lambda_reference_orthogonal) * reference_orthogonal_loss
+    )
+
+    with torch.no_grad():
+        diag = {
+            "loss/mpem": loss.detach(),
+            "mpem/motion_loss": weighted_motion_loss.detach(),
+            "mpem/unweighted_motion_loss": per_sample_motion.mean().detach(),
+            "mpem/anchor_loss": anchor_loss.detach(),
+            "mpem/static_loss": static_loss.detach(),
+            "mpem/reference_orthogonal_loss": reference_orthogonal_loss.detach(),
+            "mpem/raw_shift_norm": raw_shift.float().flatten(1).norm(dim=1).mean(),
+            "mpem/motion_shift_norm": motion_shift.float().flatten(1).norm(dim=1).mean(),
+            "mpem/target_norm": target.float().flatten(1).norm(dim=1).mean(),
+            "mpem/v_default_norm": v_default.float().flatten(1).norm(dim=1).mean(),
+            "mpem/v_anchor_norm": v_anchor_d.float().flatten(1).norm(dim=1).mean(),
+            "mpem/alpha": weight.float().mean(),
+            "mpem/alpha_eff": weight.float().mean(),
+            "mpem/loss_weight": weight.float().mean(),
+            "mpem/loss_weight_min": weight.float().min(),
+            "mpem/loss_weight_max": weight.float().max(),
+            "mpem/shift_coef": torch.tensor(float(shift_coef), device=v_default.device),
+            "mpem/anchor_beta": torch.tensor(float(anchor_beta), device=v_default.device),
+            "mpem/anchor_idx": torch.tensor(float(anchor_idx)),
+            "mpem/subspace_reference": torch.tensor(float(uses_reference_subspace)),
+            "mpem/subspace_hybrid": torch.tensor(float(str(subspace_mode) == "hybrid_reference_motion")),
         }
         diag.update(projector_diag)
     return loss, diag

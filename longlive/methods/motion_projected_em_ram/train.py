@@ -53,11 +53,12 @@ from torch.distributed.fsdp import (
 from torch.optim import AdamW
 
 from longlive.methods.motion_projected_em_ram.losses import (
-    em_tilt_weights,
+    em_tilt_alpha_and_weights,
     feature_consistency_gates,
     feature_consistency_weights,
     kl_anchor_loss,
     motion_projected_em_ram_loss,
+    reward_weighted_velocity_loss,
     score_consistency_weights,
 )
 from longlive.methods.motion_projected_em_ram.reward import MotionProjectedEMReward
@@ -504,6 +505,12 @@ def main():
     lambda_static = float(getattr(cfg, "lambda_static", 0.05))
     motion_pool = int(getattr(cfg, "motion_pool", 2))
     motion_temporal_center = bool(getattr(cfg, "motion_temporal_center", True))
+    mstep_objective = str(getattr(cfg, "mstep_objective", "alpha_shift"))
+    shift_coef = float(getattr(cfg, "shift_coef", 0.25))
+    loss_weight_mode = str(getattr(cfg, "loss_weight_mode", "em_weight"))
+    loss_weight_clip_min = float(getattr(cfg, "loss_weight_clip_min", 0.0))
+    loss_weight_clip_max = float(getattr(cfg, "loss_weight_clip_max", 2.0))
+    anchor_beta = float(getattr(cfg, "anchor_beta", 0.1))
     rollout_adapter = str(getattr(cfg, "rollout_adapter", "default"))
     reward_mode = str(getattr(cfg, "reward_mode", "absolute"))
     reward_relative_margin = float(getattr(cfg, "reward_relative_margin", 0.0))
@@ -571,6 +578,22 @@ def main():
         f"feature_selector_mode must be 'none', 'component_gate', "
         f"'component_weight', or 'score_weight', got {feature_selector_mode!r}"
     )
+    assert mstep_objective in ("alpha_shift", "reward_weighted_velocity"), (
+        f"mstep_objective must be 'alpha_shift' or 'reward_weighted_velocity', "
+        f"got {mstep_objective!r}"
+    )
+    assert loss_weight_mode == "em_weight", (
+        f"loss_weight_mode currently supports only 'em_weight', got {loss_weight_mode!r}"
+    )
+    assert loss_weight_clip_min <= loss_weight_clip_max, (
+        f"loss_weight_clip_min must be <= loss_weight_clip_max, got "
+        f"{loss_weight_clip_min} > {loss_weight_clip_max}"
+    )
+    if mstep_objective == "reward_weighted_velocity":
+        assert beta_kl == 0.0, (
+            "reward_weighted_velocity uses anchor_beta as its explicit "
+            "LongLive anchor; set beta_kl=0.0 to avoid mixing objectives"
+        )
     if reward_mode == "baseline_relative":
         assert rollout_adapter == "default", (
             "baseline_relative reward compares the trainable default adapter against "
@@ -582,6 +605,10 @@ def main():
             f"[motion_projected_em_ram] start: outer={outer_epochs} x inner={inner_steps} "
             f"x K={K} (g_endpoints={g_endpoints}, k_noisings={k_noisings}) | "
             f"reward_coef={reward_coef} | beta_kl={beta_kl} | "
+            f"mstep_objective={mstep_objective} | shift_coef={shift_coef} | "
+            f"loss_weight_mode={loss_weight_mode} | "
+            f"loss_weight_clip={loss_weight_clip_min}/{loss_weight_clip_max} | "
+            f"anchor_beta={anchor_beta} | "
             f"em_target_kl={em_target_kl} | em_eta={em_eta} | "
             f"em_alpha_mode={em_alpha_mode} | em_alpha_max={em_alpha_max} | "
             f"em_std_floor={em_std_floor} | lambda_motion={lambda_motion} | "
@@ -726,7 +753,7 @@ def main():
         gathered = [torch.zeros_like(rewards_t) for _ in range(world_size)]
         dist.all_gather(gathered, rewards_t)
         all_rewards = torch.cat(gathered)
-        alpha_all, em_diag = em_tilt_weights(
+        alpha_all, loss_weight_all, em_diag = em_tilt_alpha_and_weights(
             all_rewards,
             target_kl=em_target_kl,
             eta=em_eta,
@@ -738,6 +765,7 @@ def main():
             device=device,
         )
         alpha_tensor = alpha_all[rank * K : (rank + 1) * K].to(device)
+        loss_weight_tensor = loss_weight_all[rank * K : (rank + 1) * K].to(device)
         if reward_mode == "baseline_relative" and reward_relative_gate:
             accepted_t = torch.tensor(
                 [1.0 if float(r) > 0.0 else 0.0 for r in rewards],
@@ -745,6 +773,7 @@ def main():
                 dtype=alpha_tensor.dtype,
             )
             alpha_tensor = alpha_tensor * accepted_t
+            loss_weight_tensor = loss_weight_tensor * accepted_t
         feature_selector_diag = {}
         if feature_selector_mode == "component_gate":
             feature_gates, feature_selector_diag = feature_consistency_gates(
@@ -758,6 +787,7 @@ def main():
                 device=device,
             )
             alpha_tensor = alpha_tensor * feature_gates.to(dtype=alpha_tensor.dtype)
+            loss_weight_tensor = loss_weight_tensor * feature_gates.to(dtype=loss_weight_tensor.dtype)
         elif feature_selector_mode == "component_weight":
             feature_weights, feature_selector_diag = feature_consistency_weights(
                 reward_components,
@@ -770,6 +800,7 @@ def main():
                 device=device,
             )
             alpha_tensor = alpha_tensor * feature_weights.to(dtype=alpha_tensor.dtype)
+            loss_weight_tensor = loss_weight_tensor * feature_weights.to(dtype=loss_weight_tensor.dtype)
         elif feature_selector_mode == "score_weight":
             feature_weights, feature_selector_diag = score_consistency_weights(
                 rewards,
@@ -781,6 +812,15 @@ def main():
                 device=device,
             )
             alpha_tensor = alpha_tensor * feature_weights.to(dtype=alpha_tensor.dtype)
+            loss_weight_tensor = loss_weight_tensor * feature_weights.to(dtype=loss_weight_tensor.dtype)
+        loss_weight_tensor = loss_weight_tensor.clamp(
+            float(loss_weight_clip_min),
+            float(loss_weight_clip_max),
+        )
+        if mstep_objective == "reward_weighted_velocity":
+            em_diag["em/local_loss_weight_min"] = float(loss_weight_tensor.min())
+            em_diag["em/local_loss_weight_max"] = float(loss_weight_tensor.max())
+            em_diag["em/local_loss_weight_mean"] = float(loss_weight_tensor.mean())
 
         # ---- TRAINING phase ----
         generator.model.set_adapter("default")
@@ -809,6 +849,13 @@ def main():
             "mpem/reference_mix",
             "mpem/reference_orthogonal_loss",
             "mpem/projected_shift_norm",
+            "mpem/unweighted_motion_loss",
+            "mpem/anchor_loss",
+            "mpem/loss_weight",
+            "mpem/loss_weight_min",
+            "mpem/loss_weight_max",
+            "mpem/shift_coef",
+            "mpem/anchor_beta",
         )
         sum_optional_diag = {key: 0.0 for key in optional_diag_keys}
         count_optional_diag = {key: 0 for key in optional_diag_keys}
@@ -849,32 +896,59 @@ def main():
             generator.model.set_adapter("default")
 
             # --- loss ---
-            loss_motion_projected_em_ram, diag = motion_projected_em_ram_loss(
-                v_default=flow_pred_default,
-                v_anchor=flow_pred_anchor,
-                noise=noise,
-                x0_ref=x0_ref,
-                alpha=alpha_tensor[k_idx:k_idx + 1],
-                x0_reference=reference_latent,
-                reward_coef=reward_coef,
-                lambda_motion=lambda_motion,
-                lambda_static=lambda_static,
-                subspace_mode=subspace_mode,
-                motion_pool=motion_pool,
-                motion_temporal_center=motion_temporal_center,
-                reference_motion_scope=reference_motion_scope,
-                reference_motion_positive=reference_motion_positive,
-                reference_motion_mix=reference_motion_mix,
-                reference_motion_temporal_center=reference_motion_temporal_center,
-                lambda_reference_orthogonal=lambda_reference_orthogonal,
-                anchor_idx=t_idx,
-            )
-            if beta_kl > 0.0:
-                kl = kl_anchor_loss(flow_pred_default, flow_pred_anchor)
-                loss = loss_motion_projected_em_ram + beta_kl * kl
-            else:
+            if mstep_objective == "alpha_shift":
+                loss_motion_projected_em_ram, diag = motion_projected_em_ram_loss(
+                    v_default=flow_pred_default,
+                    v_anchor=flow_pred_anchor,
+                    noise=noise,
+                    x0_ref=x0_ref,
+                    alpha=alpha_tensor[k_idx:k_idx + 1],
+                    x0_reference=reference_latent,
+                    reward_coef=reward_coef,
+                    lambda_motion=lambda_motion,
+                    lambda_static=lambda_static,
+                    subspace_mode=subspace_mode,
+                    motion_pool=motion_pool,
+                    motion_temporal_center=motion_temporal_center,
+                    reference_motion_scope=reference_motion_scope,
+                    reference_motion_positive=reference_motion_positive,
+                    reference_motion_mix=reference_motion_mix,
+                    reference_motion_temporal_center=reference_motion_temporal_center,
+                    lambda_reference_orthogonal=lambda_reference_orthogonal,
+                    anchor_idx=t_idx,
+                )
+                if beta_kl > 0.0:
+                    kl = kl_anchor_loss(flow_pred_default, flow_pred_anchor)
+                    loss = loss_motion_projected_em_ram + beta_kl * kl
+                else:
+                    kl = torch.zeros((), device=device, dtype=loss_motion_projected_em_ram.dtype)
+                    loss = loss_motion_projected_em_ram
+            elif mstep_objective == "reward_weighted_velocity":
+                loss_motion_projected_em_ram, diag = reward_weighted_velocity_loss(
+                    v_default=flow_pred_default,
+                    v_anchor=flow_pred_anchor,
+                    noise=noise,
+                    x0_ref=x0_ref,
+                    loss_weight=loss_weight_tensor[k_idx:k_idx + 1],
+                    x0_reference=reference_latent,
+                    shift_coef=shift_coef,
+                    anchor_beta=anchor_beta,
+                    lambda_motion=lambda_motion,
+                    lambda_static=lambda_static,
+                    subspace_mode=subspace_mode,
+                    motion_pool=motion_pool,
+                    motion_temporal_center=motion_temporal_center,
+                    reference_motion_scope=reference_motion_scope,
+                    reference_motion_positive=reference_motion_positive,
+                    reference_motion_mix=reference_motion_mix,
+                    reference_motion_temporal_center=reference_motion_temporal_center,
+                    lambda_reference_orthogonal=lambda_reference_orthogonal,
+                    anchor_idx=t_idx,
+                )
                 kl = torch.zeros((), device=device, dtype=loss_motion_projected_em_ram.dtype)
                 loss = loss_motion_projected_em_ram
+            else:
+                raise AssertionError(f"unhandled mstep_objective={mstep_objective!r}")
 
             optimizer.zero_grad()
             loss.backward()
@@ -924,6 +998,7 @@ def main():
         }
         if rank0:
             ref_diag = ""
+            update_label = "weight" if mstep_objective == "reward_weighted_velocity" else "alpha"
             if "mpem/reference_alignment_cos" in avg_optional_diag:
                 ref_diag = (
                     f"ref_cos={avg_optional_diag['mpem/reference_alignment_cos']:.3f} "
@@ -941,7 +1016,7 @@ def main():
                 f"static={avg_static_loss:.4f}  "
                 f"em_kl={em_diag['em/kl']:.3f}  "
                 f"ess={em_diag['em/ess']:.1f}  "
-                f"alpha={avg_alpha:.3f}/{avg_alpha_eff:.3f}  "
+                f"{update_label}={avg_alpha:.3f}/{avg_alpha_eff:.3f}  "
                 + (
                     f"sel={feature_selector_diag.get('feature_selector/accepted', 0.0):.0f}/{K} "
                     f"sel_dir={feature_selector_diag.get('feature_selector/direction_mean', 0.0):.3f} "
@@ -977,6 +1052,11 @@ def main():
                     f"ref_orth={avg_optional_diag['mpem/reference_orthogonal_loss']:.4f}  "
                     if "mpem/reference_orthogonal_loss" in avg_optional_diag
                     and lambda_reference_orthogonal > 0.0
+                    else ""
+                )
+                + (
+                    f"anchor={avg_optional_diag['mpem/anchor_loss']:.4f}  "
+                    if "mpem/anchor_loss" in avg_optional_diag
                     else ""
                 )
                 + f"v_def={avg_v_default:.3f}  v_anc={avg_v_anchor:.3f}  "

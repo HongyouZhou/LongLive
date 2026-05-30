@@ -1,0 +1,57 @@
+# Two-video reward-weighted velocity diagnostic.
+#
+# This tests the docs/08 objective: EM/reward controls the M-step loss weight,
+# while a fixed trust coefficient controls the motion-target shift magnitude.
+
+experiment_name: per_reference_mp_em_ram_2video_reward_weighted_velocity
+data_root: ${oc.env:LL_DATA}
+output_root: ${oc.env:LL_DATA}/per_reference_adaptation_runs
+
+protocol:
+  name: per_reference_adaptation
+  seed: 0
+  datasets:
+    ucf:
+      enabled: true
+      categories:
+        - Golf-Swing
+      max_categories: null
+      refs_per_category: 1
+      prompts_per_unit: all
+    loveu:
+      enabled: true
+      max_units: null
+      unit_ids:
+        - miami-surf
+      prompts_per_unit: all
+      prompt_types:
+        - Style Change Caption
+        - Object Change Caption
+        - Background Change Caption
+        - Multiple Changes Caption
+
+runtime:
+  nproc_per_node: 8
+  eval_gpus: "0,1,2,3,4,5,6,7"
+  master_port: 29800
+  disable_wandb: false
+  skip_completed_train: true
+
+methods:
+  - name: mp_em_ram
+    overrides:
+      outer_epochs: 4
+      inner_steps: 8
+      k_rollouts: 4
+      g_endpoints_per_outer: 4
+      k_noisings_per_endpoint: 2
+      mstep_objective: reward_weighted_velocity
+      shift_coef: 0.25
+      loss_weight_mode: em_weight
+      loss_weight_clip_min: 0.0
+      loss_weight_clip_max: 2.0
+      anchor_beta: 0.1
+      em_target_kl: 0.02
+      beta_kl: 0.0
+      ckpt_interval: 2
+      ckpt_keep_last: 3
