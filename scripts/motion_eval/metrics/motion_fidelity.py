@@ -31,6 +31,7 @@ caching is the difference between a 10-minute eval and an hour.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -119,9 +120,21 @@ class CoTrackerWrapper:
             return
         # CoTracker3 offline: returns tracks for fixed-T input in one pass.
         # Online variant exists but is for long videos; we resample to 16 frames.
-        self._model = torch.hub.load(
-            "facebookresearch/co-tracker", "cotracker3_offline"
-        ).to(self.device).eval()
+        hub_dir = Path(torch.hub.get_dir())
+        local_repo_env = os.environ.get("LL_COTRACKER_HUB_DIR")
+        local_repo = (
+            Path(local_repo_env)
+            if local_repo_env
+            else hub_dir / "facebookresearch_co-tracker_main"
+        )
+        if local_repo.exists():
+            self._model = torch.hub.load(
+                str(local_repo), "cotracker3_offline", source="local"
+            ).to(self.device).eval()
+        else:
+            self._model = torch.hub.load(
+                "facebookresearch/co-tracker", "cotracker3_offline"
+            ).to(self.device).eval()
 
     def _cache_path(self, video_path: str | Path) -> Optional[Path]:
         if self.cache_dir is None:
