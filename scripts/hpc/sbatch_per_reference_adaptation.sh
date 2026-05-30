@@ -32,9 +32,11 @@ echo "[SLURM] Node:   $(hostname)"
 echo "[SLURM] GPUs:   ${SLURM_GPUS_ON_NODE:-8}"
 echo "[SLURM] GPU info: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'nvidia-smi unavailable')"
 
+set +u
 source ~/.bashrc
 : "${LL_ENV_NAME:=longlive}"
 mamba activate "$LL_ENV_NAME"
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${LL_REPO:-}" ] && [ -d "$LL_REPO" ]; then
