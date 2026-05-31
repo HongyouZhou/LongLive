@@ -43,6 +43,31 @@ def read_video_frames(
     except ImportError:
         pass
 
+    try:
+        import cv2  # type: ignore
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError(f"cv2 could not open video: {path}")
+        frames = []
+        idx = 0
+        kept = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % stride == 0:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                kept += 1
+                if max_frames is not None and kept >= max_frames:
+                    break
+            idx += 1
+        cap.release()
+        if not frames:
+            raise RuntimeError(f"cv2 read zero frames from video: {path}")
+        return np.stack(frames, axis=0).astype(np.uint8)
+    except ImportError:
+        pass
+
     # torchvision fallback
     import torch
     from torchvision.io import read_video
