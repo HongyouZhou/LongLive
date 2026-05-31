@@ -66,6 +66,11 @@ lambda_reference_orthogonal: 0.0
 
 reward_n_frames: 16
 reward_grid_size: 30
+reward_motion_mode: tracklet_scalar
+reward_bucket_count: 3
+reward_moving_percentile: 60.0
+reward_min_moving_tracks: 4
+reward_moving_speed_floor: 1.0e-5
 reward_speed_lower: 0.5
 reward_speed_upper: 2.0
 reward_speed_penalty_coef: 0.25

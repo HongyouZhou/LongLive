@@ -447,34 +447,34 @@ def main():
     # ---------- Reward (cache ref tracklets once, rank-0 first to avoid CoTracker hub race) ----------
     cache_root = Path(os.path.expandvars(cfg.cache_dir)) if getattr(cfg, "cache_dir", None) else None
     scratch_dir = Path(os.path.expandvars(cfg.scratch_dir)) / f"rank{rank}"
+    reward_motion_mode = str(getattr(cfg, "reward_motion_mode", "tracklet_scalar"))
+    reward_kwargs = dict(
+        ref_path=ref_clip_path,
+        scratch_dir=scratch_dir,
+        device=device,
+        cache_dir=cache_root,
+        n_frames=int(getattr(cfg, "reward_n_frames", 16)),
+        grid_size=int(getattr(cfg, "reward_grid_size", 30)),
+        fps=int(getattr(cfg, "fps", 16)),
+        speed_lower=float(getattr(cfg, "reward_speed_lower", 0.5)),
+        speed_upper=float(getattr(cfg, "reward_speed_upper", 2.0)),
+        speed_penalty_coef=float(getattr(cfg, "reward_speed_penalty_coef", 0.25)),
+        motion_mode=reward_motion_mode,
+        bucket_count=int(getattr(cfg, "reward_bucket_count", 3)),
+        moving_percentile=float(getattr(cfg, "reward_moving_percentile", 60.0)),
+        min_moving_tracks=int(getattr(cfg, "reward_min_moving_tracks", 4)),
+        moving_speed_floor=float(getattr(cfg, "reward_moving_speed_floor", 1e-5)),
+    )
     if rank0:
-        print(f"[motion_projected_em_ram] init reward (rank 0 first): ref={ref_clip_path}", flush=True)
-        reward_fn = MotionProjectedEMReward(
-            ref_path=ref_clip_path,
-            scratch_dir=scratch_dir,
-            device=device,
-            cache_dir=cache_root,
-            n_frames=int(getattr(cfg, "reward_n_frames", 16)),
-            grid_size=int(getattr(cfg, "reward_grid_size", 30)),
-            fps=int(getattr(cfg, "fps", 16)),
-            speed_lower=float(getattr(cfg, "reward_speed_lower", 0.5)),
-            speed_upper=float(getattr(cfg, "reward_speed_upper", 2.0)),
-            speed_penalty_coef=float(getattr(cfg, "reward_speed_penalty_coef", 0.25)),
+        print(
+            f"[motion_projected_em_ram] init reward (rank 0 first): "
+            f"mode={reward_motion_mode} ref={ref_clip_path}",
+            flush=True,
         )
+        reward_fn = MotionProjectedEMReward(**reward_kwargs)
     dist.barrier()
     if not rank0:
-        reward_fn = MotionProjectedEMReward(
-            ref_path=ref_clip_path,
-            scratch_dir=scratch_dir,
-            device=device,
-            cache_dir=cache_root,
-            n_frames=int(getattr(cfg, "reward_n_frames", 16)),
-            grid_size=int(getattr(cfg, "reward_grid_size", 30)),
-            fps=int(getattr(cfg, "fps", 16)),
-            speed_lower=float(getattr(cfg, "reward_speed_lower", 0.5)),
-            speed_upper=float(getattr(cfg, "reward_speed_upper", 2.0)),
-            speed_penalty_coef=float(getattr(cfg, "reward_speed_penalty_coef", 0.25)),
-        )
+        reward_fn = MotionProjectedEMReward(**reward_kwargs)
     dist.barrier()
     if rank0:
         print("[motion_projected_em_ram] reward init complete on all ranks", flush=True)
@@ -620,6 +620,7 @@ def main():
             f"reference_mix={reference_motion_mix} | "
             f"reference_temporal_center={reference_motion_temporal_center} | "
             f"rollout_adapter={rollout_adapter} | reward_mode={reward_mode} | "
+            f"reward_motion_mode={reward_motion_mode} | "
             f"relative_margin={reward_relative_margin} | "
             f"relative_gate={reward_relative_gate} | "
             f"feature_selector={feature_selector_mode} | "
@@ -716,8 +717,13 @@ def main():
         t_reward = time.time() - t_reward_start
         reward_component_diag = {}
         if reward_components:
-            for key in ("direction", "speed_penalty", "speed_ratio"):
-                vals = [float(c[key]) for c in reward_components if key in c]
+            component_keys = sorted({key for c in reward_components for key in c})
+            for key in component_keys:
+                vals = [
+                    float(c[key])
+                    for c in reward_components
+                    if key in c and isinstance(c[key], (int, float))
+                ]
                 if vals:
                     reward_component_diag[f"reward/{key}"] = sum(vals) / len(vals)
         if relative_components:
@@ -998,12 +1004,23 @@ def main():
         }
         if rank0:
             ref_diag = ""
+            residual_reward_diag = ""
             update_label = "weight" if mstep_objective == "reward_weighted_velocity" else "alpha"
             if "mpem/reference_alignment_cos" in avg_optional_diag:
                 ref_diag = (
                     f"ref_cos={avg_optional_diag['mpem/reference_alignment_cos']:.3f} "
                     f"ref_coef={avg_optional_diag['mpem/reference_coef_mean']:.3f}/"
                     f"{avg_optional_diag['mpem/reference_coef_abs_mean']:.3f} "
+                )
+            if reward_motion_mode == "residual_bucket":
+                bucket_diag = " ".join(
+                    f"b{idx}={reward_component_diag.get(f'reward/bucket{idx}_direction', 0.0):.3f}"
+                    for idx in range(int(getattr(cfg, "reward_bucket_count", 3)))
+                )
+                residual_reward_diag = (
+                    f"resid={reward_component_diag.get('reward/residual_score', 0.0):.3f} "
+                    f"global={reward_component_diag.get('reward/global_direction', 0.0):.3f} "
+                    f"{bucket_diag}  "
                 )
             print(
                 f"[motion_projected_em_ram] outer {outer:3d}/{outer_epochs}  "
@@ -1012,7 +1029,8 @@ def main():
                 f"dir={reward_component_diag.get('reward/direction', 0.0):.3f} "
                 f"speed={reward_component_diag.get('reward/speed_ratio', 0.0):.3f} "
                 f"sp_pen={reward_component_diag.get('reward/speed_penalty', 0.0):.3f} "
-                f"loss={avg_loss:.4f}  motion={avg_motion_loss:.4f} "
+                + residual_reward_diag
+                + f"loss={avg_loss:.4f}  motion={avg_motion_loss:.4f} "
                 f"static={avg_static_loss:.4f}  "
                 f"em_kl={em_diag['em/kl']:.3f}  "
                 f"ess={em_diag['em/ess']:.1f}  "

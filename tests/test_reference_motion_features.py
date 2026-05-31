@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -9,6 +10,9 @@ sys.path.insert(0, str(REPO_ROOT))
 from longlive.methods.motion_projected_em_ram.motion_features import (
     build_reference_motion_descriptor,
     descriptor_pair_metrics,
+)
+from longlive.methods.motion_projected_em_ram.reward import (
+    motion_projected_reward_components,
 )
 
 
@@ -88,9 +92,48 @@ def test_descriptor_pair_scores_same_motion_above_opposite_motion() -> None:
     assert same_metrics["residual_score"] > opposite_metrics["residual_score"]
 
 
+def test_residual_bucket_reward_exports_legacy_component_keys() -> None:
+    ref_tracks, ref_vis = _synthetic_tracks(residual_sign=1.0)
+    gen_tracks, gen_vis = _synthetic_tracks(residual_sign=1.0)
+
+    components = motion_projected_reward_components(
+        gen_tracks=gen_tracks,
+        gen_visibility=gen_vis,
+        ref_tracks=ref_tracks,
+        ref_visibility=ref_vis,
+        motion_mode="residual_bucket",
+        gen_frame_height=100,
+        gen_frame_width=100,
+        ref_frame_height=100,
+        ref_frame_width=100,
+        min_moving_tracks=2,
+    )
+
+    assert components["score"] == components["residual_score"]
+    assert components["direction"] == components["residual_direction"]
+    assert components["speed_penalty"] == components["residual_speed_penalty"]
+    assert components["speed_ratio"] == components["residual_speed_ratio"]
+    assert components["bucket0_direction"] > 0.99
+
+
+def test_motion_projected_reward_rejects_unknown_mode() -> None:
+    ref_tracks, ref_vis = _synthetic_tracks()
+
+    with pytest.raises(ValueError, match="motion_mode"):
+        motion_projected_reward_components(
+            gen_tracks=ref_tracks,
+            gen_visibility=ref_vis,
+            ref_tracks=ref_tracks,
+            ref_visibility=ref_vis,
+            motion_mode="not_a_mode",
+        )
+
+
 def main() -> None:
     test_descriptor_removes_global_motion_and_selects_residual_tracks()
     test_descriptor_pair_scores_same_motion_above_opposite_motion()
+    test_residual_bucket_reward_exports_legacy_component_keys()
+    test_motion_projected_reward_rejects_unknown_mode()
 
 
 if __name__ == "__main__":
