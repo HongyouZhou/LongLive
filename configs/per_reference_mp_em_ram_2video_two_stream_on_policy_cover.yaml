@@ -1,0 +1,80 @@
+# Two-video two-stream diagnostic.
+#
+# Reference stream: on-policy student rollouts with residual-bucket reward and
+# time-local RAM updates.
+# Cover stream: LongLive/anchor rollouts on train+eval prompts, distilled back
+# to the trainable adapter for explicit mode coverage.
+
+experiment_name: per_reference_mp_em_ram_2video_two_stream_on_policy_cover
+data_root: ${oc.env:LL_DATA}
+output_root: ${oc.env:LL_DATA}/per_reference_adaptation_runs
+
+protocol:
+  name: per_reference_adaptation
+  seed: 0
+  datasets:
+    ucf:
+      enabled: true
+      categories:
+        - Golf-Swing
+      max_categories: null
+      refs_per_category: 1
+      prompts_per_unit: all
+    loveu:
+      enabled: true
+      max_units: null
+      unit_ids:
+        - miami-surf
+      prompts_per_unit: all
+      prompt_types:
+        - Style Change Caption
+        - Object Change Caption
+        - Background Change Caption
+        - Multiple Changes Caption
+
+runtime:
+  nproc_per_node: 8
+  eval_gpus: "0,1,2,3,4,5,6,7"
+  master_port: 30000
+  disable_wandb: false
+  skip_completed_train: true
+
+methods:
+  - name: mp_em_ram
+    overrides:
+      outer_epochs: 4
+      inner_steps: 8
+      k_rollouts: 4
+      g_endpoints_per_outer: 4
+      k_noisings_per_endpoint: 2
+
+      mstep_objective: two_stream_on_policy_cover
+      reward_motion_mode: residual_bucket
+      reward_bucket_count: 3
+      reward_moving_percentile: 60.0
+      reward_min_moving_tracks: 4
+      reward_moving_speed_floor: 1.0e-5
+
+      time_weight_mode: residual_bucket_direction
+      time_weight_temperature: 0.25
+      time_weight_min: 0.0
+      time_weight_max: 1.0
+      time_weight_normalize_mean: false
+
+      shift_coef: 0.25
+      loss_weight_mode: em_weight
+      loss_weight_clip_min: 0.0
+      loss_weight_clip_max: 2.0
+      em_target_kl: 0.02
+      em_alpha_max: 0.25
+
+      cover_prompt_source: train_and_eval_prompts
+      cover_step_ratio: 0.25
+      cover_rollouts_per_outer: 1
+      cover_loss_weight: 1.0
+      local_anchor_beta: 0.03
+      beta_kl: 0.0
+      lambda_static: 0.05
+
+      ckpt_interval: 2
+      ckpt_keep_last: 3

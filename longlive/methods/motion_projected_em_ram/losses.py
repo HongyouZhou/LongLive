@@ -342,6 +342,82 @@ def score_consistency_weights(
     return weights, diag
 
 
+def residual_bucket_time_weights(
+    components: list[dict[str, float]],
+    *,
+    latent_frames: int,
+    bucket_count: int = 3,
+    direction_center: float = 0.0,
+    direction_temperature: float = 0.25,
+    min_weight: float = 0.0,
+    max_weight: float = 1.0,
+    normalize_mean: bool = False,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Map residual-bucket reward diagnostics to latent-frame update weights.
+
+    The reward scorer compares early/middle/late residual motion buckets in
+    pixel space.  This helper turns those bucket direction scores into a
+    coarse latent-time mask, so reference-consistent segments can receive RAM
+    motion updates while mismatched segments stay close to the LongLive anchor.
+    """
+    if not components:
+        raise ValueError("residual_bucket_time_weights requires at least one component dict")
+    if int(latent_frames) <= 0:
+        raise ValueError(f"latent_frames must be positive, got {latent_frames}")
+    bucket_count = int(bucket_count)
+    if bucket_count <= 0:
+        raise ValueError(f"bucket_count must be positive, got {bucket_count}")
+
+    missing = [
+        f"bucket{idx}_direction"
+        for idx in range(bucket_count)
+        if any(f"bucket{idx}_direction" not in c for c in components)
+    ]
+    if missing:
+        raise ValueError(
+            "residual_bucket_time_weights requires residual-bucket reward "
+            f"components; missing keys include {sorted(set(missing))}"
+        )
+
+    dirs = torch.tensor(
+        [
+            [float(c[f"bucket{idx}_direction"]) for idx in range(bucket_count)]
+            for c in components
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    temp = max(float(direction_temperature), 1e-6)
+    bucket_weights = torch.sigmoid((dirs - float(direction_center)) / temp)
+    bucket_weights = bucket_weights.clamp(float(min_weight), float(max_weight))
+    if normalize_mean:
+        bucket_weights = bucket_weights / bucket_weights.mean(dim=1, keepdim=True).clamp_min(1e-6)
+        bucket_weights = bucket_weights.clamp(float(min_weight), float(max_weight))
+
+    frame_weights = torch.zeros(
+        (len(components), int(latent_frames)),
+        dtype=torch.float32,
+        device=device,
+    )
+    buckets = torch.tensor_split(
+        torch.arange(int(latent_frames), device=device),
+        bucket_count,
+    )
+    for idx, frame_idx in enumerate(buckets):
+        if frame_idx.numel():
+            frame_weights[:, frame_idx] = bucket_weights[:, idx:idx + 1]
+
+    diag = {
+        "time_weight/mean": float(frame_weights.mean().item()),
+        "time_weight/min": float(frame_weights.min().item()),
+        "time_weight/max": float(frame_weights.max().item()),
+        "time_weight/bucket_direction_mean": float(dirs.mean().item()),
+        "time_weight/active_frame_rate": float((frame_weights > 1e-4).float().mean().item()),
+    }
+    return frame_weights, diag
+
+
 def motion_project(
     x: torch.Tensor,
     *,
@@ -775,6 +851,189 @@ def reward_weighted_velocity_loss(
             "mpem/subspace_hybrid": torch.tensor(float(str(subspace_mode) == "hybrid_reference_motion")),
         }
         diag.update(projector_diag)
+    return loss, diag
+
+
+def time_local_reward_weighted_velocity_loss(
+    v_default: torch.Tensor,
+    v_anchor: torch.Tensor,
+    noise: torch.Tensor,
+    x0_ref: torch.Tensor,
+    loss_weight: torch.Tensor,
+    time_weight: torch.Tensor,
+    x0_reference: torch.Tensor | None = None,
+    shift_coef: float = 0.25,
+    local_anchor_beta: float = 0.03,
+    lambda_motion: float = 1.0,
+    lambda_static: float = 0.05,
+    subspace_mode: str = "coarse_motion",
+    motion_pool: int = 2,
+    motion_temporal_center: bool = True,
+    reference_motion_scope: str = "frame",
+    reference_motion_positive: bool = False,
+    reference_motion_mix: float = 1.0,
+    reference_motion_temporal_center: bool = False,
+    lambda_reference_orthogonal: float = 0.0,
+    anchor_idx: int = -1,
+) -> tuple[torch.Tensor, dict]:
+    """Reward-weighted RAM target with a reference-motion time-local mask."""
+    v_anchor_d = v_anchor.detach()
+    weight = loss_weight.to(v_default.dtype).view(-1)
+    if weight.numel() != v_default.shape[0]:
+        if weight.numel() == 1:
+            weight = weight.expand(v_default.shape[0])
+        else:
+            raise ValueError(
+                f"loss_weight batch mismatch: weights={tuple(loss_weight.shape)} "
+                f"v_default={tuple(v_default.shape)}"
+            )
+
+    time_w = time_weight.to(device=v_default.device, dtype=v_default.dtype)
+    if time_w.ndim == 1:
+        time_w = time_w.view(1, -1)
+    if time_w.shape[0] != v_default.shape[0]:
+        if time_w.shape[0] == 1:
+            time_w = time_w.expand(v_default.shape[0], -1)
+        else:
+            raise ValueError(
+                f"time_weight batch mismatch: weights={tuple(time_weight.shape)} "
+                f"v_default={tuple(v_default.shape)}"
+            )
+    if time_w.shape[1] != v_default.shape[1]:
+        raise ValueError(
+            f"time_weight frame mismatch: weights={tuple(time_weight.shape)} "
+            f"v_default={tuple(v_default.shape)}"
+        )
+    time_w_b = time_w.view(v_default.shape[0], v_default.shape[1], 1, 1, 1)
+
+    raw_shift = (noise - x0_ref) - v_default.detach()
+    motion_shift, projector_diag, uses_reference_subspace = _project_ram_shift(
+        raw_shift,
+        x0_reference=x0_reference,
+        subspace_mode=subspace_mode,
+        motion_pool=motion_pool,
+        motion_temporal_center=motion_temporal_center,
+        reference_motion_scope=reference_motion_scope,
+        reference_motion_positive=reference_motion_positive,
+        reference_motion_mix=reference_motion_mix,
+        reference_motion_temporal_center=reference_motion_temporal_center,
+    )
+    time_local_shift = time_w_b * motion_shift
+    target = v_anchor_d + float(shift_coef) * time_local_shift
+
+    per_sample_motion = (
+        v_default.float() - target.detach().float()
+    ).square().flatten(1).mean(dim=1)
+    weighted_motion_loss = (weight.float() * per_sample_motion).mean()
+    local_anchor_loss = F.mse_loss(v_default, v_anchor_d)
+
+    static_default = v_default.mean(dim=1, keepdim=True)
+    static_anchor = v_anchor_d.mean(dim=1, keepdim=True)
+    static_loss = F.mse_loss(static_default, static_anchor)
+
+    reference_orthogonal_loss = torch.zeros((), device=v_default.device, dtype=v_default.dtype)
+    if uses_reference_subspace and float(lambda_reference_orthogonal) > 0.0:
+        assert x0_reference is not None
+        delta_v = v_default - v_anchor_d
+        coarse_delta = motion_project(
+            delta_v,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+        )
+        ref_delta, _ref_delta_diag = reference_motion_project(
+            delta_v,
+            x0_reference,
+            spatial_pool=motion_pool,
+            temporal_center=motion_temporal_center,
+            reference_temporal_center=reference_motion_temporal_center,
+            projection_scope=reference_motion_scope,
+            positive_only=False,
+            mix=1.0,
+        )
+        reference_orthogonal_loss = (coarse_delta - ref_delta).float().square().mean()
+
+    loss = (
+        float(lambda_motion) * weighted_motion_loss
+        + float(local_anchor_beta) * local_anchor_loss
+        + float(lambda_static) * static_loss
+        + float(lambda_reference_orthogonal) * reference_orthogonal_loss
+    )
+
+    with torch.no_grad():
+        diag = {
+            "loss/mpem": loss.detach(),
+            "mpem/motion_loss": weighted_motion_loss.detach(),
+            "mpem/unweighted_motion_loss": per_sample_motion.mean().detach(),
+            "mpem/anchor_loss": local_anchor_loss.detach(),
+            "mpem/static_loss": static_loss.detach(),
+            "mpem/reference_orthogonal_loss": reference_orthogonal_loss.detach(),
+            "mpem/raw_shift_norm": raw_shift.float().flatten(1).norm(dim=1).mean(),
+            "mpem/motion_shift_norm": time_local_shift.float().flatten(1).norm(dim=1).mean(),
+            "mpem/target_norm": target.float().flatten(1).norm(dim=1).mean(),
+            "mpem/v_default_norm": v_default.float().flatten(1).norm(dim=1).mean(),
+            "mpem/v_anchor_norm": v_anchor_d.float().flatten(1).norm(dim=1).mean(),
+            "mpem/alpha": weight.float().mean(),
+            "mpem/alpha_eff": (weight.float().mean() * time_w.float().mean()),
+            "mpem/loss_weight": weight.float().mean(),
+            "mpem/loss_weight_min": weight.float().min(),
+            "mpem/loss_weight_max": weight.float().max(),
+            "mpem/shift_coef": torch.tensor(float(shift_coef), device=v_default.device),
+            "mpem/anchor_beta": torch.tensor(float(local_anchor_beta), device=v_default.device),
+            "mpem/time_weight_mean": time_w.float().mean(),
+            "mpem/time_weight_min": time_w.float().min(),
+            "mpem/time_weight_max": time_w.float().max(),
+            "mpem/active_frame_rate": (time_w.float() > 1e-4).float().mean(),
+            "mpem/anchor_idx": torch.tensor(float(anchor_idx)),
+            "mpem/subspace_reference": torch.tensor(float(uses_reference_subspace)),
+            "mpem/subspace_hybrid": torch.tensor(float(str(subspace_mode) == "hybrid_reference_motion")),
+            "mpem/cover_stream": torch.tensor(0.0, device=v_default.device),
+        }
+        diag.update(projector_diag)
+    return loss, diag
+
+
+def mode_cover_velocity_loss(
+    v_default: torch.Tensor,
+    v_anchor: torch.Tensor,
+    *,
+    cover_loss_weight: float = 1.0,
+    lambda_static: float = 0.05,
+    anchor_idx: int = -1,
+) -> tuple[torch.Tensor, dict]:
+    """Teacher-sampled LongLive velocity matching for explicit mode coverage."""
+    v_anchor_d = v_anchor.detach()
+    cover_loss = F.mse_loss(v_default, v_anchor_d)
+    static_default = v_default.mean(dim=1, keepdim=True)
+    static_anchor = v_anchor_d.mean(dim=1, keepdim=True)
+    static_loss = F.mse_loss(static_default, static_anchor)
+    loss = float(cover_loss_weight) * cover_loss + float(lambda_static) * static_loss
+    zero = torch.zeros((), device=v_default.device, dtype=v_default.dtype)
+
+    with torch.no_grad():
+        diag = {
+            "loss/mpem": loss.detach(),
+            "mpem/motion_loss": cover_loss.detach(),
+            "mpem/unweighted_motion_loss": cover_loss.detach(),
+            "mpem/anchor_loss": cover_loss.detach(),
+            "mpem/static_loss": static_loss.detach(),
+            "mpem/reference_orthogonal_loss": zero.detach(),
+            "mpem/raw_shift_norm": zero.detach(),
+            "mpem/motion_shift_norm": zero.detach(),
+            "mpem/target_norm": v_anchor_d.float().flatten(1).norm(dim=1).mean(),
+            "mpem/v_default_norm": v_default.float().flatten(1).norm(dim=1).mean(),
+            "mpem/v_anchor_norm": v_anchor_d.float().flatten(1).norm(dim=1).mean(),
+            "mpem/alpha": torch.tensor(float(cover_loss_weight), device=v_default.device),
+            "mpem/alpha_eff": torch.tensor(float(cover_loss_weight), device=v_default.device),
+            "mpem/loss_weight": torch.tensor(float(cover_loss_weight), device=v_default.device),
+            "mpem/loss_weight_min": torch.tensor(float(cover_loss_weight), device=v_default.device),
+            "mpem/loss_weight_max": torch.tensor(float(cover_loss_weight), device=v_default.device),
+            "mpem/cover_loss": cover_loss.detach(),
+            "mpem/cover_loss_weight": torch.tensor(float(cover_loss_weight), device=v_default.device),
+            "mpem/anchor_idx": torch.tensor(float(anchor_idx), device=v_default.device),
+            "mpem/subspace_reference": zero.detach(),
+            "mpem/subspace_hybrid": zero.detach(),
+            "mpem/cover_stream": torch.tensor(1.0, device=v_default.device),
+        }
     return loss, diag
 
 

@@ -369,6 +369,7 @@ def _render_train_config(
     train_cfg.data_root = str(cfg.data_root)
     train_cfg.reference_video_path = unit["reference_video"]
     train_cfg.train_caption = unit["train_caption"]
+    train_cfg.cover_prompts = [row["prompt"] for row in unit["eval_prompts"]]
     train_cfg.unit_id = unit["unit_id"]
     train_cfg.out_dir = str(unit_train_dir)
     train_cfg.cache_dir = str(method_dir / "_tracklet_cache")

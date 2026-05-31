@@ -61,6 +61,12 @@ class _CachedTextEncoder:
         }
         self._batch_size = batch_size
 
+    def set_cond_dict(self, cond_dict: dict) -> None:
+        """Replace the cached conditioning without rebuilding the pipeline."""
+        self._cond_dict_template = {
+            k: v.detach() for k, v in cond_dict.items()
+        }
+
     @property
     def device(self):
         # CausalInferencePipeline doesn't use this, but defining it matches
@@ -117,6 +123,10 @@ class RolloutEngine:
         # Cached for log messages — the placeholder caption string never
         # reaches the encoder, but pipeline.inference signature wants a list.
         self._placeholder_prompts = ["<cached>"] * self.latent_shape[0]
+
+    def set_cached_cond_dict(self, cond_dict: dict) -> None:
+        """Switch the cached text conditioning used by subsequent rollouts."""
+        self._stub_text_encoder.set_cond_dict(cond_dict)
 
     def rollout(
         self,

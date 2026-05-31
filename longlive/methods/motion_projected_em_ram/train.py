@@ -57,9 +57,12 @@ from longlive.methods.motion_projected_em_ram.losses import (
     feature_consistency_gates,
     feature_consistency_weights,
     kl_anchor_loss,
+    mode_cover_velocity_loss,
     motion_projected_em_ram_loss,
+    residual_bucket_time_weights,
     reward_weighted_velocity_loss,
     score_consistency_weights,
+    time_local_reward_weighted_velocity_loss,
 )
 from longlive.methods.motion_projected_em_ram.reward import MotionProjectedEMReward
 from longlive.data.motion_refs import make_reference_dataset
@@ -129,6 +132,30 @@ def _prune_old_ckpts(out_dir: Path, keep_last: int) -> None:
     while len(ckpts) > keep_last:
         ckpts[0].unlink()
         ckpts.pop(0)
+
+
+def _dedupe_prompts(prompts: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for prompt in prompts:
+        p = str(prompt).strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _cover_step_schedule(inner_steps: int, cover_steps: int) -> list[bool]:
+    cover_steps = max(0, min(int(cover_steps), int(inner_steps)))
+    if cover_steps == 0:
+        return [False] * int(inner_steps)
+    schedule = []
+    for idx in range(int(inner_steps)):
+        prev = (idx * cover_steps) // int(inner_steps)
+        cur = ((idx + 1) * cover_steps) // int(inner_steps)
+        schedule.append(cur > prev)
+    return schedule
 
 
 # ============================================================================
@@ -258,6 +285,7 @@ def main():
     dataset = make_reference_dataset(cfg, vae=vae, device=device)
     train_caption = dataset.train_caption
     ref_clip_path = dataset.train_clip_path
+    mstep_objective = str(getattr(cfg, "mstep_objective", "alpha_shift"))
     reference_latent = None
     if subspace_mode in reference_subspace_modes:
         if rank0:
@@ -277,8 +305,39 @@ def main():
     text_encoder.to(device).eval()
     with torch.no_grad():
         train_cond = {k: v.detach().clone() for k, v in text_encoder([train_caption]).items()}
+        cover_prompt_source = str(getattr(cfg, "cover_prompt_source", "train_caption"))
+        raw_cover_prompts = list(getattr(cfg, "cover_prompts", []))
+        if cover_prompt_source == "train_caption":
+            cover_prompts = [train_caption]
+        elif cover_prompt_source == "train_and_eval_prompts":
+            cover_prompts = [train_caption, *raw_cover_prompts]
+        elif cover_prompt_source == "config":
+            cover_prompts = raw_cover_prompts
+        else:
+            raise ValueError(
+                "cover_prompt_source must be 'train_caption', "
+                f"'train_and_eval_prompts', or 'config', got {cover_prompt_source!r}"
+            )
+        cover_prompts = _dedupe_prompts(cover_prompts)
+        if mstep_objective == "two_stream_on_policy_cover" and not cover_prompts:
+            raise ValueError("two_stream_on_policy_cover requires at least one cover prompt")
+        cover_cond_list = []
+        if mstep_objective == "two_stream_on_policy_cover":
+            cover_cond_batch = {
+                k: v.detach().clone() for k, v in text_encoder(cover_prompts).items()
+            }
+            cover_cond_list = [
+                {k: v[i:i + 1].detach().clone() for k, v in cover_cond_batch.items()}
+                for i in range(len(cover_prompts))
+            ]
     del text_encoder
     torch.cuda.empty_cache()
+    if rank0 and mstep_objective == "two_stream_on_policy_cover":
+        print(
+            f"[motion_projected_em_ram] cover prompts: {len(cover_prompts)} "
+            f"(source={cover_prompt_source})",
+            flush=True,
+        )
 
     # ---------- Backbone + base ckpt + NVlabs baseline LoRA merge ----------
     is_causal = bool(getattr(cfg, "is_causal", True))
@@ -505,12 +564,20 @@ def main():
     lambda_static = float(getattr(cfg, "lambda_static", 0.05))
     motion_pool = int(getattr(cfg, "motion_pool", 2))
     motion_temporal_center = bool(getattr(cfg, "motion_temporal_center", True))
-    mstep_objective = str(getattr(cfg, "mstep_objective", "alpha_shift"))
     shift_coef = float(getattr(cfg, "shift_coef", 0.25))
     loss_weight_mode = str(getattr(cfg, "loss_weight_mode", "em_weight"))
     loss_weight_clip_min = float(getattr(cfg, "loss_weight_clip_min", 0.0))
     loss_weight_clip_max = float(getattr(cfg, "loss_weight_clip_max", 2.0))
     anchor_beta = float(getattr(cfg, "anchor_beta", 0.1))
+    local_anchor_beta = float(getattr(cfg, "local_anchor_beta", anchor_beta))
+    cover_step_ratio = float(getattr(cfg, "cover_step_ratio", 0.25))
+    cover_rollouts_per_outer = int(getattr(cfg, "cover_rollouts_per_outer", 1))
+    cover_loss_weight = float(getattr(cfg, "cover_loss_weight", 1.0))
+    time_weight_mode = str(getattr(cfg, "time_weight_mode", "none"))
+    time_weight_temperature = float(getattr(cfg, "time_weight_temperature", 0.25))
+    time_weight_min = float(getattr(cfg, "time_weight_min", 0.0))
+    time_weight_max = float(getattr(cfg, "time_weight_max", 1.0))
+    time_weight_normalize_mean = bool(getattr(cfg, "time_weight_normalize_mean", False))
     rollout_adapter = str(getattr(cfg, "rollout_adapter", "default"))
     reward_mode = str(getattr(cfg, "reward_mode", "absolute"))
     reward_relative_margin = float(getattr(cfg, "reward_relative_margin", 0.0))
@@ -578,8 +645,9 @@ def main():
         f"feature_selector_mode must be 'none', 'component_gate', "
         f"'component_weight', or 'score_weight', got {feature_selector_mode!r}"
     )
-    assert mstep_objective in ("alpha_shift", "reward_weighted_velocity"), (
-        f"mstep_objective must be 'alpha_shift' or 'reward_weighted_velocity', "
+    assert mstep_objective in ("alpha_shift", "reward_weighted_velocity", "two_stream_on_policy_cover"), (
+        f"mstep_objective must be 'alpha_shift', 'reward_weighted_velocity', "
+        f"or 'two_stream_on_policy_cover', "
         f"got {mstep_objective!r}"
     )
     assert loss_weight_mode == "em_weight", (
@@ -593,6 +661,25 @@ def main():
         assert beta_kl == 0.0, (
             "reward_weighted_velocity uses anchor_beta as its explicit "
             "LongLive anchor; set beta_kl=0.0 to avoid mixing objectives"
+        )
+    if mstep_objective == "two_stream_on_policy_cover":
+        assert beta_kl == 0.0, (
+            "two_stream_on_policy_cover has explicit local_anchor_beta and "
+            "cover_loss_weight; set beta_kl=0.0 to avoid mixing objectives"
+        )
+        assert reward_motion_mode == "residual_bucket", (
+            "two_stream_on_policy_cover currently requires "
+            "reward_motion_mode='residual_bucket' for time-local weights"
+        )
+        assert time_weight_mode == "residual_bucket_direction", (
+            "two_stream_on_policy_cover currently supports only "
+            "time_weight_mode='residual_bucket_direction'"
+        )
+        assert 0.0 <= cover_step_ratio <= 1.0, (
+            f"cover_step_ratio must be in [0, 1], got {cover_step_ratio}"
+        )
+        assert cover_rollouts_per_outer > 0, (
+            f"cover_rollouts_per_outer must be positive, got {cover_rollouts_per_outer}"
         )
     if reward_mode == "baseline_relative":
         assert rollout_adapter == "default", (
@@ -609,6 +696,13 @@ def main():
             f"loss_weight_mode={loss_weight_mode} | "
             f"loss_weight_clip={loss_weight_clip_min}/{loss_weight_clip_max} | "
             f"anchor_beta={anchor_beta} | "
+            f"local_anchor_beta={local_anchor_beta} | "
+            f"cover_step_ratio={cover_step_ratio} | "
+            f"cover_rollouts={cover_rollouts_per_outer} | "
+            f"cover_loss_weight={cover_loss_weight} | "
+            f"time_weight_mode={time_weight_mode} | "
+            f"time_weight_temp={time_weight_temperature} | "
+            f"time_weight_minmax={time_weight_min}/{time_weight_max} | "
             f"em_target_kl={em_target_kl} | em_eta={em_eta} | "
             f"em_alpha_mode={em_alpha_mode} | em_alpha_max={em_alpha_max} | "
             f"em_std_floor={em_std_floor} | lambda_motion={lambda_motion} | "
@@ -823,10 +917,62 @@ def main():
             float(loss_weight_clip_min),
             float(loss_weight_clip_max),
         )
+        time_weight_tensor = None
+        time_weight_diag = {}
+        if mstep_objective == "two_stream_on_policy_cover":
+            time_weight_tensor, time_weight_diag = residual_bucket_time_weights(
+                reward_components,
+                latent_frames=latent_f,
+                bucket_count=int(getattr(cfg, "reward_bucket_count", 3)),
+                direction_temperature=time_weight_temperature,
+                min_weight=time_weight_min,
+                max_weight=time_weight_max,
+                normalize_mean=time_weight_normalize_mean,
+                device=device,
+            )
         if mstep_objective == "reward_weighted_velocity":
             em_diag["em/local_loss_weight_min"] = float(loss_weight_tensor.min())
             em_diag["em/local_loss_weight_max"] = float(loss_weight_tensor.max())
             em_diag["em/local_loss_weight_mean"] = float(loss_weight_tensor.mean())
+        elif mstep_objective == "two_stream_on_policy_cover":
+            em_diag["em/local_loss_weight_min"] = float(loss_weight_tensor.min())
+            em_diag["em/local_loss_weight_max"] = float(loss_weight_tensor.max())
+            em_diag["em/local_loss_weight_mean"] = float(loss_weight_tensor.mean())
+            for key, value in time_weight_diag.items():
+                em_diag[key] = value
+
+        # ---- COVER phase ----
+        # Teacher/anchor rollouts provide an explicit mode-covering stream.
+        cover_rollouts = []
+        t_cover = 0.0
+        if mstep_objective == "two_stream_on_policy_cover":
+            t_cover_start = time.time()
+            generator.model.set_adapter("anchor")
+            cover_gen = torch.Generator(device=device)
+            cover_base_seed = int(cfg.seed) + 7919 * outer + 37 * rank
+            for cover_idx in range(cover_rollouts_per_outer):
+                prompt_idx = (outer * cover_rollouts_per_outer + cover_idx) % len(cover_cond_list)
+                cover_cond = cover_cond_list[prompt_idx]
+                rollout_engine.set_cached_cond_dict(cover_cond)
+                cover_gen.manual_seed(cover_base_seed + cover_idx)
+                cover_noise = torch.randn(
+                    latent_shape,
+                    device=device,
+                    dtype=torch.bfloat16,
+                    generator=cover_gen,
+                )
+                cover_out = rollout_engine.rollout(cover_noise)
+                rollout_engine.pipeline.kv_cache1 = None
+                rollout_engine.pipeline.crossattn_cache = None
+                cover_rollouts.append({
+                    "latent": cover_out.latent_x0.detach(),
+                    "cond": cover_cond,
+                    "prompt_idx": prompt_idx,
+                })
+                del cover_out
+            rollout_engine.set_cached_cond_dict(train_cond)
+            generator.model.set_adapter("default")
+            t_cover = time.time() - t_cover_start
 
         # ---- TRAINING phase ----
         generator.model.set_adapter("default")
@@ -862,6 +1008,13 @@ def main():
             "mpem/loss_weight_max",
             "mpem/shift_coef",
             "mpem/anchor_beta",
+            "mpem/time_weight_mean",
+            "mpem/time_weight_min",
+            "mpem/time_weight_max",
+            "mpem/active_frame_rate",
+            "mpem/cover_loss",
+            "mpem/cover_loss_weight",
+            "mpem/cover_stream",
         )
         sum_optional_diag = {key: 0.0 for key in optional_diag_keys}
         count_optional_diag = {key: 0 for key in optional_diag_keys}
@@ -870,14 +1023,43 @@ def main():
         per_anchor_count = [0] * len(anchors)
         per_rollout_shift = [0.0] * K
         per_rollout_count = [0] * K
+        cover_steps = (
+            int(round(inner_steps * cover_step_ratio))
+            if mstep_objective == "two_stream_on_policy_cover"
+            else 0
+        )
+        cover_schedule = _cover_step_schedule(inner_steps, cover_steps)
+        ref_inner = 0
+        cover_inner = 0
 
         for inner in range(inner_steps):
-            # Motion-Projected EM-RAM cycling: noisings grouped under endpoint, anchor rotates inside.
-            k_idx = (inner // k_noisings) % g_endpoints
-            t_idx = inner % len(anchors)
+            use_cover = (
+                mstep_objective == "two_stream_on_policy_cover"
+                and cover_schedule[inner]
+            )
+            if use_cover:
+                cover_item = cover_rollouts[cover_inner % len(cover_rollouts)]
+                k_idx = -1
+                t_idx = cover_inner % len(anchors)
+                x0_ref = cover_item["latent"].to(torch.bfloat16)
+                active_cond = cover_item["cond"]
+                cover_inner += 1
+            else:
+                # Existing MP-EM-RAM keeps noisings grouped under each endpoint.
+                # The two-stream objective distributes fewer reference updates
+                # across all sampled endpoints instead of dropping the tail K.
+                ref_step = ref_inner if mstep_objective == "two_stream_on_policy_cover" else inner
+                if mstep_objective == "two_stream_on_policy_cover":
+                    k_idx = ref_step % K
+                    t_idx = ref_step % len(anchors)
+                else:
+                    k_idx = (ref_step // k_noisings) % g_endpoints
+                    t_idx = ref_step % len(anchors)
+                _video_k, latent_k, _noise_k = rollouts[k_idx]
+                x0_ref = latent_k.to(torch.bfloat16)
+                active_cond = train_cond
+                ref_inner += 1
             anchor_t = int(anchors[t_idx])
-            _video_k, latent_k, _noise_k = rollouts[k_idx]
-            x0_ref = latent_k.to(torch.bfloat16)
 
             noise = torch.randn_like(x0_ref)
             n_frames = x0_ref.shape[1]
@@ -890,19 +1072,29 @@ def main():
             ).unflatten(0, x0_ref.shape[:2])
 
             # --- default forward (grad) ---
-            flow_pred_default, _pred_x0_default = generator(noisy, train_cond, timestep)
+            flow_pred_default, _pred_x0_default = generator(noisy, active_cond, timestep)
 
             # --- anchor forward (no_grad) ---
             generator.model.set_adapter("anchor")
             with torch.no_grad():
-                flow_pred_anchor, _pred_x0_anchor = generator(noisy, train_cond, timestep)
+                flow_pred_anchor, _pred_x0_anchor = generator(noisy, active_cond, timestep)
 
             # Restore default BEFORE backward so gradient-checkpoint recompute
             # uses the same active adapter as the original forward.
             generator.model.set_adapter("default")
 
             # --- loss ---
-            if mstep_objective == "alpha_shift":
+            if use_cover:
+                loss_motion_projected_em_ram, diag = mode_cover_velocity_loss(
+                    v_default=flow_pred_default,
+                    v_anchor=flow_pred_anchor,
+                    cover_loss_weight=cover_loss_weight,
+                    lambda_static=lambda_static,
+                    anchor_idx=t_idx,
+                )
+                kl = torch.zeros((), device=device, dtype=loss_motion_projected_em_ram.dtype)
+                loss = loss_motion_projected_em_ram
+            elif mstep_objective == "alpha_shift":
                 loss_motion_projected_em_ram, diag = motion_projected_em_ram_loss(
                     v_default=flow_pred_default,
                     v_anchor=flow_pred_anchor,
@@ -953,6 +1145,32 @@ def main():
                 )
                 kl = torch.zeros((), device=device, dtype=loss_motion_projected_em_ram.dtype)
                 loss = loss_motion_projected_em_ram
+            elif mstep_objective == "two_stream_on_policy_cover":
+                assert time_weight_tensor is not None
+                loss_motion_projected_em_ram, diag = time_local_reward_weighted_velocity_loss(
+                    v_default=flow_pred_default,
+                    v_anchor=flow_pred_anchor,
+                    noise=noise,
+                    x0_ref=x0_ref,
+                    loss_weight=loss_weight_tensor[k_idx:k_idx + 1],
+                    time_weight=time_weight_tensor[k_idx:k_idx + 1],
+                    x0_reference=reference_latent,
+                    shift_coef=shift_coef,
+                    local_anchor_beta=local_anchor_beta,
+                    lambda_motion=lambda_motion,
+                    lambda_static=lambda_static,
+                    subspace_mode=subspace_mode,
+                    motion_pool=motion_pool,
+                    motion_temporal_center=motion_temporal_center,
+                    reference_motion_scope=reference_motion_scope,
+                    reference_motion_positive=reference_motion_positive,
+                    reference_motion_mix=reference_motion_mix,
+                    reference_motion_temporal_center=reference_motion_temporal_center,
+                    lambda_reference_orthogonal=lambda_reference_orthogonal,
+                    anchor_idx=t_idx,
+                )
+                kl = torch.zeros((), device=device, dtype=loss_motion_projected_em_ram.dtype)
+                loss = loss_motion_projected_em_ram
             else:
                 raise AssertionError(f"unhandled mstep_objective={mstep_objective!r}")
 
@@ -973,8 +1191,9 @@ def main():
             sum_alpha_eff += float(diag["mpem/alpha_eff"])
             per_anchor_shift[t_idx] += float(diag["mpem/motion_shift_norm"])
             per_anchor_count[t_idx] += 1
-            per_rollout_shift[k_idx] += float(diag["mpem/motion_shift_norm"])
-            per_rollout_count[k_idx] += 1
+            if k_idx >= 0:
+                per_rollout_shift[k_idx] += float(diag["mpem/motion_shift_norm"])
+                per_rollout_count[k_idx] += 1
             for key in optional_diag_keys:
                 if key in diag:
                     sum_optional_diag[key] += float(diag[key])
@@ -1005,7 +1224,11 @@ def main():
         if rank0:
             ref_diag = ""
             residual_reward_diag = ""
-            update_label = "weight" if mstep_objective == "reward_weighted_velocity" else "alpha"
+            update_label = (
+                "weight"
+                if mstep_objective in ("reward_weighted_velocity", "two_stream_on_policy_cover")
+                else "alpha"
+            )
             if "mpem/reference_alignment_cos" in avg_optional_diag:
                 ref_diag = (
                     f"ref_cos={avg_optional_diag['mpem/reference_alignment_cos']:.3f} "
@@ -1077,10 +1300,17 @@ def main():
                     if "mpem/anchor_loss" in avg_optional_diag
                     else ""
                 )
+                + (
+                    f"tw={avg_optional_diag['mpem/time_weight_mean']:.3f} "
+                    f"cover={avg_optional_diag.get('mpem/cover_stream', 0.0):.2f} "
+                    f"cover_loss={avg_optional_diag.get('mpem/cover_loss', 0.0):.4f}  "
+                    if mstep_objective == "two_stream_on_policy_cover"
+                    else ""
+                )
                 + f"v_def={avg_v_default:.3f}  v_anc={avg_v_anchor:.3f}  "
                 + (f"kl={avg_kl:.4f}  " if beta_kl > 0.0 else "")
                 + f"dt={dt_outer:.1f}s (rollout={t_rollout:.1f}, "
-                f"reward={t_reward:.1f}, train={t_train:.1f})",
+                f"reward={t_reward:.1f}, cover={t_cover:.1f}, train={t_train:.1f})",
                 flush=True,
             )
         if wandb_enabled:
@@ -1098,6 +1328,7 @@ def main():
                 "outer/dt_total_s": dt_outer,
                 "outer/dt_rollout_s": t_rollout,
                 "outer/dt_reward_s": t_reward,
+                "outer/dt_cover_s": t_cover,
                 "outer/dt_train_s": t_train,
                 **{f"em/{k.split('/')[-1]}": v for k, v in em_diag.items() if k.startswith("em/")},
                 **{f"reward/{k.split('/')[-1]}": v for k, v in em_diag.items() if k.startswith("reward/")},

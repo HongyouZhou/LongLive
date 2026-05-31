@@ -11,12 +11,15 @@ from longlive.methods.motion_projected_em_ram.losses import (
     em_tilt_weights,
     feature_consistency_gates,
     feature_consistency_weights,
+    mode_cover_velocity_loss,
     motion_project,
     motion_projected_em_ram_loss,
     reference_motion_basis,
     reference_motion_project,
+    residual_bucket_time_weights,
     reward_weighted_velocity_loss,
     score_consistency_weights,
+    time_local_reward_weighted_velocity_loss,
 )
 
 
@@ -153,6 +156,41 @@ def test_score_consistency_weights_downweight_bad_absolute_rewards() -> None:
     assert weights[0] < weights[1] < weights[2]
     assert abs(float(weights[1]) - 0.5) < 1e-6
     assert diag["feature_selector/score_mean"] == 0.0
+
+
+def test_residual_bucket_time_weights_map_bucket_directions_to_frames() -> None:
+    components = [
+        {
+            "bucket0_direction": 1.0,
+            "bucket1_direction": 0.0,
+            "bucket2_direction": -1.0,
+        }
+    ]
+
+    weights, diag = residual_bucket_time_weights(
+        components,
+        latent_frames=6,
+        bucket_count=3,
+        direction_temperature=0.25,
+    )
+
+    assert weights.shape == (1, 6)
+    assert torch.all(weights[:, :2] > weights[:, 2:4])
+    assert torch.all(weights[:, 2:4] > weights[:, 4:])
+    assert diag["time_weight/max"] <= 1.0
+
+
+def test_residual_bucket_time_weights_requires_bucket_components() -> None:
+    try:
+        residual_bucket_time_weights(
+            [{"direction": 0.5}],
+            latent_frames=4,
+            bucket_count=2,
+        )
+    except ValueError as exc:
+        assert "residual-bucket" in str(exc)
+    else:
+        raise AssertionError("missing bucket components should fail")
 
 
 def test_em_tilt_exposes_importance_weights_without_changing_alpha() -> None:
@@ -320,6 +358,64 @@ def test_reward_weighted_velocity_loss_keeps_anchor_when_weight_zero() -> None:
     assert diag["mpem/anchor_loss"] > 0.0
 
 
+def test_time_local_reward_weighted_velocity_masks_target_shift() -> None:
+    student = torch.zeros(1, 4, 2, 3, 3, requires_grad=True)
+    anchor = torch.zeros_like(student, requires_grad=True)
+    noise = torch.ones_like(student)
+    x0 = torch.zeros_like(student)
+
+    loss_zero, diag_zero = time_local_reward_weighted_velocity_loss(
+        v_default=student,
+        v_anchor=anchor,
+        noise=noise,
+        x0_ref=x0,
+        loss_weight=torch.tensor([1.0]),
+        time_weight=torch.zeros(1, 4),
+        shift_coef=0.5,
+        local_anchor_beta=0.0,
+        lambda_static=0.0,
+        subspace_mode="coarse_motion",
+        motion_pool=1,
+        motion_temporal_center=False,
+    )
+    loss_full, diag_full = time_local_reward_weighted_velocity_loss(
+        v_default=student,
+        v_anchor=anchor,
+        noise=noise,
+        x0_ref=x0,
+        loss_weight=torch.tensor([1.0]),
+        time_weight=torch.ones(1, 4),
+        shift_coef=0.5,
+        local_anchor_beta=0.0,
+        lambda_static=0.0,
+        subspace_mode="coarse_motion",
+        motion_pool=1,
+        motion_temporal_center=False,
+    )
+
+    assert loss_full > loss_zero
+    assert diag_full["mpem/motion_shift_norm"] > diag_zero["mpem/motion_shift_norm"]
+    assert diag_zero["mpem/time_weight_mean"] == 0.0
+
+
+def test_mode_cover_velocity_loss_detaches_anchor() -> None:
+    student = torch.zeros(1, 4, 2, 3, 3, requires_grad=True)
+    anchor = torch.ones_like(student, requires_grad=True)
+
+    loss, diag = mode_cover_velocity_loss(
+        v_default=student,
+        v_anchor=anchor,
+        cover_loss_weight=1.0,
+        lambda_static=0.0,
+    )
+    loss.backward()
+
+    assert student.grad is not None
+    assert anchor.grad is None
+    assert diag["mpem/cover_stream"] == 1.0
+    assert diag["mpem/cover_loss"] > 0.0
+
+
 def main() -> None:
     test_reference_motion_project_recovers_basis_direction()
     test_reference_motion_positive_clamps_opposite_direction()
@@ -328,12 +424,16 @@ def main() -> None:
     test_feature_consistency_gates_optional_fallback_topk()
     test_feature_consistency_weights_are_soft_and_mean_preserving()
     test_score_consistency_weights_downweight_bad_absolute_rewards()
+    test_residual_bucket_time_weights_map_bucket_directions_to_frames()
+    test_residual_bucket_time_weights_requires_bucket_components()
     test_em_tilt_exposes_importance_weights_without_changing_alpha()
     test_hybrid_reference_motion_mix_keeps_coarse_component()
     test_hybrid_reference_motion_loss_reports_orthogonal_penalty()
     test_coarse_motion_loss_keeps_anchor_detached()
     test_reward_weighted_velocity_loss_weights_loss_not_target_shift()
     test_reward_weighted_velocity_loss_keeps_anchor_when_weight_zero()
+    test_time_local_reward_weighted_velocity_masks_target_shift()
+    test_mode_cover_velocity_loss_detaches_anchor()
 
 
 if __name__ == "__main__":
