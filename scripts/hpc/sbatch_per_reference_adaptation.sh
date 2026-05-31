@@ -8,7 +8,7 @@
 #SBATCH --mem=900G
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/%x-%j.out
-#SBATCH --exclude=s-sc-dgx[01-02]
+#SBATCH --exclude=s-sc-dgx[01-02],s-sc-pgpu13,s-sc-pgpu14
 #
 # Per-reference adaptation protocol: resolve units, train each selected unit,
 # generate only that unit's eval prompts, score against the same reference
